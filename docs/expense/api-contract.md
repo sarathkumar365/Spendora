@@ -7,15 +7,44 @@ Base URL (local): `http://127.0.0.1:8081`
 - `GET /api/v1/health`
 - `GET /api/v1/diagnostics`
 
+## CORS Policy
+- CORS uses an explicit origin allowlist configured via `CORS_ALLOWED_ORIGINS`.
+- No wildcard origins are used.
+- No credentialed CORS (`Access-Control-Allow-Credentials` is not enabled).
+- Optional env overrides:
+  - `CORS_ALLOWED_METHODS` (default: `GET,POST,PUT,DELETE,OPTIONS`)
+  - `CORS_ALLOWED_HEADERS` (default: `Content-Type,Authorization`)
+
 ## Planned core endpoints
-- `POST /api/v1/connections/plaid/link-token`
-- `POST /api/v1/connections/plaid/exchange`
-- `GET /api/v1/connections`
-- `DELETE /api/v1/connections/:id`
-- `GET /api/v1/accounts`
-- `GET /api/v1/transactions`
-- `PATCH /api/v1/transactions/:id/category`
+### Implemented in Step 2
 - `POST /api/v1/imports`
 - `GET /api/v1/imports/:id/status`
+- `GET /api/v1/imports/:id/review`
+- `POST /api/v1/imports/:id/review`
+- `POST /api/v1/imports/:id/commit`
+- `GET /api/v1/accounts`
+- `GET /api/v1/transactions`
+
+### Implemented in Step 2.1
+- `GET /api/v1/settings/extraction`
+- `PUT /api/v1/settings/extraction`
+
+Step 2.1 import contract additions:
+- `POST /api/v1/imports` optional request fields:
+  - `extraction_mode`: `managed` or `local_ocr`
+- `GET /api/v1/imports/:id/status` additional fields:
+  - `extraction_mode`
+  - `effective_provider`
+  - `provider_attempts[]`
+  - `diagnostics`
+
+### Deferred (returns 501)
+- `POST /api/v1/connections/plaid/link-token`
+- `POST /api/v1/connections/plaid/exchange`
+
+### Backlog
+- `GET /api/v1/connections`
+- `DELETE /api/v1/connections/:id`
+- `PATCH /api/v1/transactions/:id/category`
 - `GET /api/v1/insights/monthly`
 - `POST /api/v1/assistant/query`

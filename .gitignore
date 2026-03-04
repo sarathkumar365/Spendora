@@ -11,8 +11,10 @@ build/
 apps/expense-desktop-ui/.vite/
 apps/expense-desktop-tauri/src-tauri/target/
 services/expense-rs/target/
+services/expense-rs/.runtime/
 .tmp/
 *.tsbuildinfo
+apps/expense-desktop-ui/src/*.js
 *.db
 *.db-shm
 *.db-wal

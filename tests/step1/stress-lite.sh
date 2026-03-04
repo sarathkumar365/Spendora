@@ -49,14 +49,14 @@ wait_for_url() {
 }
 
 start_api() {
-  cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$API_PORT" --migrate true \
+  cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$API_PORT" --migrate \
     >"$TEST_TMP_DIR/api.log" 2>&1 &
   API_PID="$!"
   wait_for_url "http://127.0.0.1:${API_PORT}/health" "$API_PID" "$TEST_TMP_DIR/api.log"
 }
 
 start_worker() {
-  cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$WORKER_PORT" --migrate true --poll-seconds 1 \
+  cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$WORKER_PORT" --migrate --poll-seconds 1 \
     >"$TEST_TMP_DIR/worker.log" 2>&1 &
   WORKER_PID="$!"
   wait_for_url "http://127.0.0.1:${WORKER_PORT}/health" "$WORKER_PID" "$TEST_TMP_DIR/worker.log"
@@ -104,13 +104,13 @@ run_invalid_path_failure_checks() {
   local invalid_db="/dev/null/expense-invalid.db"
 
   echo "[step1-stress] validating API fails with invalid db path"
-  if cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$invalid_db" --port 19091 --migrate true >"$TEST_TMP_DIR/api-invalid.log" 2>&1; then
+  if cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$invalid_db" --port 19091 --migrate >"$TEST_TMP_DIR/api-invalid.log" 2>&1; then
     echo "API unexpectedly started with invalid db path" >&2
     return 1
   fi
 
   echo "[step1-stress] validating Worker fails with invalid db path"
-  if cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$invalid_db" --port 19092 --migrate true >"$TEST_TMP_DIR/worker-invalid.log" 2>&1; then
+  if cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$invalid_db" --port 19092 --migrate >"$TEST_TMP_DIR/worker-invalid.log" 2>&1; then
     echo "Worker unexpectedly started with invalid db path" >&2
     return 1
   fi

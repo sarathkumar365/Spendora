@@ -3,9 +3,12 @@
 use serde::Serialize;
 use std::{
     env,
+    fs::OpenOptions,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 #[derive(Default)]
@@ -20,18 +23,36 @@ struct ServiceStatus {
     worker_running: bool,
 }
 
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[tauri::command]
 fn start_services(state: tauri::State<'_, Mutex<ProcessState>>) -> Result<ServiceStatus, String> {
     let mut processes = state.lock().map_err(|_| "lock poisoned".to_string())?;
 
-    if !is_alive(&mut processes.api) {
+    clean_stale_processes_for_port(&mut processes.api, 8081)?;
+    if !is_service_running(&mut processes.api, 8081) {
         processes.api =
             Some(spawn_service("api").map_err(|e| format!("failed to start api: {e}"))?);
     }
+    if !wait_for_service(8081, &mut processes.api, STARTUP_TIMEOUT) {
+        let hint = read_log_tail("api", 20);
+        return Err(format!(
+            "API failed to become ready on http://127.0.0.1:8081. {}",
+            hint
+        ));
+    }
 
-    if !is_alive(&mut processes.worker) {
+    clean_stale_processes_for_port(&mut processes.worker, 8082)?;
+    if !is_service_running(&mut processes.worker, 8082) {
         processes.worker =
             Some(spawn_service("worker").map_err(|e| format!("failed to start worker: {e}"))?);
+    }
+    if !wait_for_service(8082, &mut processes.worker, STARTUP_TIMEOUT) {
+        let hint = read_log_tail("worker", 20);
+        return Err(format!(
+            "Worker failed to become ready on http://127.0.0.1:8082. {}",
+            hint
+        ));
     }
 
     Ok(ServiceStatus {
@@ -56,8 +77,8 @@ fn stop_services(state: tauri::State<'_, Mutex<ProcessState>>) -> Result<Service
 fn service_status(state: tauri::State<'_, Mutex<ProcessState>>) -> Result<ServiceStatus, String> {
     let mut processes = state.lock().map_err(|_| "lock poisoned".to_string())?;
     Ok(ServiceStatus {
-        api_running: is_alive(&mut processes.api),
-        worker_running: is_alive(&mut processes.worker),
+        api_running: is_service_running(&mut processes.api, 8081),
+        worker_running: is_service_running(&mut processes.worker, 8082),
     })
 }
 
@@ -82,13 +103,26 @@ fn spawn_service(package: &str) -> std::io::Result<Child> {
         ));
     }
 
+    let app_data_dir = services_dir.join(".runtime");
+    std::fs::create_dir_all(&app_data_dir)?;
+    let logs_dir = app_data_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+
+    let log_path = service_log_path(package);
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let log_file_err = log_file.try_clone()?;
+
     Command::new("cargo")
         .arg("run")
         .arg("-p")
         .arg(package)
+        .env("EXPENSE_APP_DATA_DIR", app_data_dir)
         .current_dir(services_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
         .spawn()
 }
 
@@ -128,6 +162,122 @@ fn terminate(child: &mut Option<Child>) {
         let _ = process.wait();
     }
     *child = None;
+}
+
+fn wait_for_service(port: u16, child: &mut Option<Child>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+
+        if !is_alive(child) {
+            return false;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn is_service_running(child: &mut Option<Child>, port: u16) -> bool {
+    is_alive(child) || is_port_open(port)
+}
+
+fn is_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+fn clean_stale_processes_for_port(child: &mut Option<Child>, port: u16) -> Result<(), String> {
+    // If this Tauri instance owns a healthy child, do not touch the port owner.
+    if is_alive(child) {
+        return Ok(());
+    }
+
+    if !is_port_open(port) {
+        return Ok(());
+    }
+
+    kill_port_owner(port).map_err(|e| format!("failed to clear stale process on port {port}: {e}"))
+}
+
+#[cfg(unix)]
+fn kill_port_owner(port: u16) -> std::io::Result<()> {
+    // macOS/Linux: get PIDs listening on tcp:<port>
+    let output = Command::new("lsof")
+        .arg("-ti")
+        .arg(format!("tcp:{port}"))
+        .output()?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for pid in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let _ = Command::new("kill").arg("-TERM").arg(pid).status();
+    }
+
+    // Give processes a moment to exit gracefully.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Force kill any stubborn listener.
+    let output = Command::new("lsof")
+        .arg("-ti")
+        .arg(format!("tcp:{port}"))
+        .output()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for pid in stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let _ = Command::new("kill").arg("-KILL").arg(pid).status();
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_port_owner(_port: u16) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn service_log_path(package: &str) -> PathBuf {
+    services_root()
+        .join(".runtime")
+        .join("logs")
+        .join(format!("{package}.log"))
+}
+
+fn read_log_tail(package: &str, max_lines: usize) -> String {
+    let path = service_log_path(package);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return format!("Check startup logs at {}", path.display()),
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines: Vec<String> = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    if lines.is_empty() {
+        return format!("Check startup logs at {}", path.display());
+    }
+    format!("Log tail ({}): {}", path.display(), lines.join(" | "))
 }
 
 fn resolve_services_root(
@@ -205,4 +355,12 @@ mod tests {
         assert!(!alive);
         assert!(child.is_none());
     }
+
+    #[test]
+    fn wait_for_service_returns_false_for_dead_or_missing_process() {
+        let mut child: Option<Child> = None;
+        let ready = wait_for_service(65534, &mut child, Duration::from_millis(100));
+        assert!(!ready);
+    }
+
 }

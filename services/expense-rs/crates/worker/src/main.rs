@@ -1,8 +1,17 @@
 use axum::{routing::get, Json, Router};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
-use expense_core::{default_app_data_dir, new_health_status, HealthStatus};
+use connectors_ai::{local_ocr_stub, ExtractionRequest, ManagedExtractor, StatementExtractor};
+use connectors_manual::{parse_csv, parse_pdf};
+use expense_core::{default_app_data_dir, new_health_status, HealthStatus, ImportStatus};
+use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
-use storage_sqlite::{connect, run_migrations};
+use storage_sqlite::{
+    claim_pending_job, clear_import_rows, connect, ensure_default_manual_account,
+    get_extraction_settings, get_import_content, insert_import_rows, mark_job_completed,
+    mark_job_failed, run_migrations, update_import_extraction_result, update_import_status,
+    ParsedRowInput,
+};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
@@ -14,8 +23,13 @@ struct Args {
     port: u16,
     #[arg(long, default_value_t = true)]
     migrate: bool,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 5)]
     poll_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportJobPayload {
+    import_id: String,
 }
 
 #[tokio::main]
@@ -49,9 +63,206 @@ async fn main() -> anyhow::Result<()> {
 
     info!(poll_seconds = args.poll_seconds, "worker loop started");
     loop {
-        info!("worker heartbeat: no jobs yet");
+        if let Err(err) = process_pending_import_jobs(&pool).await {
+            error!(error = %err, "failed to process import jobs");
+        }
         sleep(Duration::from_secs(args.poll_seconds)).await;
     }
+}
+
+async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyhow::Result<()> {
+    let Some(job) = claim_pending_job(pool, "import_parse").await? else {
+        return Ok(());
+    };
+
+    let job_attempt = job.attempts + 1;
+    let job_payload: ImportJobPayload = serde_json::from_str(&job.payload_json)?;
+
+    let result = async {
+        update_import_status(
+            pool,
+            &job_payload.import_id,
+            ImportStatus::Parsing,
+            serde_json::json!({}),
+            Vec::new(),
+            Vec::new(),
+            0,
+        )
+        .await?;
+
+        let blob = get_import_content(pool, &job_payload.import_id).await?;
+        let account_id = ensure_default_manual_account(pool).await?;
+        let decoded = STANDARD.decode(blob.content_base64.as_bytes())?;
+        let settings = get_extraction_settings(pool).await?;
+
+        let parsed = if blob.parser_type == "csv" {
+            parse_csv(&decoded, &account_id)
+        } else if blob.parser_type == "pdf" {
+            let extraction_mode = if blob.extraction_mode.trim().is_empty() {
+                settings.default_extraction_mode.clone()
+            } else {
+                blob.extraction_mode.clone()
+            };
+
+            if extraction_mode == "local_ocr" {
+                let result = local_ocr_stub(&ExtractionRequest {
+                    import_id: job_payload.import_id.clone(),
+                    account_id: account_id.clone(),
+                    file_name: blob.file_name.clone(),
+                    bytes: decoded,
+                    max_provider_retries: settings.max_provider_retries,
+                    timeout_ms: settings.provider_timeout_ms,
+                    managed_fallback_enabled: settings.managed_fallback_enabled,
+                })
+                .await?;
+
+                update_import_extraction_result(
+                    pool,
+                    &job_payload.import_id,
+                    result.effective_provider.as_deref(),
+                    &result
+                        .attempts
+                        .iter()
+                        .map(|item| {
+                            serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect::<Vec<_>>(),
+                    &result.diagnostics,
+                )
+                .await?;
+
+                anyhow::bail!(
+                    "{}",
+                    result
+                        .errors
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "LOCAL_OCR_NOT_IMPLEMENTED".to_string())
+                );
+            }
+
+            let extractor = ManagedExtractor::default();
+            let result = extractor
+                .extract_pdf(&ExtractionRequest {
+                    import_id: job_payload.import_id.clone(),
+                    account_id: account_id.clone(),
+                    file_name: blob.file_name.clone(),
+                    bytes: decoded,
+                    max_provider_retries: settings.max_provider_retries,
+                    timeout_ms: settings.provider_timeout_ms,
+                    managed_fallback_enabled: settings.managed_fallback_enabled,
+                })
+                .await?;
+
+            update_import_extraction_result(
+                pool,
+                &job_payload.import_id,
+                result.effective_provider.as_deref(),
+                &result
+                    .attempts
+                    .iter()
+                    .map(|item| {
+                        serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({}))
+                    })
+                    .collect::<Vec<_>>(),
+                &result.diagnostics,
+            )
+            .await?;
+
+            if !result.errors.is_empty() && result.rows.is_empty() {
+                anyhow::bail!("{}", result.errors.join(" | "));
+            }
+
+            connectors_manual::ParsedImport {
+                rows: result
+                    .rows
+                    .into_iter()
+                    .map(|row| connectors_manual::ParsedRow {
+                        row_index: row.row_index,
+                        booked_at: row.booked_at,
+                        amount_cents: row.amount_cents,
+                        description: row.description,
+                        confidence: row.confidence,
+                        parse_error: row.parse_error,
+                        normalized_txn_hash: row.normalized_txn_hash,
+                    })
+                    .collect(),
+                warnings: result.warnings,
+                errors: result.errors,
+            }
+        } else {
+            parse_pdf(&decoded, &account_id)
+        };
+
+        clear_import_rows(pool, &job_payload.import_id).await?;
+
+        let parsed_rows: Vec<ParsedRowInput> = parsed
+            .rows
+            .iter()
+            .map(|row| ParsedRowInput {
+                row_index: row.row_index,
+                normalized_json: serde_json::json!({
+                    "booked_at": row.booked_at,
+                    "amount_cents": row.amount_cents,
+                    "description": row.description,
+                }),
+                confidence: row.confidence,
+                parse_error: row.parse_error.clone(),
+                normalized_txn_hash: row.normalized_txn_hash.clone(),
+                account_id: Some(account_id.clone()),
+            })
+            .collect();
+
+        insert_import_rows(pool, &job_payload.import_id, parsed_rows).await?;
+
+        let review_required_count = parsed
+            .rows
+            .iter()
+            .filter(|row| row.parse_error.is_some() || row.confidence < 0.75)
+            .count() as i64;
+
+        let status = if review_required_count > 0 {
+            ImportStatus::ReviewRequired
+        } else {
+            ImportStatus::ReadyToCommit
+        };
+
+        update_import_status(
+            pool,
+            &job_payload.import_id,
+            status,
+            serde_json::json!({ "parsed_rows": parsed.rows.len() }),
+            parsed.errors,
+            parsed.warnings,
+            review_required_count,
+        )
+        .await?;
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    match result {
+        Ok(_) => {
+            mark_job_completed(pool, &job.id).await?;
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            update_import_status(
+                pool,
+                &job_payload.import_id,
+                ImportStatus::Failed,
+                serde_json::json!({}),
+                vec![err_text.clone()],
+                Vec::new(),
+                0,
+            )
+            .await?;
+            mark_job_failed(pool, &job.id, job_attempt, &err_text).await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn health() -> Json<HealthStatus> {
@@ -78,6 +289,8 @@ fn default_db_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use storage_sqlite::{create_import, get_import_status, run_migrations, CreateImportInput};
 
     #[tokio::test]
     async fn health_returns_ok_payload() {
@@ -93,5 +306,102 @@ mod tests {
             value.ends_with("expense.db"),
             "default db path should end with expense.db, got: {value}"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_processes_import_job_and_updates_status() {
+        let db_path = std::env::current_dir()
+            .expect("cwd")
+            .join(".tmp")
+            .join(format!(
+                "worker-import-test-{}.db",
+                expense_core::new_idempotency_key()
+            ));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+
+        let pool = connect(&db_path).await.expect("connect");
+        run_migrations(&pool).await.expect("migrate");
+
+        let source = b"2026-03-01,Coffee,10.50\n03/02/2026,Bad Date,5.00";
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "statement.pdf".to_string(),
+                parser_type: "csv".to_string(),
+                content_base64: STANDARD.encode(source),
+                source_hash: "worker-hash".to_string(),
+                extraction_mode: None,
+            },
+        )
+        .await
+        .expect("create import");
+
+        process_pending_import_jobs(&pool)
+            .await
+            .expect("process import job");
+
+        let status = get_import_status(&pool, &import_id)
+            .await
+            .expect("get status");
+        assert_eq!(status.status, ImportStatus::ReviewRequired.as_str());
+        assert_eq!(status.review_required_count, 1);
+        assert!(status.summary.to_string().contains("parsed_rows"));
+
+        let rows = storage_sqlite::list_import_rows_for_review(&pool, &import_id)
+            .await
+            .expect("review rows");
+        assert_eq!(rows.len(), 2);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn worker_marks_local_ocr_mode_as_failed_stub() {
+        let db_path = std::env::current_dir()
+            .expect("cwd")
+            .join(".tmp")
+            .join(format!(
+                "worker-local-ocr-stub-test-{}.db",
+                expense_core::new_idempotency_key()
+            ));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+
+        let pool = connect(&db_path).await.expect("connect");
+        run_migrations(&pool).await.expect("migrate");
+
+        let source = b"%PDF-1.4 binary placeholder";
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "statement.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: STANDARD.encode(source),
+                source_hash: "worker-local-ocr-hash".to_string(),
+                extraction_mode: Some("local_ocr".to_string()),
+            },
+        )
+        .await
+        .expect("create import");
+
+        process_pending_import_jobs(&pool)
+            .await
+            .expect("process import job");
+
+        let status = get_import_status(&pool, &import_id)
+            .await
+            .expect("get status");
+        assert_eq!(status.status, ImportStatus::Failed.as_str());
+        assert!(status
+            .errors
+            .iter()
+            .any(|e| e.contains("LOCAL_OCR_NOT_IMPLEMENTED")));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
     }
 }

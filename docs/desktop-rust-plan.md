@@ -242,6 +242,8 @@ UX principles:
 - Exit criteria: app launches on macOS, API/worker boot reliably, DB initializes from migrations.
 
 ### Step 2: Core Ledger + Plaid Sync Path
+Status: Done for current delivery scope. Live Plaid integration remains deferred; see `docs/expense/plaid-deferred-checklist.md`.
+
 - Implement `core` domain models, error taxonomy, and idempotency/dedupe helpers.
 - Implement `storage_sqlite` repositories and schema constraints (`connections`, `accounts`, `transactions`, `job_runs`, etc.).
 - Implement `connectors_plaid` (link token, exchange, accounts list, cursor sync) and API endpoints.

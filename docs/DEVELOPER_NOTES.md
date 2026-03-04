@@ -259,6 +259,61 @@ From repo root:
 3. `npm run rs:worker`
 - Runs Rust worker binary with migrations.
 
+## 12) Managed Extraction Pipeline (Step 2.1)
+
+New components:
+1. `crates/connectors_ai`
+- Contains managed extraction orchestration and provider clients.
+- Provider order: `llamaparse` first, `openrouter_pdf_text` fallback.
+- Retries are capped at 3 per provider.
+
+2. `crates/storage_sqlite` additions
+- `app_settings` table for extraction defaults.
+- `imports` now stores extraction mode, effective provider, provider attempts, and diagnostics.
+
+3. `crates/api` additions
+- `GET/PUT /api/v1/settings/extraction`
+- `POST /api/v1/imports` accepts optional extraction overrides.
+- `GET /api/v1/imports/:id/status` returns extraction diagnostics fields.
+
+4. `crates/worker` flow change
+- CSV imports still use local parser.
+- PDF imports route through extraction mode:
+  - `managed`: providers with retry/fallback
+  - `local_ocr`: stubbed not implemented error
+
+## 13) Retry and Fallback Rules
+
+Per provider:
+1. Max attempts: 3
+2. Retryable:
+- timeout/network
+- HTTP 429
+- HTTP 5xx
+3. Non-retryable:
+- response schema invalid
+- permanent 4xx client errors
+
+Fallback:
+- Only after primary provider stops/reaches limit.
+- Final failure is surfaced as `MANAGED_ALL_PROVIDERS_FAILED`.
+
+## 14) Logging Behavior
+
+Worker logs include provider attempts and outcomes.
+Additionally, provider responses are written to:
+- `services/expense-rs/.runtime/logs/extraction-provider.log`
+
+Each attempt log includes:
+- import id
+- provider name
+- attempt number
+- latency
+- retry decision
+- raw response (capped by configured max bytes)
+
+This is intentionally verbose for diagnostics and includes sensitive data risk.
+
 4. `npm run test:step1`
 - Runs Rust tests, UI build validation, smoke tests.
 

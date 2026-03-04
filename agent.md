@@ -7,6 +7,7 @@ These rules apply to any coding agent working in this repository.
 2. All repository tests must pass before considering work complete.
 3. Build must pass for changed components before considering work complete.
 4. If any test or build fails, fix the issue (or clearly document blocker if external).
+5. Every newly discovered issue/bug must add at least one meaningful regression test to the suite before closure.
 
 ## Engineering Standards
 1. Follow repository structure and conventions. Do not introduce ad-hoc layouts.
@@ -25,6 +26,7 @@ These rules apply to any coding agent working in this repository.
 2. Do not break existing workflows, scripts, or contracts without explicit migration notes.
 3. Update docs when behavior, startup flow, or developer workflow changes.
 4. Validate end-to-end behavior for touched features, not just unit scope.
+5. When fixing an issue found during development, QA, or production-like testing, add coverage that reproduces the original failure and verifies the fix.
 
 ## Repository Expectations
 1. Respect existing architecture decisions in `docs/desktop-rust-plan.md`.

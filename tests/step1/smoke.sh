@@ -47,7 +47,7 @@ wait_for_url() {
 }
 
 echo "[step1-smoke] starting API"
-cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$API_PORT" --migrate true \
+cargo run -p api --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$API_PORT" --migrate \
   >"$TEST_TMP_DIR/api.log" 2>&1 &
 API_PID="$!"
 
@@ -61,7 +61,7 @@ DIAG="$(curl -sSf "http://127.0.0.1:${API_PORT}/api/v1/diagnostics")"
 [[ "$DIAG" == *'"sqlite":"ok"'* ]]
 
 echo "[step1-smoke] starting worker"
-cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$WORKER_PORT" --migrate true --poll-seconds 1 \
+cargo run -p worker --manifest-path "$RUST_MANIFEST" -- --db-path "$DB_PATH" --port "$WORKER_PORT" --migrate --poll-seconds 1 \
   >"$TEST_TMP_DIR/worker.log" 2>&1 &
 WORKER_PID="$!"
 

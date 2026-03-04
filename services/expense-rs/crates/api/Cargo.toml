@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 expense_core = { path = "../core" }
 serde = { workspace = true }
@@ -15,3 +16,7 @@ storage_sqlite = { path = "../storage_sqlite" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+
+[dev-dependencies]
+tower = "0.5"
