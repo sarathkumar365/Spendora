@@ -1,0 +1,22 @@
+{
+  "name": "expense-tracker-rust-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/expense-desktop-ui",
+    "apps/expense-desktop-tauri"
+  ],
+  "scripts": {
+    "rs:api": "cargo run -p api --manifest-path services/expense-rs/Cargo.toml -- --migrate",
+    "rs:worker": "cargo run -p worker --manifest-path services/expense-rs/Cargo.toml -- --migrate",
+    "test:rs": "cargo test --workspace --manifest-path services/expense-rs/Cargo.toml",
+    "test:ui-build": "npm run build --workspace expense-desktop-ui",
+    "test:step1:smoke": "bash tests/step1/smoke.sh",
+    "test:step1:stress": "bash tests/step1/stress-lite.sh",
+    "test:step1": "bash tests/step1/run-all.sh",
+    "ui:dev": "npm run dev --workspace expense-desktop-ui",
+    "ui:build": "npm run build --workspace expense-desktop-ui",
+    "tauri:dev": "npm run tauri:dev --workspace expense-desktop-tauri",
+    "tauri:build": "npm run tauri:build --workspace expense-desktop-tauri"
+  }
+}

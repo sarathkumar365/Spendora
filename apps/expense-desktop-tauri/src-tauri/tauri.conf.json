@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Expense Tracker Desktop",
+  "version": "0.1.0",
+  "identifier": "com.expense.tracker.desktop",
+  "build": {
+    "beforeDevCommand": "cd ../.. && npm run ui:dev",
+    "beforeBuildCommand": "cd ../.. && npm run ui:build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../../expense-desktop-ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Expense Tracker",
+        "width": 1280,
+        "height": 800,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

@@ -1,0 +1,50 @@
+:root {
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: #1d2433;
+  background: radial-gradient(circle at top left, #eef6ff, #f8fbff 40%, #ffffff 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 2rem;
+}
+
+.status-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+button {
+  border: 1px solid #98b3d8;
+  background: #e9f2ff;
+  color: #0d1f3c;
+  border-radius: 10px;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+}
+
+.error {
+  color: #a1002d;
+}
+
+article {
+  border: 1px solid #d7e2f2;
+  border-radius: 12px;
+  padding: 1rem;
+  background: #ffffff;
+}

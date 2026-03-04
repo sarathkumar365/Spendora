@@ -1,0 +1,15 @@
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+expense_core = { path = "../core" }
+serde = { workspace = true }
+storage_sqlite = { path = "../storage_sqlite" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "expense_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = "2.0"
+uuid = { workspace = true }

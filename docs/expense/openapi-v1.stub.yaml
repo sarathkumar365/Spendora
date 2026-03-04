@@ -1,0 +1,25 @@
+openapi: 3.0.3
+info:
+  title: Expense Tracker API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:8081
+paths:
+  /health:
+    get:
+      summary: Service health
+      responses:
+        '200':
+          description: ok
+  /api/v1/health:
+    get:
+      summary: Versioned service health
+      responses:
+        '200':
+          description: ok
+  /api/v1/diagnostics:
+    get:
+      summary: Service diagnostics
+      responses:
+        '200':
+          description: ok
