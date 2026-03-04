@@ -251,10 +251,10 @@ Status: Done for current delivery scope. Live Plaid integration remains deferred
 - Exit criteria: Plaid sandbox connects, sync works end-to-end, no duplicate transactions across repeated sync.
 
 ### Step 3: Manual Import Pipeline + Review UX
-- Implement `connectors_manual` CSV parser first; PDF parser baseline second with diagnostics.
-- Add import session flow (`POST /api/v1/imports`, status tracking, staging tables).
-- Build review queue UI for low-confidence rows and partial parse handling.
-- Merge approved import rows into canonical `transactions` with provenance metadata.
+- Implement `connectors_manual` CSV parser first; PDF parser baseline second with diagnostics. **(implemented in Step 2)**
+- Add import session flow (`POST /api/v1/imports`, status tracking, staging tables). **(implemented in Step 2)**
+- Build review queue UI for low-confidence rows and partial parse handling. **(implemented in Step 2, partial)**
+- Merge approved import rows into canonical `transactions` with provenance metadata. **(implemented in Step 2, partial)**
 - Exit criteria: CSV path is reliable end-to-end; PDF baseline works with explicit review fallback.
 
 ### Step 4: Rules, Agent, Reconciliation, and Insights
