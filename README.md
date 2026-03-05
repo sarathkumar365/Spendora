@@ -1,4 +1,4 @@
-# Expense Tracker Rust Desktop
+# Spendora
 
 A desktop-first personal expense tracker built with:
 - React UI (`apps/expense-desktop-ui`)
@@ -85,7 +85,7 @@ Expected behavior:
 - Worker health: `http://127.0.0.1:8082/health`
 
 ## Database Behavior
-- SQLite file is created in OS app-data path (`ExpenseTrackerDesktop/expense.db`).
+- SQLite file is created in OS app-data path (`SpendoraDesktop/expense.db`).
 - On first API/Worker run with migration enabled, migrations are applied automatically.
 - Current migration source: `services/expense-rs/migrations`.
 

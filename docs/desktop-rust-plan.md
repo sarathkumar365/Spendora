@@ -1,4 +1,4 @@
-# Desktop-First Personal Expense Tracker (Rust) - Decision-Complete Build Plan
+# Spendora Desktop-First (Rust) - Decision-Complete Build Plan
 
 ## Summary
 Build a native desktop expense tracker for macOS and Windows with:

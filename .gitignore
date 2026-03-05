@@ -1,8 +1,6 @@
 node_modules/
 dist/
-!apps/expense-desktop-ui/dist/
 apps/expense-desktop-ui/dist/*
-!apps/expense-desktop-ui/dist/index.html
 build/
 .DS_Store
 .env

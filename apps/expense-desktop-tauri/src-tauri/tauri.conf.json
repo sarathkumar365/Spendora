@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Expense Tracker Desktop",
+  "productName": "Spendora Desktop",
   "version": "0.1.0",
-  "identifier": "com.expense.tracker.desktop",
+  "identifier": "com.spendora.desktop",
   "build": {
     "beforeDevCommand": "cd ../.. && npm run ui:dev",
     "beforeBuildCommand": "cd ../.. && npm run ui:build",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Expense Tracker",
+        "title": "Spendora",
         "width": 1280,
         "height": 800,
         "resizable": true

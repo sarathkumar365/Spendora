@@ -170,7 +170,7 @@ pub fn default_app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Ok(app_data) = env::var("APPDATA") {
-            return PathBuf::from(app_data).join("ExpenseTrackerDesktop");
+            return PathBuf::from(app_data).join("SpendoraDesktop");
         }
     }
 
@@ -180,7 +180,7 @@ pub fn default_app_data_dir() -> PathBuf {
             return PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join("ExpenseTrackerDesktop");
+                .join("SpendoraDesktop");
         }
     }
 
@@ -188,7 +188,7 @@ pub fn default_app_data_dir() -> PathBuf {
         return PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("ExpenseTrackerDesktop");
+            .join("SpendoraDesktop");
     }
 
     PathBuf::from(".").join("data")
@@ -233,7 +233,7 @@ mod tests {
         let path = default_app_data_dir();
         let rendered = path.display().to_string();
         assert!(
-            rendered.contains("ExpenseTrackerDesktop")
+            rendered.contains("SpendoraDesktop")
                 || rendered.ends_with("./data")
                 || rendered.contains(".runtime"),
             "unexpected app data path: {rendered}"

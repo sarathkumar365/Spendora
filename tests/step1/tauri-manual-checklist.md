@@ -4,7 +4,7 @@ Use this checklist after `npm install` and successful Rust dependency resolution
 
 ## Start Desktop Shell
 - Run `npm run tauri:dev` from repo root.
-- Confirm app window opens with the Expense Tracker bootstrap screen.
+- Confirm app window opens with the Spendora bootstrap screen.
 
 ## Process Lifecycle Commands
 - Click `Start Services`.

@@ -296,7 +296,7 @@ function App() {
   return (
     <main className="app-shell">
       <header>
-        <h1>Expense Tracker</h1>
+        <h1>Spendora</h1>
         <p>Step 2 manual ingestion flow (PDF-first, Plaid deferred).</p>
       </header>
 
