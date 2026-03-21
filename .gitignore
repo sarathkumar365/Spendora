@@ -16,3 +16,5 @@ apps/expense-desktop-ui/src/*.js
 *.db
 *.db-shm
 *.db-wal
+
+.sfdx/
