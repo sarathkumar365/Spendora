@@ -61,6 +61,10 @@ Mode resolution order:
 2. global extraction settings
 3. default `managed`
 
+Managed flow mode:
+- `EXTRACTION_MANAGED_FLOW_MODE=new|legacy`
+- default: `new`
+
 ### Managed providers
 - Primary: LlamaParse
 - Fallback: OpenRouter `pdf-text`
@@ -91,12 +95,22 @@ By default, full provider responses are written for each attempt.
 Controls:
 - `EXTRACTION_LOG_FULL_RESPONSE=true` (default behavior)
 - `EXTRACTION_LOG_MAX_BYTES=262144` (default max response bytes per entry)
+- `LLAMAEXTRACT_POLL_ATTEMPTS` (poll loop ceiling; capped in code, default if unset)
 - `EXPENSE_EXTRACTION_LOG_PATH` (optional explicit path)
 - `EXPENSE_BOOTSTRAP_LOG_PATH` (optional explicit path for bootstrap/gate events)
+- `EXPENSE_EXTERNAL_API_RAW_LOG_PATH` (optional explicit path for common raw external API responses)
+
+Jobs polling timeout behavior:
+- hard cap: 3 minutes per extraction job poll lifecycle
+- timeout error: `MANAGED_PROVIDER_TIMEOUT`
 
 Default log paths:
 - provider attempts/http: `~/Library/Application Support/SpendoraDesktop/logs/extraction-provider.log`
+- raw external API responses (common): `~/Library/Application Support/SpendoraDesktop/logs/external-api-raw.log`
 - bootstrap/readiness/gate: `~/Library/Application Support/SpendoraDesktop/logs/extraction-bootstrap.log`
+
+Desktop dev startup note:
+- In dev mode, service startup truncates existing runtime `*.log` files before launching API/worker for a fresh log session.
 
 Security warning:
 - Logs can include sensitive financial statement data when full-response logging is enabled.

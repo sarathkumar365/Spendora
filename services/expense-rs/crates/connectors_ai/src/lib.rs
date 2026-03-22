@@ -2,7 +2,8 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use expense_core::{
-    compute_row_hash, normalize_description, parse_amount_cents, ExtractionRuntimeConfig,
+    compute_row_hash, load_extraction_runtime_config_from_env, normalize_description,
+    parse_amount_cents, ExtractionRuntimeConfig,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use tokio::time::sleep;
 const MIN_PROVIDER_TIMEOUT_MS: i64 = 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 180_000;
 const LLAMA_PHASE_BUDGET_MS: u64 = 180_000;
+const JOBS_POLL_HARD_CAP_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlamaAgentDescriptor {
@@ -108,6 +110,25 @@ pub struct ExtractionRequest {
     pub max_provider_retries: i64,
     pub timeout_ms: i64,
     pub managed_fallback_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JobsTerminalStatus {
+    Success,
+    PartialSuccess,
+    Error,
+    Cancelled,
+}
+
+impl JobsTerminalStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::PartialSuccess => "PARTIAL_SUCCESS",
+            Self::Error => "ERROR",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -485,6 +506,848 @@ impl StatementExtractor for ManagedExtractor {
     }
 }
 
+impl ManagedExtractor {
+    pub async fn extract_pdf_new(&self, request: &ExtractionRequest) -> anyhow::Result<ExtractionResult> {
+        let cfg = load_extraction_runtime_config_from_env().map_err(|e| anyhow!(e.to_string()))?;
+        let base_url = env::var("LLAMA_CLOUD_BASE_URL")
+            .unwrap_or_else(|_| "https://api.cloud.llamaindex.ai".to_string());
+        let agent_name = versioned_agent_name(&cfg.llama_agent_name, &cfg.llama_schema_version);
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_flow_start",
+            "import_id": request.import_id,
+            "file_name": request.file_name,
+            "base_url": base_url,
+            "agent_name": agent_name,
+            "schema_version": cfg.llama_schema_version,
+        }));
+        let agent_id = find_llama_agent_id(&self.http, &base_url, &cfg, &agent_name)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?
+            .ok_or_else(|| anyhow!("MANAGED_PROVIDER_BAD_REQUEST: agent_id not found for {agent_name}"))?;
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_agent_resolved",
+            "import_id": request.import_id,
+            "agent_name": agent_name,
+            "agent_id": agent_id,
+        }));
+
+        let timeout_ms = request
+            .timeout_ms
+            .clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS) as u64;
+
+        let uploaded = jobs_upload_file(
+            &self.http,
+            request,
+            cfg.llama_cloud_api_key.as_str(),
+            timeout_ms,
+            base_url.as_str(),
+        )
+        .await?;
+        let created = jobs_create_extraction_job(
+            &self.http,
+            request,
+            cfg.llama_cloud_api_key.as_str(),
+            timeout_ms,
+            base_url.as_str(),
+            uploaded.file_id.as_str(),
+            agent_id.as_str(),
+        )
+        .await?;
+        let polled = jobs_poll_status(
+            &self.http,
+            request,
+            cfg.llama_cloud_api_key.as_str(),
+            timeout_ms,
+            base_url.as_str(),
+            created.job_id.as_str(),
+        )
+        .await?;
+        let fetched = jobs_fetch_result(
+            &self.http,
+            request,
+            cfg.llama_cloud_api_key.as_str(),
+            timeout_ms,
+            base_url.as_str(),
+            created.job_id.as_str(),
+        )
+        .await?;
+
+        let validated = validate_jobs_result_payload(&fetched.payload)?;
+        let (period_start, period_end, period_derived) =
+            resolve_period(validated.period_start.clone(), validated.period_end.clone(), &validated.rows)?;
+
+        let mut out_rows = Vec::new();
+        for (idx, item) in validated.rows.into_iter().enumerate() {
+            out_rows.push(map_statement_row(idx as i64 + 1, &request.account_id, item));
+        }
+        let rows = dedupe_mapped_rows(out_rows);
+        let diagnostics = serde_json::json!({
+            "provider": "llamaextract_jobs",
+            "provider_lineage": {
+                "provider": "llamaextract_jobs",
+                "file_id": uploaded.file_id,
+                "job_id": created.job_id,
+                "run_id": created.run_id,
+                "agent_id": agent_id,
+            },
+            "poll_status_trail": polled.status_trail,
+            "statement_context": {
+                "period_start": period_start,
+                "period_end": period_end,
+                "period_derived": period_derived,
+                "statement_month": validated.statement_month,
+                "schema_version": cfg.llama_schema_version,
+            },
+            "terminal_status": polled.terminal_status.as_str(),
+            "validation_counts": {
+                "rows_total": rows.len(),
+                "rows_with_parse_error": rows.iter().filter(|r| r.parse_error.is_some()).count(),
+            }
+        });
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_flow_completed",
+            "import_id": request.import_id,
+            "provider": "llamaextract_jobs",
+            "file_id": uploaded.file_id,
+            "job_id": created.job_id,
+            "run_id": created.run_id,
+            "terminal_status": polled.terminal_status.as_str(),
+            "rows_total": rows.len(),
+            "rows_with_parse_error": rows.iter().filter(|r| r.parse_error.is_some()).count(),
+            "period_start": period_start,
+            "period_end": period_end,
+            "period_derived": period_derived,
+        }));
+        Ok(ExtractionResult {
+            rows,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            effective_provider: Some("llamaextract_jobs".to_string()),
+            attempts: vec![ProviderAttempt {
+                provider: "llamaextract_jobs".to_string(),
+                attempt_no: 1,
+                status_code: Some(200),
+                outcome: "success".to_string(),
+                error_code: None,
+                error_message: None,
+                latency_ms: 0,
+                retry_decision: "stop".to_string(),
+                raw_response: Some(fetched.raw_response),
+                truncated: fetched.truncated,
+            }],
+            diagnostics,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobsUploadResult {
+    file_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct JobsCreateResult {
+    job_id: String,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JobsPollResult {
+    terminal_status: JobsTerminalStatus,
+    status_trail: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct JobsResultPayload {
+    payload: Value,
+    raw_response: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StatementRowCandidate {
+    booked_at: Option<String>,
+    description: Option<String>,
+    amount_cents: Option<i64>,
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedJobsStatement {
+    period_start: Option<String>,
+    period_end: Option<String>,
+    statement_month: Option<String>,
+    rows: Vec<StatementRowCandidate>,
+}
+
+async fn jobs_upload_file(
+    http: &reqwest::Client,
+    request: &ExtractionRequest,
+    api_key: &str,
+    timeout_ms: u64,
+    base_url: &str,
+) -> anyhow::Result<JobsUploadResult> {
+    let candidate_forms = [
+        ("/api/v1/beta/files", "file", true),
+        ("/api/v1/files", "upload_file", false),
+        ("/api/v1/files", "file", false),
+    ];
+    let mut last_error: Option<String> = None;
+    for (path, file_field, include_purpose) in candidate_forms {
+        let endpoint = format!("{base_url}{path}");
+        let file_part = reqwest::multipart::Part::bytes(request.bytes.clone())
+            .file_name(request.file_name.clone())
+            .mime_str("application/pdf")
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_BAD_REQUEST: {e}"))?;
+        let purpose = env::var("LLAMAEXTRACT_FILE_PURPOSE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "extract".to_string());
+        let mut form = reqwest::multipart::Form::new().part(file_field, file_part);
+        if include_purpose {
+            form = form.text("purpose", purpose);
+        }
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_upload_attempt",
+            "import_id": request.import_id,
+            "file_name": request.file_name,
+            "endpoint_path": path,
+            "file_field": file_field,
+            "include_purpose": include_purpose,
+        }));
+        let response = http
+            .post(endpoint.clone())
+            .header("Authorization", format!("Bearer {api_key}"))
+            .multipart(form)
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "jobs_upload_transport_error",
+                "import_id": request.import_id,
+                "endpoint_path": path,
+                "file_field": file_field,
+            }));
+            continue;
+        };
+        let status = response.status();
+        let response_headers = redact_headers(response.headers());
+        let raw = response.text().await.unwrap_or_default();
+        log_external_api_raw_event(&ExternalApiRawEvent {
+            ts_utc: chrono::Utc::now().to_rfc3339(),
+            kind: "external_api_raw",
+            import_id: Some(request.import_id.clone()),
+            file_name: Some(request.file_name.clone()),
+            provider: "llamaextract_jobs".to_string(),
+            attempt_no: None,
+            operation: "jobs_upload_file".to_string(),
+            method: "POST".to_string(),
+            url: endpoint.clone(),
+            request_body_meta: Some(serde_json::json!({
+                "endpoint_path": path,
+                "file_field": file_field,
+                "include_purpose": include_purpose,
+            })),
+            status_code: Some(status.as_u16()),
+            response_headers_redacted: response_headers,
+            response_body_raw: Some(raw.clone()),
+            error_message: None,
+        });
+        if !status.is_success() {
+            let raw_trimmed = truncate_for_log(raw.as_str(), 800);
+            last_error = Some(format!(
+                "path={path} file_field={file_field} include_purpose={include_purpose} status={} body={}",
+                status.as_u16(),
+                raw_trimmed
+            ));
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "jobs_upload_non_success",
+                "import_id": request.import_id,
+                "endpoint_path": path,
+                "file_field": file_field,
+                "include_purpose": include_purpose,
+                "status_code": status.as_u16(),
+                "response_body": raw_trimmed,
+            }));
+            if matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ) {
+                continue;
+            }
+            return Err(anyhow!(
+                "MANAGED_PROVIDER_API_UNREACHABLE: file upload failed ({}): {}",
+                status.as_u16(),
+                raw
+            ));
+        }
+        let value: Value = serde_json::from_str(raw.as_str())
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: upload invalid json: {e}"))?;
+        let file_id = find_string_field(
+            &value,
+            &["id", "file_id", "data.id", "data.file_id", "file.id"],
+        )
+        .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: upload missing file id"))?;
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_upload_success",
+            "import_id": request.import_id,
+            "file_name": request.file_name,
+            "file_id": file_id,
+            "endpoint_path": path,
+            "file_field": file_field,
+            "include_purpose": include_purpose,
+        }));
+        return Ok(JobsUploadResult { file_id });
+    }
+    let detail = last_error.unwrap_or_else(|| "upload request could not be completed".to_string());
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "jobs_upload_failed",
+        "import_id": request.import_id,
+        "detail": detail,
+    }));
+    Err(anyhow!("MANAGED_PROVIDER_API_UNREACHABLE: {detail}"))
+}
+
+async fn jobs_create_extraction_job(
+    http: &reqwest::Client,
+    request: &ExtractionRequest,
+    api_key: &str,
+    timeout_ms: u64,
+    base_url: &str,
+    file_id: &str,
+    agent_id: &str,
+) -> anyhow::Result<JobsCreateResult> {
+    let endpoint = format!("{base_url}/api/v1/extraction/jobs");
+    let bodies = [
+        serde_json::json!({
+            "extraction_agent_id": agent_id,
+            "file_id": file_id,
+        }),
+        serde_json::json!({
+            "agent_id": agent_id,
+            "file_id": file_id,
+        }),
+    ];
+    let mut last_error: Option<String> = None;
+    for body in bodies {
+        let body_keys = body
+            .as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_create_attempt",
+            "import_id": request.import_id,
+            "job_endpoint": endpoint,
+            "body_keys": body_keys,
+        }));
+        let response = http
+            .post(endpoint.clone())
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .await
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_API_UNREACHABLE: {e}"))?;
+        let status = response.status();
+        let response_headers = redact_headers(response.headers());
+        let raw = response.text().await.unwrap_or_default();
+        log_external_api_raw_event(&ExternalApiRawEvent {
+            ts_utc: chrono::Utc::now().to_rfc3339(),
+            kind: "external_api_raw",
+            import_id: Some(request.import_id.clone()),
+            file_name: Some(request.file_name.clone()),
+            provider: "llamaextract_jobs".to_string(),
+            attempt_no: None,
+            operation: "jobs_create_extraction_job".to_string(),
+            method: "POST".to_string(),
+            url: endpoint.clone(),
+            request_body_meta: Some(serde_json::json!({
+                "body_keys": body_keys,
+            })),
+            status_code: Some(status.as_u16()),
+            response_headers_redacted: response_headers,
+            response_body_raw: Some(raw.clone()),
+            error_message: None,
+        });
+        if !status.is_success() {
+            let raw_trimmed = truncate_for_log(raw.as_str(), 800);
+            last_error = Some(format!(
+                "job create failed with body_keys={:?} status={} body={}",
+                body_keys,
+                status.as_u16(),
+                raw_trimmed
+            ));
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "jobs_create_non_success",
+                "import_id": request.import_id,
+                "status_code": status.as_u16(),
+                "body_keys": body_keys,
+                "response_body": raw_trimmed,
+            }));
+            if matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY) {
+                continue;
+            }
+            return Err(anyhow!(
+                "MANAGED_PROVIDER_API_UNREACHABLE: job create failed ({}): {}",
+                status.as_u16(),
+                raw
+            ));
+        }
+        let value: Value = serde_json::from_str(raw.as_str())
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: create invalid json: {e}"))?;
+        let job_id = find_string_field(&value, &["id", "job_id", "data.id", "data.job_id"])
+            .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: create missing job id"))?;
+        let run_id = find_string_field(&value, &["run_id", "data.run_id"]);
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_create_success",
+            "import_id": request.import_id,
+            "job_id": job_id,
+            "run_id": run_id,
+        }));
+        return Ok(JobsCreateResult { job_id, run_id });
+    }
+    let detail = last_error.unwrap_or_else(|| "job create did not return a response".to_string());
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "jobs_create_failed",
+        "import_id": request.import_id,
+        "detail": detail,
+    }));
+    Err(anyhow!("MANAGED_PROVIDER_API_UNREACHABLE: {detail}"))
+}
+
+async fn jobs_poll_status(
+    http: &reqwest::Client,
+    request: &ExtractionRequest,
+    api_key: &str,
+    timeout_ms: u64,
+    base_url: &str,
+    job_id: &str,
+) -> anyhow::Result<JobsPollResult> {
+    let max_polls = env::var("LLAMAEXTRACT_POLL_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+        .clamp(3, 180);
+    let hard_cap = Duration::from_secs(JOBS_POLL_HARD_CAP_SECS);
+    let poll_started_at = Instant::now();
+    let mut trail = Vec::new();
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "jobs_poll_start",
+        "import_id": request.import_id,
+        "job_id": job_id,
+        "max_polls": max_polls,
+        "hard_cap_seconds": JOBS_POLL_HARD_CAP_SECS,
+    }));
+
+    for poll_no in 1..=max_polls {
+        if poll_started_at.elapsed() >= hard_cap {
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "jobs_poll_timeout",
+                "import_id": request.import_id,
+                "job_id": job_id,
+                "reason": "hard_cap_reached_before_poll",
+                "elapsed_ms": poll_started_at.elapsed().as_millis(),
+                "hard_cap_ms": hard_cap.as_millis(),
+            }));
+            return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+        }
+        let endpoint = format!("{base_url}/api/v1/extraction/jobs/{job_id}");
+        let response = http
+            .get(endpoint.clone())
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("accept", "application/json")
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .await
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_API_UNREACHABLE: {e}"))?;
+        let status = response.status();
+        let response_headers = redact_headers(response.headers());
+        let raw = response.text().await.unwrap_or_default();
+        log_external_api_raw_event(&ExternalApiRawEvent {
+            ts_utc: chrono::Utc::now().to_rfc3339(),
+            kind: "external_api_raw",
+            import_id: Some(request.import_id.clone()),
+            file_name: Some(request.file_name.clone()),
+            provider: "llamaextract_jobs".to_string(),
+            attempt_no: Some(poll_no as i64),
+            operation: "jobs_poll_status".to_string(),
+            method: "GET".to_string(),
+            url: endpoint.clone(),
+            request_body_meta: None,
+            status_code: Some(status.as_u16()),
+            response_headers_redacted: response_headers,
+            response_body_raw: Some(raw.clone()),
+            error_message: None,
+        });
+        if !status.is_success() {
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "jobs_poll_non_success",
+                "import_id": request.import_id,
+                "job_id": job_id,
+                "poll_no": poll_no,
+                "status_code": status.as_u16(),
+                "response_body": truncate_for_log(raw.as_str(), 800),
+            }));
+            return Err(anyhow!(
+                "MANAGED_PROVIDER_API_UNREACHABLE: poll failed ({}): {}",
+                status.as_u16(),
+                raw
+            ));
+        }
+        let value: Value = serde_json::from_str(raw.as_str())
+            .map_err(|e| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: poll invalid json: {e}"))?;
+        let state = find_string_field(
+            &value,
+            &["status", "state", "data.status", "data.state", "job.status", "job.state"],
+        )
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+        trail.push(serde_json::json!({
+            "poll_no": poll_no,
+            "status": state,
+        }));
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_poll_tick",
+            "import_id": request.import_id,
+            "job_id": job_id,
+            "poll_no": poll_no,
+            "status": state,
+        }));
+        match classify_job_status(state.as_str()) {
+            JobStatusClass::TerminalSuccess(terminal) => {
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "jobs_poll_terminal_success",
+                    "import_id": request.import_id,
+                    "job_id": job_id,
+                    "poll_no": poll_no,
+                    "status": terminal.as_str(),
+                }));
+                return Ok(JobsPollResult {
+                    terminal_status: terminal,
+                    status_trail: trail,
+                });
+            }
+            JobStatusClass::TerminalFailure(terminal) => {
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "jobs_poll_terminal_failure",
+                    "import_id": request.import_id,
+                    "job_id": job_id,
+                    "poll_no": poll_no,
+                    "status": terminal.as_str(),
+                }));
+                return Err(anyhow!(
+                    "MANAGED_PROVIDER_API_UNREACHABLE: terminal status {}",
+                    terminal.as_str()
+                ));
+            }
+            JobStatusClass::InProgress => {
+                let delay = adaptive_poll_delay(poll_no as i64);
+                let elapsed = poll_started_at.elapsed();
+                if elapsed + delay >= hard_cap {
+                    log_bootstrap_event(serde_json::json!({
+                        "ts_utc": chrono::Utc::now().to_rfc3339(),
+                        "kind": "jobs_poll_timeout",
+                        "import_id": request.import_id,
+                        "job_id": job_id,
+                        "reason": "hard_cap_reached_during_backoff",
+                        "elapsed_ms": elapsed.as_millis(),
+                        "hard_cap_ms": hard_cap.as_millis(),
+                        "poll_no": poll_no,
+                    }));
+                    return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+                }
+                sleep(delay).await;
+            }
+            JobStatusClass::Unknown => {
+                if poll_no == max_polls {
+                    log_bootstrap_event(serde_json::json!({
+                        "ts_utc": chrono::Utc::now().to_rfc3339(),
+                        "kind": "jobs_poll_unknown_status_exhausted",
+                        "import_id": request.import_id,
+                        "job_id": job_id,
+                        "poll_no": poll_no,
+                        "status": state,
+                    }));
+                    return Err(anyhow!("MANAGED_PROVIDER_UNKNOWN_STATUS: {}", state));
+                }
+                let delay = adaptive_poll_delay(poll_no as i64);
+                let elapsed = poll_started_at.elapsed();
+                if elapsed + delay >= hard_cap {
+                    log_bootstrap_event(serde_json::json!({
+                        "ts_utc": chrono::Utc::now().to_rfc3339(),
+                        "kind": "jobs_poll_timeout",
+                        "import_id": request.import_id,
+                        "job_id": job_id,
+                        "reason": "hard_cap_reached_during_backoff",
+                        "elapsed_ms": elapsed.as_millis(),
+                        "hard_cap_ms": hard_cap.as_millis(),
+                        "poll_no": poll_no,
+                        "status": state,
+                    }));
+                    return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+                }
+                sleep(delay).await;
+            }
+        }
+    }
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "jobs_poll_timeout",
+        "import_id": request.import_id,
+        "job_id": job_id,
+        "reason": "max_polls_exhausted",
+        "elapsed_ms": poll_started_at.elapsed().as_millis(),
+        "hard_cap_ms": hard_cap.as_millis(),
+    }));
+    Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling exhausted"))
+}
+
+async fn jobs_fetch_result(
+    http: &reqwest::Client,
+    request: &ExtractionRequest,
+    api_key: &str,
+    timeout_ms: u64,
+    base_url: &str,
+    job_id: &str,
+) -> anyhow::Result<JobsResultPayload> {
+    let endpoint = format!("{base_url}/api/v1/extraction/jobs/{job_id}/result");
+    let response = http
+        .get(endpoint.clone())
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("accept", "application/json")
+        .timeout(Duration::from_millis(timeout_ms))
+        .send()
+        .await
+        .map_err(|e| anyhow!("MANAGED_PROVIDER_API_UNREACHABLE: {e}"))?;
+    let status = response.status();
+    let response_headers = redact_headers(response.headers());
+    let raw = response.text().await.unwrap_or_default();
+    log_external_api_raw_event(&ExternalApiRawEvent {
+        ts_utc: chrono::Utc::now().to_rfc3339(),
+        kind: "external_api_raw",
+        import_id: Some(request.import_id.clone()),
+        file_name: Some(request.file_name.clone()),
+        provider: "llamaextract_jobs".to_string(),
+        attempt_no: None,
+        operation: "jobs_fetch_result".to_string(),
+        method: "GET".to_string(),
+        url: endpoint.clone(),
+        request_body_meta: None,
+        status_code: Some(status.as_u16()),
+        response_headers_redacted: response_headers,
+        response_body_raw: Some(raw.clone()),
+        error_message: None,
+    });
+    if !status.is_success() {
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "jobs_result_non_success",
+            "import_id": request.import_id,
+            "job_id": job_id,
+            "status_code": status.as_u16(),
+            "response_body": truncate_for_log(raw.as_str(), 800),
+        }));
+        return Err(anyhow!(
+            "MANAGED_PROVIDER_API_UNREACHABLE: fetch result failed ({}): {}",
+            status.as_u16(),
+            raw
+        ));
+    }
+    let value: Value = serde_json::from_str(raw.as_str())
+        .map_err(|e| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: result invalid json: {e}"))?;
+    let raw_preview = truncate_for_log(raw.as_str(), 4000);
+    let (raw_response, truncated) = truncate_raw(raw.clone());
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "jobs_result_fetched",
+        "import_id": request.import_id,
+        "job_id": job_id,
+        "payload_top_keys": value
+            .as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "response_body": raw_preview,
+    }));
+    Ok(JobsResultPayload {
+        payload: value,
+        raw_response,
+        truncated,
+    })
+}
+
+fn truncate_for_log(raw: &str, max_chars: usize) -> String {
+    if raw.len() <= max_chars {
+        return raw.to_string();
+    }
+    let mut out = raw.chars().take(max_chars).collect::<String>();
+    out.push_str("...(truncated)");
+    out
+}
+
+enum JobStatusClass {
+    TerminalSuccess(JobsTerminalStatus),
+    TerminalFailure(JobsTerminalStatus),
+    InProgress,
+    Unknown,
+}
+
+fn classify_job_status(raw: &str) -> JobStatusClass {
+    match raw {
+        "SUCCESS" => JobStatusClass::TerminalSuccess(JobsTerminalStatus::Success),
+        "PARTIAL_SUCCESS" => JobStatusClass::TerminalSuccess(JobsTerminalStatus::PartialSuccess),
+        "ERROR" => JobStatusClass::TerminalFailure(JobsTerminalStatus::Error),
+        "CANCELLED" => JobStatusClass::TerminalFailure(JobsTerminalStatus::Cancelled),
+        "PENDING" | "QUEUED" | "RUNNING" | "IN_PROGRESS" => JobStatusClass::InProgress,
+        _ => JobStatusClass::Unknown,
+    }
+}
+
+fn validate_jobs_result_payload(payload: &Value) -> anyhow::Result<ValidatedJobsStatement> {
+    let envelope = payload
+        .get("result")
+        .or_else(|| payload.get("data"))
+        .or_else(|| payload.get("output"))
+        .unwrap_or(payload);
+    let period_start = envelope
+        .get("period_start")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let period_end = envelope
+        .get("period_end")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let statement_month = envelope
+        .get("statement_month")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let txs = envelope
+        .get("transactions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: missing transactions[]"))?;
+    let mut rows = Vec::new();
+    for item in txs {
+        rows.push(StatementRowCandidate {
+            booked_at: item.get("booked_at").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            description: item.get("description").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            amount_cents: item.get("amount_cents").and_then(|v| v.as_i64()),
+            confidence: item.get("confidence").and_then(|v| v.as_f64()),
+        });
+    }
+    if rows.is_empty() {
+        return Err(anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: no transaction rows"));
+    }
+    Ok(ValidatedJobsStatement {
+        period_start,
+        period_end,
+        statement_month,
+        rows,
+    })
+}
+
+fn resolve_period(
+    period_start: Option<String>,
+    period_end: Option<String>,
+    rows: &[StatementRowCandidate],
+) -> anyhow::Result<(String, String, bool)> {
+    if let (Some(start), Some(end)) = (period_start, period_end) {
+        return Ok((start, end, false));
+    }
+    let mut dates = rows
+        .iter()
+        .filter_map(|r| r.booked_at.as_deref())
+        .filter(|d| is_iso_date(d))
+        .collect::<Vec<_>>();
+    dates.sort_unstable();
+    let start = dates
+        .first()
+        .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: cannot derive period_start"))?;
+    let end = dates
+        .last()
+        .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: cannot derive period_end"))?;
+    Ok(((*start).to_string(), (*end).to_string(), true))
+}
+
+fn map_statement_row(row_index: i64, account_id: &str, row: StatementRowCandidate) -> ExtractedRow {
+    let mut parse_errors = Vec::new();
+    let booked_at = match row.booked_at {
+        Some(v) if is_iso_date(v.as_str()) => v,
+        Some(v) => {
+            parse_errors.push(format!("invalid booked_at format: {v}"));
+            "1970-01-01".to_string()
+        }
+        None => {
+            parse_errors.push("missing booked_at".to_string());
+            "1970-01-01".to_string()
+        }
+    };
+    let description = row.description.unwrap_or_else(|| {
+        parse_errors.push("missing description".to_string());
+        "Unknown transaction".to_string()
+    });
+    let amount_cents = row.amount_cents.unwrap_or_else(|| {
+        parse_errors.push("missing amount_cents".to_string());
+        0
+    });
+    let normalized_description = normalize_description(description.as_str());
+    let normalized_txn_hash =
+        compute_row_hash(account_id, booked_at.as_str(), amount_cents, normalized_description.as_str());
+    ExtractedRow {
+        row_index,
+        booked_at,
+        amount_cents,
+        description: normalized_description,
+        confidence: row.confidence.unwrap_or(0.7),
+        parse_error: if parse_errors.is_empty() {
+            None
+        } else {
+            Some(parse_errors.join("; "))
+        },
+        normalized_txn_hash,
+    }
+}
+
+fn find_string_field(root: &Value, paths: &[&str]) -> Option<String> {
+    for path in paths {
+        let mut current = root;
+        let mut ok = true;
+        for part in path.split('.') {
+            if let Some(next) = current.get(part) {
+                current = next;
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            if let Some(value) = current.as_str() {
+                if !value.trim().is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn versioned_agent_name(base_name: &str, schema_version: &str) -> String {
     format!("{}--{}", base_name.trim(), schema_version.trim())
 }
@@ -606,6 +1469,7 @@ async fn validate_schema_with_llama(
         "/api/v1/extraction/extraction-agents/schema/validation",
         config,
     )?;
+    let url_for_log = url.to_string();
     let payload = serde_json::json!({
         "data_schema": schema,
         "schema": schema
@@ -624,17 +1488,37 @@ async fn validate_schema_with_llama(
         .await
         .map_err(map_bootstrap_network_error)?;
 
-    if response.status().is_success() {
+    let status_code = response.status().as_u16();
+    let response_headers = redact_headers(response.headers());
+    let body = response.text().await.unwrap_or_default();
+    log_external_api_raw_event(&ExternalApiRawEvent {
+        ts_utc: chrono::Utc::now().to_rfc3339(),
+        kind: "external_api_raw",
+        import_id: None,
+        file_name: None,
+        provider: "llamaextract_bootstrap".to_string(),
+        attempt_no: None,
+        operation: "bootstrap_validate_schema".to_string(),
+        method: "POST".to_string(),
+        url: url_for_log,
+        request_body_meta: Some(serde_json::json!({
+            "payload_keys": ["data_schema", "schema"],
+        })),
+        status_code: Some(status_code),
+        response_headers_redacted: response_headers,
+        response_body_raw: Some(body.clone()),
+        error_message: None,
+    });
+
+    if (200..300).contains(&status_code) {
         log_bootstrap_event(serde_json::json!({
             "ts_utc": chrono::Utc::now().to_rfc3339(),
             "kind": "bootstrap_schema_validation_success",
-            "status_code": response.status().as_u16(),
+            "status_code": status_code,
         }));
         return Ok(());
     }
 
-    let status_code = response.status().as_u16();
-    let body = response.text().await.unwrap_or_default();
     let code = if status_code == 400 || status_code == 422 {
         "EXTRACTION_SCHEMA_INVALID"
     } else {
@@ -654,6 +1538,7 @@ async fn find_llama_agent_id(
     desired_name: &str,
 ) -> Result<Option<String>, LlamaAgentBootstrapError> {
     let url = scoped_url(base_url, "/api/v1/extraction/extraction-agents", config)?;
+    let url_for_log = url.to_string();
     log_bootstrap_event(serde_json::json!({
         "ts_utc": chrono::Utc::now().to_rfc3339(),
         "kind": "bootstrap_agent_list_request",
@@ -667,19 +1552,35 @@ async fn find_llama_agent_id(
         .await
         .map_err(map_bootstrap_network_error)?;
 
-    if !response.status().is_success() {
-        let status_code = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+    let status_code = response.status().as_u16();
+    let response_headers = redact_headers(response.headers());
+    let raw_body = response.text().await.unwrap_or_default();
+    log_external_api_raw_event(&ExternalApiRawEvent {
+        ts_utc: chrono::Utc::now().to_rfc3339(),
+        kind: "external_api_raw",
+        import_id: None,
+        file_name: None,
+        provider: "llamaextract_bootstrap".to_string(),
+        attempt_no: None,
+        operation: "bootstrap_find_agent".to_string(),
+        method: "GET".to_string(),
+        url: url_for_log,
+        request_body_meta: None,
+        status_code: Some(status_code),
+        response_headers_redacted: response_headers,
+        response_body_raw: Some(raw_body.clone()),
+        error_message: None,
+    });
+
+    if !(200..300).contains(&status_code) {
         return Err(LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
-            message: format!("agent list failed ({status_code}): {body}"),
+            message: format!("agent list failed ({status_code}): {raw_body}"),
             status_code: Some(status_code),
         });
     }
 
-    let body: Value = response
-        .json()
-        .await
+    let body: Value = serde_json::from_str(raw_body.as_str())
         .map_err(|e| LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
             message: format!("agent list returned invalid json: {e}"),
@@ -704,6 +1605,7 @@ async fn create_llama_agent(
     schema: &Value,
 ) -> Result<String, LlamaAgentBootstrapError> {
     let url = scoped_url(base_url, "/api/v1/extraction/extraction-agents", config)?;
+    let url_for_log = url.to_string();
     let payload = serde_json::json!({
         "name": agent_name,
         "data_schema": schema,
@@ -726,19 +1628,38 @@ async fn create_llama_agent(
         .await
         .map_err(map_bootstrap_network_error)?;
 
-    if !response.status().is_success() {
-        let status_code = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+    let status_code = response.status().as_u16();
+    let response_headers = redact_headers(response.headers());
+    let raw_body = response.text().await.unwrap_or_default();
+    log_external_api_raw_event(&ExternalApiRawEvent {
+        ts_utc: chrono::Utc::now().to_rfc3339(),
+        kind: "external_api_raw",
+        import_id: None,
+        file_name: None,
+        provider: "llamaextract_bootstrap".to_string(),
+        attempt_no: None,
+        operation: "bootstrap_create_agent".to_string(),
+        method: "POST".to_string(),
+        url: url_for_log,
+        request_body_meta: Some(serde_json::json!({
+            "agent_name": agent_name,
+            "payload_keys": ["name", "data_schema", "config"],
+        })),
+        status_code: Some(status_code),
+        response_headers_redacted: response_headers,
+        response_body_raw: Some(raw_body.clone()),
+        error_message: None,
+    });
+
+    if !(200..300).contains(&status_code) {
         return Err(LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
-            message: format!("agent create failed ({status_code}): {body}"),
+            message: format!("agent create failed ({status_code}): {raw_body}"),
             status_code: Some(status_code),
         });
     }
 
-    let body: Value = response
-        .json()
-        .await
+    let body: Value = serde_json::from_str(raw_body.as_str())
         .map_err(|e| LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
             message: format!("agent create returned invalid json: {e}"),
@@ -862,6 +1783,24 @@ struct HttpCallEvent {
     truncated: bool,
     latency_ms: i64,
     error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExternalApiRawEvent {
+    ts_utc: String,
+    kind: &'static str,
+    import_id: Option<String>,
+    file_name: Option<String>,
+    provider: String,
+    attempt_no: Option<i64>,
+    operation: String,
+    method: String,
+    url: String,
+    request_body_meta: Option<Value>,
+    status_code: Option<u16>,
+    response_headers_redacted: Value,
+    response_body_raw: Option<String>,
     error_message: Option<String>,
 }
 
@@ -1710,6 +2649,23 @@ where
             let response_headers = redact_headers(response.headers());
             let raw = response.text().await.unwrap_or_default();
             let latency_ms = started.elapsed().as_millis() as i64;
+            let raw_event = ExternalApiRawEvent {
+                ts_utc: chrono::Utc::now().to_rfc3339(),
+                kind: "external_api_raw",
+                import_id: Some(meta.import_id.to_string()),
+                file_name: Some(meta.file_name.to_string()),
+                provider: meta.provider.to_string(),
+                attempt_no: Some(meta.attempt_no),
+                operation: meta.operation.clone(),
+                method: meta.method.to_string(),
+                url: meta.url.clone(),
+                request_body_meta: Some(meta.request_body_meta.clone()),
+                status_code: Some(status.as_u16()),
+                response_headers_redacted: response_headers.clone(),
+                response_body_raw: Some(raw.clone()),
+                error_message: None,
+            };
+            log_external_api_raw_event(&raw_event);
             let (raw_out, truncated) = truncate_raw(raw.clone());
             let event = HttpCallEvent {
                 ts_utc: chrono::Utc::now().to_rfc3339(),
@@ -1745,6 +2701,23 @@ where
         Err(err) => {
             let mapped = map_network_error(err);
             let latency_ms = started.elapsed().as_millis() as i64;
+            let raw_event = ExternalApiRawEvent {
+                ts_utc: chrono::Utc::now().to_rfc3339(),
+                kind: "external_api_raw",
+                import_id: Some(meta.import_id.to_string()),
+                file_name: Some(meta.file_name.to_string()),
+                provider: meta.provider.to_string(),
+                attempt_no: Some(meta.attempt_no),
+                operation: meta.operation.clone(),
+                method: meta.method.to_string(),
+                url: meta.url.clone(),
+                request_body_meta: Some(meta.request_body_meta.clone()),
+                status_code: mapped.status_code,
+                response_headers_redacted: serde_json::json!({}),
+                response_body_raw: mapped.raw_response.clone(),
+                error_message: Some(mapped.message.clone()),
+            };
+            log_external_api_raw_event(&raw_event);
             let event = HttpCallEvent {
                 ts_utc: chrono::Utc::now().to_rfc3339(),
                 kind: "http_call",
@@ -1958,6 +2931,15 @@ fn extraction_log_path() -> PathBuf {
         .join("extraction-provider.log")
 }
 
+fn external_api_raw_log_path() -> PathBuf {
+    if let Ok(explicit) = env::var("EXPENSE_EXTERNAL_API_RAW_LOG_PATH") {
+        return PathBuf::from(explicit);
+    }
+    expense_core::default_app_data_dir()
+        .join("logs")
+        .join("external-api-raw.log")
+}
+
 fn should_log_full_response() -> bool {
     // Intentional for local development and debugging provider behavior.
     // Revisit before production to avoid storing sensitive financial payloads by default.
@@ -1965,6 +2947,19 @@ fn should_log_full_response() -> bool {
         .ok()
         .map(|v| v == "false" || v == "0")
         .unwrap_or(false)
+}
+
+fn log_external_api_raw_event(event: &ExternalApiRawEvent) {
+    let log_path = external_api_raw_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(event) {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 #[cfg(test)]
@@ -2334,5 +3329,60 @@ mod tests {
         let rendered = url.as_str().to_string();
         assert!(!rendered.contains("organization_id="));
         assert!(!rendered.contains("project_id="));
+    }
+
+    #[test]
+    fn classify_job_status_maps_known_buckets() {
+        assert!(matches!(
+            classify_job_status("SUCCESS"),
+            JobStatusClass::TerminalSuccess(JobsTerminalStatus::Success)
+        ));
+        assert!(matches!(
+            classify_job_status("PARTIAL_SUCCESS"),
+            JobStatusClass::TerminalSuccess(JobsTerminalStatus::PartialSuccess)
+        ));
+        assert!(matches!(
+            classify_job_status("ERROR"),
+            JobStatusClass::TerminalFailure(JobsTerminalStatus::Error)
+        ));
+        assert!(matches!(
+            classify_job_status("RUNNING"),
+            JobStatusClass::InProgress
+        ));
+        assert!(matches!(classify_job_status("UNSEEN"), JobStatusClass::Unknown));
+    }
+
+    #[test]
+    fn validate_jobs_result_payload_requires_transactions_array() {
+        let payload = serde_json::json!({
+            "result": {
+                "period_start": "2026-03-01",
+                "period_end": "2026-03-31"
+            }
+        });
+        let err = validate_jobs_result_payload(&payload).expect_err("missing transactions");
+        assert!(err.to_string().contains("MANAGED_PROVIDER_SCHEMA_INVALID"));
+    }
+
+    #[test]
+    fn resolve_period_derives_when_missing() {
+        let rows = vec![
+            StatementRowCandidate {
+                booked_at: Some("2026-03-01".to_string()),
+                description: Some("a".to_string()),
+                amount_cents: Some(10),
+                confidence: Some(0.8),
+            },
+            StatementRowCandidate {
+                booked_at: Some("2026-03-31".to_string()),
+                description: Some("b".to_string()),
+                amount_cents: Some(20),
+                confidence: Some(0.8),
+            },
+        ];
+        let (start, end, derived) = resolve_period(None, None, &rows).expect("derived");
+        assert_eq!(start, "2026-03-01");
+        assert_eq!(end, "2026-03-31");
+        assert!(derived);
     }
 }

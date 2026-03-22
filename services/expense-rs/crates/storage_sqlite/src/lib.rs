@@ -48,6 +48,7 @@ pub struct ParsedRowInput {
     pub parse_error: Option<String>,
     pub normalized_txn_hash: String,
     pub account_id: Option<String>,
+    pub statement_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +167,20 @@ pub struct LlamaAgentReadiness {
     pub checked_at: String,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatementRecord {
+    pub id: String,
+    pub account_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub statement_month: Option<String>,
+    pub provider_name: Option<String>,
+    pub provider_job_id: Option<String>,
+    pub provider_run_id: Option<String>,
+    pub provider_metadata_json: serde_json::Value,
+    pub schema_version: String,
 }
 
 impl Default for ExtractionSettings {
@@ -434,6 +449,79 @@ pub async fn upsert_llama_agent_readiness(
     Ok(readiness.clone())
 }
 
+pub async fn get_statement_by_account_period(
+    pool: &SqlitePool,
+    account_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> anyhow::Result<Option<StatementRecord>> {
+    let row = sqlx::query(
+        "SELECT id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3",
+    )
+    .bind(account_id)
+    .bind(period_start)
+    .bind(period_end)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let metadata_raw: String = row.get("provider_metadata_json");
+    Ok(Some(StatementRecord {
+        id: row.get("id"),
+        account_id: row.get("account_id"),
+        period_start: row.get("period_start"),
+        period_end: row.get("period_end"),
+        statement_month: row.get("statement_month"),
+        provider_name: row.get("provider_name"),
+        provider_job_id: row.get("provider_job_id"),
+        provider_run_id: row.get("provider_run_id"),
+        provider_metadata_json: serde_json::from_str(metadata_raw.as_str())
+            .unwrap_or_else(|_| serde_json::json!({})),
+        schema_version: row.get("schema_version"),
+    }))
+}
+
+pub async fn upsert_or_get_statement(
+    pool: &SqlitePool,
+    account_id: &str,
+    period_start: &str,
+    period_end: &str,
+    statement_month: Option<&str>,
+    provider_name: Option<&str>,
+    provider_job_id: Option<&str>,
+    provider_run_id: Option<&str>,
+    provider_metadata_json: &serde_json::Value,
+    schema_version: &str,
+) -> anyhow::Result<StatementRecord> {
+    if let Some(existing) =
+        get_statement_by_account_period(pool, account_id, period_start, period_end).await?
+    {
+        return Ok(existing);
+    }
+
+    let statement_id = new_idempotency_key();
+    sqlx::query(
+        "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)",
+    )
+    .bind(&statement_id)
+    .bind(account_id)
+    .bind(period_start)
+    .bind(period_end)
+    .bind(statement_month)
+    .bind(provider_name)
+    .bind(provider_job_id)
+    .bind(provider_run_id)
+    .bind(provider_metadata_json.to_string())
+    .bind(schema_version)
+    .execute(pool)
+    .await?;
+
+    get_statement_by_account_period(pool, account_id, period_start, period_end)
+        .await?
+        .ok_or_else(|| anyhow!("statement upsert load failed"))
+}
+
 pub async fn get_import_content(pool: &SqlitePool, import_id: &str) -> anyhow::Result<ImportBlob> {
     let row = sqlx::query(
         "SELECT parser_type, content_base64, extraction_mode, file_name FROM imports WHERE id = ?1",
@@ -467,7 +555,7 @@ pub async fn insert_import_rows(
     for row in rows {
         let has_parse_error = row.parse_error.is_some();
         sqlx::query(
-            "INSERT INTO import_rows (id, import_id, row_index, normalized_json, confidence, parse_error, normalized_txn_hash, approved, rejection_reason, account_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO import_rows (id, import_id, row_index, normalized_json, confidence, parse_error, normalized_txn_hash, approved, rejection_reason, account_id, statement_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(new_idempotency_key())
         .bind(import_id)
@@ -479,6 +567,7 @@ pub async fn insert_import_rows(
         .bind(if has_parse_error { 0 } else { 1 })
         .bind(Option::<String>::None)
         .bind(row.account_id)
+        .bind(row.statement_id)
         .execute(pool)
         .await?;
     }
@@ -577,7 +666,7 @@ pub async fn commit_import_rows(
     let mut tx = pool.begin().await?;
 
     let rows = sqlx::query(
-        "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id FROM import_rows WHERE import_id = ?1 AND parse_error IS NULL AND approved = 1",
+        "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id, statement_id FROM import_rows WHERE import_id = ?1 AND parse_error IS NULL AND approved = 1",
     )
     .bind(import_id)
     .fetch_all(&mut *tx)
@@ -607,7 +696,7 @@ pub async fn commit_import_rows(
             .ok_or_else(|| anyhow!("normalized row missing booked_at"))?;
 
         let result = sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
         )
         .bind(new_idempotency_key())
         .bind(&account_id)
@@ -619,6 +708,7 @@ pub async fn commit_import_rows(
         .bind(ClassificationSource::Manual.as_str())
         .bind(row.get::<f64, _>("confidence"))
         .bind("Imported from statement")
+        .bind(row.get::<Option<String>, _>("statement_id"))
         .execute(&mut *tx)
         .await?;
 
@@ -830,6 +920,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0004_statement_foundation",
         include_str!("../../../migrations/0004_statement_foundation.sql"),
     ),
+    (
+        "0005_import_rows_statement_link",
+        include_str!("../../../migrations/0005_import_rows_statement_link.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -913,6 +1007,7 @@ mod tests {
                     parse_error: None,
                     normalized_txn_hash: "same-hash".to_string(),
                     account_id: Some(account_id.clone()),
+                    statement_id: None,
                 },
                 ParsedRowInput {
                     row_index: 2,
@@ -921,6 +1016,7 @@ mod tests {
                     parse_error: None,
                     normalized_txn_hash: "same-hash".to_string(),
                     account_id: Some(account_id),
+                    statement_id: None,
                 },
             ],
         )
@@ -977,6 +1073,7 @@ mod tests {
                     parse_error: None,
                     normalized_txn_hash: "hash-ok".to_string(),
                     account_id: Some(account_id.clone()),
+                    statement_id: None,
                 },
                 ParsedRowInput {
                     row_index: 2,
@@ -989,6 +1086,7 @@ mod tests {
                     parse_error: Some("failed parse".to_string()),
                     normalized_txn_hash: "hash-err".to_string(),
                     account_id: Some(account_id.clone()),
+                    statement_id: None,
                 },
             ],
         )
@@ -1318,6 +1416,132 @@ mod tests {
         assert_eq!(loaded.agent_name, "agent--statement_v1");
         assert_eq!(loaded.schema_version, "statement_v1");
         assert_eq!(loaded.agent_id.as_deref(), Some("agent-123"));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn upsert_or_get_statement_returns_same_record_for_same_period() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        let first = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-03-01",
+            "2026-03-31",
+            Some("2026-03"),
+            Some("llamaextract_jobs"),
+            Some("job-1"),
+            Some("run-1"),
+            &serde_json::json!({"job_id":"job-1","run_id":"run-1"}),
+            "statement_v1",
+        )
+        .await
+        .expect("first upsert");
+        let second = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-03-01",
+            "2026-03-31",
+            Some("2026-03"),
+            Some("llamaextract_jobs"),
+            Some("job-2"),
+            Some("run-2"),
+            &serde_json::json!({"job_id":"job-2","run_id":"run-2"}),
+            "statement_v1",
+        )
+        .await
+        .expect("second upsert");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.period_start, "2026-03-01");
+        assert_eq!(first.period_end, "2026-03-31");
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn commit_import_rows_persists_statement_id_linkage() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "sample.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: "".to_string(),
+                source_hash: "hash-link".to_string(),
+                extraction_mode: None,
+            },
+        )
+        .await
+        .expect("create import");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+        let statement = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-04-01",
+            "2026-04-30",
+            Some("2026-04"),
+            Some("llamaextract_jobs"),
+            Some("job-link"),
+            Some("run-link"),
+            &serde_json::json!({"job_id":"job-link","run_id":"run-link"}),
+            "statement_v1",
+        )
+        .await
+        .expect("upsert statement");
+
+        insert_import_rows(
+            &pool,
+            &import_id,
+            vec![ParsedRowInput {
+                row_index: 1,
+                normalized_json: serde_json::json!({
+                    "booked_at": "2026-04-10",
+                    "amount_cents": 4200,
+                    "description": "linked row"
+                }),
+                confidence: 0.9,
+                parse_error: None,
+                normalized_txn_hash: "link-hash".to_string(),
+                account_id: Some(account_id.clone()),
+                statement_id: Some(statement.id.clone()),
+            }],
+        )
+        .await
+        .expect("insert import row");
+
+        let committed = commit_import_rows(&pool, &import_id)
+            .await
+            .expect("commit");
+        assert_eq!(committed.inserted_count, 1);
+
+        let saved = sqlx::query(
+            "SELECT statement_id FROM transactions WHERE account_id = ?1 AND external_txn_id = ?2",
+        )
+        .bind(&account_id)
+        .bind("link-hash")
+        .fetch_one(&pool)
+        .await
+        .expect("load tx");
+        let saved_statement_id: Option<String> = saved.get("statement_id");
+        assert_eq!(saved_statement_id.as_deref(), Some(statement.id.as_str()));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
