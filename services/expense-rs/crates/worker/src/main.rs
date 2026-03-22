@@ -46,7 +46,6 @@ struct ImportJobPayload {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
-    validate_extraction_runtime_contract()?;
 
     let db_path = PathBuf::from(args.db_path);
     let pool = connect(&db_path).await?;
