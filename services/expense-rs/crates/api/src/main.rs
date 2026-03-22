@@ -19,7 +19,10 @@ use expense_core::{
 };
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use storage_sqlite::{connect, ensure_default_manual_account, run_migrations, SqlitePool};
+use storage_sqlite::{
+    connect, ensure_default_manual_account, get_llama_agent_readiness, run_migrations,
+    LlamaAgentReadiness, SqlitePool,
+};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing::info;
 
@@ -39,6 +42,7 @@ struct Args {
 struct Diagnostics {
     service: &'static str,
     sqlite: &'static str,
+    llama_agent_readiness: Option<LlamaAgentReadiness>,
 }
 
 #[tokio::main]
@@ -116,10 +120,12 @@ async fn health() -> Json<HealthStatus> {
 
 async fn diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let ping = sqlite_ping_status(&state.db).await;
+    let readiness = get_llama_agent_readiness(&state.db).await.ok().flatten();
 
     Json(Diagnostics {
         service: "expense-api",
         sqlite: ping,
+        llama_agent_readiness: readiness,
     })
 }
 
@@ -234,6 +240,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::{Mutex, OnceLock};
+    use storage_sqlite::{upsert_llama_agent_readiness, LlamaAgentReadinessState};
     use tower::util::ServiceExt;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -246,6 +253,52 @@ mod tests {
         let Json(status) = health().await;
         assert_eq!(status.service, "expense-api");
         assert_eq!(status.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_returns_llama_agent_readiness_when_present() {
+        let db_path = std::env::current_dir()
+            .expect("cwd")
+            .join(".tmp")
+            .join(format!("api-diagnostics-test-{}.db", expense_core::new_idempotency_key()));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        let pool = connect(&db_path).await.expect("connect");
+        run_migrations(&pool).await.expect("migrate");
+        ensure_default_manual_account(&pool).await.expect("default account");
+
+        upsert_llama_agent_readiness(
+            &pool,
+            &LlamaAgentReadiness {
+                state: LlamaAgentReadinessState::Configured,
+                agent_name: "agent--statement_v1".to_string(),
+                schema_version: "statement_v1".to_string(),
+                agent_id: Some("agent-123".to_string()),
+                checked_at: chrono::Utc::now().to_rfc3339(),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .expect("save readiness");
+
+        let state = Arc::new(AppState { db: pool.clone() });
+        let response = diagnostics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload
+                .get("llama_agent_readiness")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str()),
+            Some("configured")
+        );
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
     }
 
     #[test]

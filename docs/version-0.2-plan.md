@@ -1,9 +1,10 @@
 # Version 0.2 — 5-Step Technical Implementation Plan
 
-## Implementation Status (Updated March 21, 2026)
+## Implementation Status (Updated March 22, 2026)
 
 - `Step 1` is complete and validated in the current codebase.
-- `Step 2` is the next implementation target.
+- `Step 2` is complete and validated in the current codebase.
+- `Step 3` is the next implementation target.
 
 ### Step 1 Completion Record (for Step 2 handoff)
 
@@ -28,10 +29,43 @@ Validated:
   - `statements` table,
   - `transactions.statement_id` column.
 
-Important current behavior (explicit for Step 2):
+Important Step 1 snapshot (pre-Step 2 implementation):
 - `load_statement_blueprint_schema` is currently a startup guardrail only.
 - Provider extraction responses are not yet validated against full `statement_v1` at ingest time.
 - No agent auto-ensure logic exists yet (this is Step 2 scope).
+
+### Step 2 Completion Record (for Step 3 handoff)
+
+Implemented:
+- Worker-owned Llama agent bootstrap and readiness persistence:
+  - startup `ensure_llama_agent_ready` added after DB connect/migrations,
+  - readiness persisted in `app_settings` key `llama_agent_readiness`,
+  - states implemented: `configured | missing | schema_invalid | api_unreachable`.
+- Llama agent bootstrap client for Step 2:
+  - schema validation call,
+  - list-by-name resolution using versioned name `${LLAMA_AGENT_NAME}--${LLAMA_SCHEMA_VERSION}`,
+  - create-on-miss path.
+- Managed extraction readiness gate in worker:
+  - managed PDF path now blocks when agent readiness is not configured,
+  - deterministic failure code: `EXTRACTION_AGENT_NOT_READY:<state>`,
+  - import status diagnostics include `agent_readiness` snapshot.
+- API diagnostics extended:
+  - `GET /api/v1/diagnostics` now includes `llama_agent_readiness`.
+- Observability/logging additions:
+  - bootstrap + gate events written to `extraction-bootstrap.log`,
+  - provider-level attempt/http logs continue in `extraction-provider.log`.
+- Optional scope ID hardening:
+  - invalid `LLAMA_CLOUD_ORGANIZATION_ID` / `LLAMA_CLOUD_PROJECT_ID` values are ignored (non-blocking),
+  - warning event logged (`bootstrap_scope_id_ignored`).
+
+Validated:
+- Rust workspace tests pass (`cargo test --workspace`).
+- Runtime diagnostics confirms readiness visibility via API.
+- Managed imports fail fast with structured readiness error when not ready.
+
+Important current behavior (explicit for Step 3):
+- Step 2 does not replace the managed extraction provider internals with LlamaExtract Jobs yet.
+- Managed extraction still uses current provider call path until Step 3 migration is implemented.
 
 ## Summary
 

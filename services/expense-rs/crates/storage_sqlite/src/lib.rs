@@ -137,6 +137,37 @@ pub struct LlamaAgentCache {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlamaAgentReadinessState {
+    Configured,
+    Missing,
+    SchemaInvalid,
+    ApiUnreachable,
+}
+
+impl LlamaAgentReadinessState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Missing => "missing",
+            Self::SchemaInvalid => "schema_invalid",
+            Self::ApiUnreachable => "api_unreachable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlamaAgentReadiness {
+    pub state: LlamaAgentReadinessState,
+    pub agent_name: String,
+    pub schema_version: String,
+    pub agent_id: Option<String>,
+    pub checked_at: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 impl Default for ExtractionSettings {
     fn default() -> Self {
         Self {
@@ -372,6 +403,35 @@ pub async fn upsert_llama_agent_cache(
     .await?;
 
     Ok(payload)
+}
+
+pub async fn get_llama_agent_readiness(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<LlamaAgentReadiness>> {
+    let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'llama_agent_readiness'")
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let raw: String = row.get("value_json");
+    let parsed: LlamaAgentReadiness = serde_json::from_str(&raw)
+        .map_err(|e| anyhow!("invalid llama_agent_readiness payload: {e}"))?;
+    Ok(Some(parsed))
+}
+
+pub async fn upsert_llama_agent_readiness(
+    pool: &SqlitePool,
+    readiness: &LlamaAgentReadiness,
+) -> anyhow::Result<LlamaAgentReadiness> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value_json, updated_at) VALUES ('llama_agent_readiness', ?1, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(serde_json::to_string(readiness)?)
+    .execute(pool)
+    .await?;
+
+    Ok(readiness.clone())
 }
 
 pub async fn get_import_content(pool: &SqlitePool, import_id: &str) -> anyhow::Result<ImportBlob> {
@@ -1219,6 +1279,45 @@ mod tests {
             .expect("cache value");
         assert_eq!(loaded.agent_id, "agent-123");
         assert_eq!(loaded.schema_version, "statement_v1");
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn llama_agent_readiness_roundtrip_works() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let initial = get_llama_agent_readiness(&pool)
+            .await
+            .expect("read readiness");
+        assert!(initial.is_none());
+
+        let payload = LlamaAgentReadiness {
+            state: LlamaAgentReadinessState::Configured,
+            agent_name: "agent--statement_v1".to_string(),
+            schema_version: "statement_v1".to_string(),
+            agent_id: Some("agent-123".to_string()),
+            checked_at: chrono::Utc::now().to_rfc3339(),
+            error_code: None,
+            error_message: None,
+        };
+        let saved = upsert_llama_agent_readiness(&pool, &payload)
+            .await
+            .expect("save readiness");
+        assert_eq!(saved.state, LlamaAgentReadinessState::Configured);
+
+        let loaded = get_llama_agent_readiness(&pool)
+            .await
+            .expect("reload readiness")
+            .expect("readiness value");
+        assert_eq!(loaded.agent_name, "agent--statement_v1");
+        assert_eq!(loaded.schema_version, "statement_v1");
+        assert_eq!(loaded.agent_id.as_deref(), Some("agent-123"));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;

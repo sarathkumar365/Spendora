@@ -220,7 +220,7 @@ pub fn default_app_data_dir() -> PathBuf {
     PathBuf::from(".").join("data")
 }
 
-pub fn load_extraction_runtime_conf ig_from_env(
+pub fn load_extraction_runtime_config_from_env(
 ) -> Result<ExtractionRuntimeConfig, ExtractionRuntimeConfigError> {
     Ok(ExtractionRuntimeConfig {
         llama_cloud_api_key: required_env("LLAMA_CLOUD_API_KEY")?,

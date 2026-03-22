@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+chrono = { workspace = true }
 connectors_manual = { path = "../connectors_manual" }
 connectors_ai = { path = "../connectors_ai" }
 expense_core = { path = "../core" }

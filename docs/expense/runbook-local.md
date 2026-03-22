@@ -81,6 +81,10 @@ Mode resolution order:
   - `LLAMA_CLOUD_ORGANIZATION_ID`
   - `LLAMA_CLOUD_PROJECT_ID`
 
+Optional scope-ID behavior:
+- `LLAMA_CLOUD_ORGANIZATION_ID` and `LLAMA_CLOUD_PROJECT_ID` are optional.
+- If present but invalid UUIDs, they are ignored (non-blocking) and a warning event is written to bootstrap logs.
+
 ### Response logging (full raw provider responses)
 By default, full provider responses are written for each attempt.
 
@@ -88,9 +92,11 @@ Controls:
 - `EXTRACTION_LOG_FULL_RESPONSE=true` (default behavior)
 - `EXTRACTION_LOG_MAX_BYTES=262144` (default max response bytes per entry)
 - `EXPENSE_EXTRACTION_LOG_PATH` (optional explicit path)
+- `EXPENSE_BOOTSTRAP_LOG_PATH` (optional explicit path for bootstrap/gate events)
 
-Default provider log path:
-- `services/expense-rs/.runtime/logs/extraction-provider.log`
+Default log paths:
+- provider attempts/http: `~/Library/Application Support/SpendoraDesktop/logs/extraction-provider.log`
+- bootstrap/readiness/gate: `~/Library/Application Support/SpendoraDesktop/logs/extraction-bootstrap.log`
 
 Security warning:
 - Logs can include sensitive financial statement data when full-response logging is enabled.

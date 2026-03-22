@@ -1,7 +1,9 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use expense_core::{compute_row_hash, normalize_description, parse_amount_cents};
+use expense_core::{
+    compute_row_hash, normalize_description, parse_amount_cents, ExtractionRuntimeConfig,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +19,27 @@ use tokio::time::sleep;
 const MIN_PROVIDER_TIMEOUT_MS: i64 = 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 180_000;
 const LLAMA_PHASE_BUDGET_MS: u64 = 180_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlamaAgentDescriptor {
+    pub agent_id: String,
+    pub agent_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlamaAgentBootstrapError {
+    pub code: String,
+    pub message: String,
+    pub status_code: Option<u16>,
+}
+
+impl std::fmt::Display for LlamaAgentBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for LlamaAgentBootstrapError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -462,6 +485,57 @@ impl StatementExtractor for ManagedExtractor {
     }
 }
 
+pub fn versioned_agent_name(base_name: &str, schema_version: &str) -> String {
+    format!("{}--{}", base_name.trim(), schema_version.trim())
+}
+
+pub async fn ensure_llama_extraction_agent(
+    config: &ExtractionRuntimeConfig,
+    schema: &Value,
+) -> Result<LlamaAgentDescriptor, LlamaAgentBootstrapError> {
+    let http = reqwest::Client::new();
+    let base_url = env::var("LLAMA_CLOUD_BASE_URL")
+        .unwrap_or_else(|_| "https://api.cloud.llamaindex.ai".to_string());
+    let agent_name = versioned_agent_name(&config.llama_agent_name, &config.llama_schema_version);
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_ensure_start",
+        "agent_name": agent_name,
+        "schema_version": config.llama_schema_version,
+    }));
+
+    validate_schema_with_llama(&http, &base_url, config, schema).await?;
+
+    if let Some(found_id) = find_llama_agent_id(&http, &base_url, config, &agent_name).await? {
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "bootstrap_ensure_success",
+            "source": "existing_agent",
+            "agent_name": agent_name,
+            "agent_id": found_id,
+            "schema_version": config.llama_schema_version,
+        }));
+        return Ok(LlamaAgentDescriptor {
+            agent_id: found_id,
+            agent_name,
+        });
+    }
+
+    let created_id = create_llama_agent(&http, &base_url, config, &agent_name, schema).await?;
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_ensure_success",
+        "source": "created_agent",
+        "agent_name": agent_name,
+        "agent_id": created_id,
+        "schema_version": config.llama_schema_version,
+    }));
+    Ok(LlamaAgentDescriptor {
+        agent_id: created_id,
+        agent_name,
+    })
+}
+
 pub async fn local_ocr_stub(_request: &ExtractionRequest) -> anyhow::Result<ExtractionResult> {
     Ok(ExtractionResult {
         rows: Vec::new(),
@@ -474,6 +548,275 @@ pub async fn local_ocr_stub(_request: &ExtractionRequest) -> anyhow::Result<Extr
             "message": "Local OCR mode is planned but not implemented in this phase."
         }),
     })
+}
+
+fn scoped_url(
+    base_url: &str,
+    path: &str,
+    config: &ExtractionRuntimeConfig,
+) -> Result<reqwest::Url, LlamaAgentBootstrapError> {
+    let mut url = reqwest::Url::parse(format!("{base_url}{path}").as_str()).map_err(|e| {
+        LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_BAD_URL".to_string(),
+            message: e.to_string(),
+            status_code: None,
+        }
+    })?;
+
+    if config.llama_cloud_organization_id.is_some() || config.llama_cloud_project_id.is_some() {
+        let mut qp = url.query_pairs_mut();
+        if let Some(org) = config.llama_cloud_organization_id.as_deref() {
+            if uuid::Uuid::parse_str(org).is_ok() {
+                qp.append_pair("organization_id", org);
+            } else {
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "bootstrap_scope_id_ignored",
+                    "field": "organization_id",
+                    "reason": "invalid_uuid",
+                    "value": org,
+                }));
+            }
+        }
+        if let Some(project) = config.llama_cloud_project_id.as_deref() {
+            if uuid::Uuid::parse_str(project).is_ok() {
+                qp.append_pair("project_id", project);
+            } else {
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "bootstrap_scope_id_ignored",
+                    "field": "project_id",
+                    "reason": "invalid_uuid",
+                    "value": project,
+                }));
+            }
+        }
+    }
+    Ok(url)
+}
+
+async fn validate_schema_with_llama(
+    http: &reqwest::Client,
+    base_url: &str,
+    config: &ExtractionRuntimeConfig,
+    schema: &Value,
+) -> Result<(), LlamaAgentBootstrapError> {
+    let url = scoped_url(
+        base_url,
+        "/api/v1/extraction/extraction-agents/schema/validation",
+        config,
+    )?;
+    let payload = serde_json::json!({
+        "data_schema": schema,
+        "schema": schema
+    });
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_schema_validation_request",
+        "url": url.as_str(),
+    }));
+
+    let response = http
+        .post(url)
+        .bearer_auth(&config.llama_cloud_api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(map_bootstrap_network_error)?;
+
+    if response.status().is_success() {
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "bootstrap_schema_validation_success",
+            "status_code": response.status().as_u16(),
+        }));
+        return Ok(());
+    }
+
+    let status_code = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let code = if status_code == 400 || status_code == 422 {
+        "EXTRACTION_SCHEMA_INVALID"
+    } else {
+        "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE"
+    };
+    Err(LlamaAgentBootstrapError {
+        code: code.to_string(),
+        message: format!("schema validation failed ({status_code}): {body}"),
+        status_code: Some(status_code),
+    })
+}
+
+async fn find_llama_agent_id(
+    http: &reqwest::Client,
+    base_url: &str,
+    config: &ExtractionRuntimeConfig,
+    desired_name: &str,
+) -> Result<Option<String>, LlamaAgentBootstrapError> {
+    let url = scoped_url(base_url, "/api/v1/extraction/extraction-agents", config)?;
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_list_request",
+        "url": url.as_str(),
+        "desired_name": desired_name,
+    }));
+    let response = http
+        .get(url)
+        .bearer_auth(&config.llama_cloud_api_key)
+        .send()
+        .await
+        .map_err(map_bootstrap_network_error)?;
+
+    if !response.status().is_success() {
+        let status_code = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: format!("agent list failed ({status_code}): {body}"),
+            status_code: Some(status_code),
+        });
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: format!("agent list returned invalid json: {e}"),
+            status_code: None,
+        })?;
+
+    let found = extract_agent_id_by_name(&body, desired_name);
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_list_success",
+        "found": found.is_some(),
+        "desired_name": desired_name,
+    }));
+    Ok(found)
+}
+
+async fn create_llama_agent(
+    http: &reqwest::Client,
+    base_url: &str,
+    config: &ExtractionRuntimeConfig,
+    agent_name: &str,
+    schema: &Value,
+) -> Result<String, LlamaAgentBootstrapError> {
+    let url = scoped_url(base_url, "/api/v1/extraction/extraction-agents", config)?;
+    let payload = serde_json::json!({
+        "name": agent_name,
+        "data_schema": schema,
+        "config": {
+            "extraction_mode": "BALANCED"
+        }
+    });
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_create_request",
+        "url": url.as_str(),
+        "agent_name": agent_name,
+    }));
+
+    let response = http
+        .post(url)
+        .bearer_auth(&config.llama_cloud_api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(map_bootstrap_network_error)?;
+
+    if !response.status().is_success() {
+        let status_code = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: format!("agent create failed ({status_code}): {body}"),
+            status_code: Some(status_code),
+        });
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: format!("agent create returned invalid json: {e}"),
+            status_code: None,
+        })?;
+
+    let agent_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.get("data").and_then(|v| v.get("id")).and_then(|v| v.as_str()))
+        .ok_or_else(|| LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: "agent create response missing id".to_string(),
+            status_code: None,
+        })?;
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_create_success",
+        "agent_name": agent_name,
+        "agent_id": agent_id,
+    }));
+    Ok(agent_id.to_string())
+}
+
+fn extract_agent_id_by_name(body: &Value, desired_name: &str) -> Option<String> {
+    let list = if let Some(arr) = body.as_array() {
+        Some(arr)
+    } else {
+        body.get("data").and_then(|v| v.as_array())
+    }?;
+
+    for item in list {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("extraction_agent_name").and_then(|v| v.as_str()));
+        if name == Some(desired_name) {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn map_bootstrap_network_error(err: reqwest::Error) -> LlamaAgentBootstrapError {
+    let mapped = LlamaAgentBootstrapError {
+        code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+        message: err.to_string(),
+        status_code: None,
+    };
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_network_error",
+        "error_code": mapped.code.clone(),
+        "error_message": mapped.message.clone(),
+    }));
+    mapped
+}
+
+fn log_bootstrap_event(payload: Value) {
+    let log_path = bootstrap_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) else {
+        return;
+    };
+    let _ = writeln!(file, "{payload}");
+}
+
+fn bootstrap_log_path() -> PathBuf {
+    if let Ok(explicit) = env::var("EXPENSE_BOOTSTRAP_LOG_PATH") {
+        return PathBuf::from(explicit);
+    }
+    expense_core::default_app_data_dir()
+        .join("logs")
+        .join("extraction-bootstrap.log")
 }
 
 #[derive(Debug)]
@@ -1949,5 +2292,47 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].row_index, 1);
         assert_eq!(deduped[1].row_index, 2);
+    }
+
+    #[test]
+    fn versioned_agent_name_uses_expected_pattern() {
+        assert_eq!(
+            versioned_agent_name("spendora-statement-agent", "statement_v1"),
+            "spendora-statement-agent--statement_v1"
+        );
+    }
+
+    #[test]
+    fn extract_agent_id_by_name_handles_data_array_shape() {
+        let payload = serde_json::json!({
+            "data": [
+                { "id": "a1", "name": "one" },
+                { "id": "a2", "name": "two" }
+            ]
+        });
+        assert_eq!(
+            extract_agent_id_by_name(&payload, "two").as_deref(),
+            Some("a2")
+        );
+    }
+
+    #[test]
+    fn scoped_url_ignores_invalid_optional_scope_ids() {
+        let cfg = ExtractionRuntimeConfig {
+            llama_cloud_api_key: "k".to_string(),
+            llama_agent_name: "agent".to_string(),
+            llama_schema_version: "statement_v1".to_string(),
+            llama_cloud_organization_id: Some("...".to_string()),
+            llama_cloud_project_id: Some("not-a-uuid".to_string()),
+        };
+        let url = scoped_url(
+            "https://api.cloud.llamaindex.ai",
+            "/api/v1/extraction/extraction-agents",
+            &cfg,
+        )
+        .expect("scoped url");
+        let rendered = url.as_str().to_string();
+        assert!(!rendered.contains("organization_id="));
+        assert!(!rendered.contains("project_id="));
     }
 }

@@ -302,7 +302,10 @@ Fallback:
 
 Worker logs include provider attempts and outcomes.
 Additionally, provider responses are written to:
-- `services/expense-rs/.runtime/logs/extraction-provider.log`
+- `~/Library/Application Support/SpendoraDesktop/logs/extraction-provider.log`
+
+Step 2 bootstrap/readiness observability events are written to:
+- `~/Library/Application Support/SpendoraDesktop/logs/extraction-bootstrap.log`
 
 Each attempt log includes:
 - import id

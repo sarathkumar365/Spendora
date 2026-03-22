@@ -1,19 +1,26 @@
 use axum::{routing::get, Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
-use connectors_ai::{local_ocr_stub, ExtractionRequest, ManagedExtractor, StatementExtractor};
+use connectors_ai::{
+    ensure_llama_extraction_agent, local_ocr_stub, ExtractionRequest, ManagedExtractor,
+    StatementExtractor,
+};
 use connectors_manual::{parse_csv, parse_pdf};
 use expense_core::{
     default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
-    new_health_status, HealthStatus, ImportStatus,
+    new_health_status, BlueprintSchemaError, ExtractionRuntimeConfigError, HealthStatus,
+    ImportStatus,
 };
 use serde::Deserialize;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::{net::SocketAddr, path::PathBuf};
 use storage_sqlite::{
     claim_pending_job, clear_import_rows, connect, ensure_default_manual_account,
-    get_extraction_settings, get_import_content, insert_import_rows, mark_job_completed,
-    mark_job_failed, run_migrations, update_import_extraction_result, update_import_status,
-    ParsedRowInput,
+    get_extraction_settings, get_import_content, get_llama_agent_cache, get_llama_agent_readiness,
+    insert_import_rows, mark_job_completed, mark_job_failed, run_migrations,
+    update_import_extraction_result, update_import_status, upsert_llama_agent_cache,
+    upsert_llama_agent_readiness, LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
 };
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
@@ -48,6 +55,10 @@ async fn main() -> anyhow::Result<()> {
         run_migrations(&pool).await?;
     }
 
+    if let Err(err) = ensure_llama_agent_ready(&pool).await {
+        error!(error = %err, "failed to persist llama agent readiness");
+    }
+
     let health_addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     tokio::spawn(async move {
         let app = Router::new()
@@ -80,6 +91,228 @@ fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
     load_statement_blueprint_schema(&extraction_config.llama_schema_version)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(())
+}
+
+fn bootstrap_log_path() -> PathBuf {
+    if let Ok(explicit) = std::env::var("EXPENSE_BOOTSTRAP_LOG_PATH") {
+        return PathBuf::from(explicit);
+    }
+    expense_core::default_app_data_dir()
+        .join("logs")
+        .join("extraction-bootstrap.log")
+}
+
+fn log_bootstrap_event(payload: serde_json::Value) {
+    let path = bootstrap_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{payload}");
+}
+
+fn classify_missing_or_schema_state(err_text: &str) -> LlamaAgentReadinessState {
+    if err_text.contains("EXTRACTION_CONFIG_MISSING_REQUIRED_ENV") {
+        return LlamaAgentReadinessState::Missing;
+    }
+    LlamaAgentReadinessState::SchemaInvalid
+}
+
+fn new_readiness_record(
+    state: LlamaAgentReadinessState,
+    agent_name: String,
+    schema_version: String,
+    agent_id: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+) -> LlamaAgentReadiness {
+    LlamaAgentReadiness {
+        state,
+        agent_name,
+        schema_version,
+        agent_id,
+        checked_at: chrono::Utc::now().to_rfc3339(),
+        error_code,
+        error_message,
+    }
+}
+
+async fn ensure_llama_agent_ready(pool: &storage_sqlite::SqlitePool) -> anyhow::Result<()> {
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "worker_bootstrap_start"
+    }));
+    let extraction_config = match load_extraction_runtime_config_from_env() {
+        Ok(v) => v,
+        Err(err @ ExtractionRuntimeConfigError::MissingRequiredEnv(_)) => {
+            let message = err.to_string();
+            let readiness = new_readiness_record(
+                LlamaAgentReadinessState::Missing,
+                std::env::var("LLAMA_AGENT_NAME").unwrap_or_else(|_| "".to_string()),
+                std::env::var("LLAMA_SCHEMA_VERSION").unwrap_or_else(|_| "".to_string()),
+                None,
+                Some("EXTRACTION_CONFIG_MISSING_REQUIRED_ENV".to_string()),
+                Some(message.clone()),
+            );
+            upsert_llama_agent_readiness(pool, &readiness).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "worker_bootstrap_missing_env",
+                "error_code": "EXTRACTION_CONFIG_MISSING_REQUIRED_ENV",
+                "error_message": message,
+            }));
+            return Ok(());
+        }
+    };
+
+    let versioned_agent_name = connectors_ai::versioned_agent_name(
+        &extraction_config.llama_agent_name,
+        &extraction_config.llama_schema_version,
+    );
+
+    let schema = match load_statement_blueprint_schema(&extraction_config.llama_schema_version) {
+        Ok(schema) => schema,
+        Err(err) => {
+            let code = match err {
+                BlueprintSchemaError::VersionNotFound(_) => "EXTRACTION_SCHEMA_INVALID",
+                BlueprintSchemaError::InvalidJson(_) => "EXTRACTION_SCHEMA_INVALID",
+                BlueprintSchemaError::InvalidContract(_) => "EXTRACTION_SCHEMA_INVALID",
+            };
+            let readiness = new_readiness_record(
+                LlamaAgentReadinessState::SchemaInvalid,
+                versioned_agent_name,
+                extraction_config.llama_schema_version.clone(),
+                None,
+                Some(code.to_string()),
+                Some(err.to_string()),
+            );
+            upsert_llama_agent_readiness(pool, &readiness).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "worker_bootstrap_schema_invalid",
+                "error_code": code,
+                "error_message": err.to_string(),
+            }));
+            return Ok(());
+        }
+    };
+
+    match ensure_llama_extraction_agent(&extraction_config, &schema).await {
+        Ok(agent) => {
+            upsert_llama_agent_cache(pool, &agent.agent_id, &extraction_config.llama_schema_version)
+                .await?;
+            let readiness = new_readiness_record(
+                LlamaAgentReadinessState::Configured,
+                agent.agent_name,
+                extraction_config.llama_schema_version,
+                Some(agent.agent_id),
+                None,
+                None,
+            );
+            upsert_llama_agent_readiness(pool, &readiness).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "worker_bootstrap_configured",
+                "agent_name": readiness.agent_name,
+                "schema_version": readiness.schema_version,
+                "agent_id": readiness.agent_id,
+            }));
+        }
+        Err(err) => {
+            let err_code = err.code.clone();
+            let err_message = err.to_string();
+            let state = if err.code == "EXTRACTION_SCHEMA_INVALID" {
+                LlamaAgentReadinessState::SchemaInvalid
+            } else {
+                LlamaAgentReadinessState::ApiUnreachable
+            };
+            let readiness = new_readiness_record(
+                state,
+                versioned_agent_name,
+                extraction_config.llama_schema_version,
+                None,
+                Some(err_code),
+                Some(err_message),
+            );
+            upsert_llama_agent_readiness(pool, &readiness).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "worker_bootstrap_api_unreachable",
+                "state": readiness.state.as_str(),
+                "error_code": readiness.error_code,
+                "error_message": readiness.error_message,
+            }));
+        }
+    }
+
+    Ok(())
+}
+
+async fn managed_readiness_snapshot(
+    pool: &storage_sqlite::SqlitePool,
+) -> anyhow::Result<(LlamaAgentReadiness, bool)> {
+    let runtime = match load_extraction_runtime_config_from_env() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            let state = classify_missing_or_schema_state(err.to_string().as_str());
+            let fallback = new_readiness_record(
+                state,
+                std::env::var("LLAMA_AGENT_NAME").unwrap_or_else(|_| "".to_string()),
+                std::env::var("LLAMA_SCHEMA_VERSION").unwrap_or_else(|_| "".to_string()),
+                None,
+                Some("EXTRACTION_AGENT_NOT_READY".to_string()),
+                Some(err.to_string()),
+            );
+            return Ok((fallback, false));
+        }
+    };
+
+    let readiness = get_llama_agent_readiness(pool)
+        .await?
+        .unwrap_or_else(|| {
+            new_readiness_record(
+                LlamaAgentReadinessState::Missing,
+                connectors_ai::versioned_agent_name(
+                    &runtime.llama_agent_name,
+                    &runtime.llama_schema_version,
+                ),
+                runtime.llama_schema_version.clone(),
+                None,
+                Some("EXTRACTION_AGENT_NOT_READY".to_string()),
+                Some("llama agent readiness not initialized".to_string()),
+            )
+        });
+
+    let cache = get_llama_agent_cache(pool).await?;
+    let cache_schema_matches = cache
+        .as_ref()
+        .is_some_and(|entry| entry.schema_version == runtime.llama_schema_version);
+    let readiness_schema_matches = readiness.schema_version == runtime.llama_schema_version;
+    let is_ready = readiness.state == LlamaAgentReadinessState::Configured
+        && readiness_schema_matches
+        && cache_schema_matches;
+
+    if is_ready {
+        return Ok((readiness, true));
+    }
+
+    if readiness.state == LlamaAgentReadinessState::Configured
+        && (!readiness_schema_matches || !cache_schema_matches)
+    {
+        let downgraded = new_readiness_record(
+            LlamaAgentReadinessState::SchemaInvalid,
+            readiness.agent_name.clone(),
+            readiness.schema_version.clone(),
+            readiness.agent_id.clone(),
+            Some("EXTRACTION_AGENT_NOT_READY".to_string()),
+            Some("readiness/cache schema mismatch".to_string()),
+        );
+        return Ok((downgraded, false));
+    }
+
+    Ok((readiness, false))
 }
 
 async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyhow::Result<()> {
@@ -153,6 +386,44 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 );
             }
 
+            let (readiness, managed_ready) = managed_readiness_snapshot(pool).await?;
+            if !managed_ready {
+                let blocked_state = readiness.state.as_str().to_string();
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "managed_gate_blocked",
+                    "import_id": job_payload.import_id.clone(),
+                    "state": blocked_state,
+                    "agent_name": readiness.agent_name.clone(),
+                    "schema_version": readiness.schema_version.clone(),
+                    "error_code": readiness.error_code.clone(),
+                }));
+                let diagnostics = serde_json::json!({
+                    "provider": "managed",
+                    "agent_readiness": readiness.clone(),
+                });
+                update_import_extraction_result(
+                    pool,
+                    &job_payload.import_id,
+                    None,
+                    &[],
+                    &diagnostics,
+                )
+                .await?;
+                anyhow::bail!(
+                    "EXTRACTION_AGENT_NOT_READY:{}",
+                    readiness.state.as_str()
+                );
+            }
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "managed_gate_allowed",
+                "import_id": job_payload.import_id.clone(),
+                "state": readiness.state.as_str(),
+                "agent_name": readiness.agent_name.clone(),
+                "schema_version": readiness.schema_version.clone(),
+            }));
+
             let extractor = ManagedExtractor::default();
             let result = extractor
                 .extract_pdf(&ExtractionRequest {
@@ -166,6 +437,11 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 })
                 .await?;
 
+            let diagnostics = serde_json::json!({
+                "provider_diagnostics": result.diagnostics.clone(),
+                "agent_readiness": readiness,
+            });
+
             update_import_extraction_result(
                 pool,
                 &job_payload.import_id,
@@ -177,7 +453,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                         serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({}))
                     })
                     .collect::<Vec<_>>(),
-                &result.diagnostics,
+                &diagnostics,
             )
             .await?;
 
@@ -418,6 +694,72 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("LOCAL_OCR_NOT_IMPLEMENTED")));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn worker_blocks_managed_mode_when_agent_not_ready() {
+        let _guard = env_lock().lock().expect("env lock");
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let db_path = std::env::current_dir()
+            .expect("cwd")
+            .join(".tmp")
+            .join(format!(
+                "worker-managed-gate-test-{}.db",
+                expense_core::new_idempotency_key()
+            ));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+
+        let pool = connect(&db_path).await.expect("connect");
+        run_migrations(&pool).await.expect("migrate");
+
+        let source = b"%PDF-1.4 binary placeholder";
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "statement.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: STANDARD.encode(source),
+                source_hash: "worker-managed-gate-hash".to_string(),
+                extraction_mode: Some("managed".to_string()),
+            },
+        )
+        .await
+        .expect("create import");
+
+        process_pending_import_jobs(&pool)
+            .await
+            .expect("process import job");
+
+        let status = get_import_status(&pool, &import_id)
+            .await
+            .expect("get status");
+        assert_eq!(status.status, ImportStatus::Failed.as_str());
+        assert!(status
+            .errors
+            .iter()
+            .any(|e| e.contains("EXTRACTION_AGENT_NOT_READY:missing")));
+        assert_eq!(
+            status
+                .diagnostics
+                .get("agent_readiness")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str()),
+            Some("missing")
+        );
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
