@@ -130,6 +130,13 @@ pub struct ExtractionSettings {
     pub provider_timeout_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlamaAgentCache {
+    pub agent_id: String,
+    pub schema_version: String,
+    pub updated_at: String,
+}
+
 impl Default for ExtractionSettings {
     fn default() -> Self {
         Self {
@@ -329,6 +336,42 @@ pub async fn upsert_extraction_settings(
     .await?;
 
     Ok(settings)
+}
+
+pub async fn get_llama_agent_cache(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<LlamaAgentCache>> {
+    let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'llama_agent_cache'")
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let raw: String = row.get("value_json");
+    let parsed: LlamaAgentCache = serde_json::from_str(&raw)
+        .map_err(|e| anyhow!("invalid llama_agent_cache payload: {e}"))?;
+    Ok(Some(parsed))
+}
+
+pub async fn upsert_llama_agent_cache(
+    pool: &SqlitePool,
+    agent_id: &str,
+    schema_version: &str,
+) -> anyhow::Result<LlamaAgentCache> {
+    let payload = LlamaAgentCache {
+        agent_id: agent_id.to_string(),
+        schema_version: schema_version.to_string(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    sqlx::query(
+        "INSERT INTO app_settings (key, value_json, updated_at) VALUES ('llama_agent_cache', ?1, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(serde_json::to_string(&payload)?)
+    .execute(pool)
+    .await?;
+
+    Ok(payload)
 }
 
 pub async fn get_import_content(pool: &SqlitePool, import_id: &str) -> anyhow::Result<ImportBlob> {
@@ -723,6 +766,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_extraction_settings",
         include_str!("../../../migrations/0003_extraction_settings.sql"),
     ),
+    (
+        "0004_statement_foundation",
+        include_str!("../../../migrations/0004_statement_foundation.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -1072,6 +1119,106 @@ mod tests {
                 .unwrap_or_default(),
             "llamaparse"
         );
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn statement_foundation_migration_adds_expected_columns_and_constraints() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        let txn_cols = sqlx::query("PRAGMA table_info(transactions)")
+            .fetch_all(&pool)
+            .await
+            .expect("table info");
+        let has_statement_id = txn_cols
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "statement_id");
+        assert!(has_statement_id, "transactions.statement_id should exist");
+
+        sqlx::query(
+            "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, schema_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind("stmt-1")
+        .bind(&account_id)
+        .bind("2026-03-01")
+        .bind("2026-03-31")
+        .bind("2026-03")
+        .bind("statement_v1")
+        .execute(&pool)
+        .await
+        .expect("insert statement");
+
+        let duplicate = sqlx::query(
+            "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, schema_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind("stmt-2")
+        .bind(&account_id)
+        .bind("2026-03-01")
+        .bind("2026-03-31")
+        .bind("2026-03")
+        .bind("statement_v1")
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "duplicate account+period statement should fail"
+        );
+
+        let inserted = sqlx::query(
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, 'manual', 'manual', 1.0, 'manual entry', ?7)",
+        )
+        .bind("tx-statement-1")
+        .bind(&account_id)
+        .bind("hash-statement-1")
+        .bind(1250_i64)
+        .bind("Coffee")
+        .bind("2026-03-10")
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert tx with nullable statement_id");
+        assert_eq!(inserted.rows_affected(), 1);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn llama_agent_cache_roundtrip_works() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let initial = get_llama_agent_cache(&pool)
+            .await
+            .expect("read cache");
+        assert!(initial.is_none());
+
+        let saved = upsert_llama_agent_cache(&pool, "agent-123", "statement_v1")
+            .await
+            .expect("save cache");
+        assert_eq!(saved.agent_id, "agent-123");
+        assert_eq!(saved.schema_version, "statement_v1");
+        assert!(!saved.updated_at.is_empty());
+
+        let loaded = get_llama_agent_cache(&pool)
+            .await
+            .expect("reload cache")
+            .expect("cache value");
+        assert_eq!(loaded.agent_id, "agent-123");
+        assert_eq!(loaded.schema_version, "statement_v1");
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;

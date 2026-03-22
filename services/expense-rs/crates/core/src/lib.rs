@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{collections::hash_map::DefaultHasher, env, hash::Hasher, path::PathBuf};
 use uuid::Uuid;
 
@@ -109,6 +110,31 @@ pub enum DomainError {
     DuplicateIgnored(String),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractionRuntimeConfig {
+    pub llama_cloud_api_key: String,
+    pub llama_agent_name: String,
+    pub llama_schema_version: String,
+    pub llama_cloud_organization_id: Option<String>,
+    pub llama_cloud_project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ExtractionRuntimeConfigError {
+    #[error("EXTRACTION_CONFIG_MISSING_REQUIRED_ENV: {0}")]
+    MissingRequiredEnv(&'static str),
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum BlueprintSchemaError {
+    #[error("EXTRACTION_SCHEMA_VERSION_NOT_FOUND: {0}")]
+    VersionNotFound(String),
+    #[error("EXTRACTION_SCHEMA_INVALID_JSON: {0}")]
+    InvalidJson(String),
+    #[error("EXTRACTION_SCHEMA_INVALID_CONTRACT: {0}")]
+    InvalidContract(String),
+}
+
 pub fn new_health_status(service: &'static str) -> HealthStatus {
     HealthStatus {
         service,
@@ -194,10 +220,116 @@ pub fn default_app_data_dir() -> PathBuf {
     PathBuf::from(".").join("data")
 }
 
+pub fn load_extraction_runtime_conf ig_from_env(
+) -> Result<ExtractionRuntimeConfig, ExtractionRuntimeConfigError> {
+    Ok(ExtractionRuntimeConfig {
+        llama_cloud_api_key: required_env("LLAMA_CLOUD_API_KEY")?,
+        llama_agent_name: required_env("LLAMA_AGENT_NAME")?,
+        llama_schema_version: required_env("LLAMA_SCHEMA_VERSION")?,
+        llama_cloud_organization_id: optional_env("LLAMA_CLOUD_ORGANIZATION_ID"),
+        llama_cloud_project_id: optional_env("LLAMA_CLOUD_PROJECT_ID"),
+    })
+}
+
+pub fn load_statement_blueprint_schema(version: &str) -> Result<Value, BlueprintSchemaError> {
+    let raw = match version {
+        "statement_v1" => include_str!("../../../schemas/statement_v1.json"),
+        _ => {
+            return Err(BlueprintSchemaError::VersionNotFound(version.to_string()));
+        }
+    };
+
+    let schema: Value =
+        serde_json::from_str(raw).map_err(|e| BlueprintSchemaError::InvalidJson(e.to_string()))?;
+    validate_statement_schema_contract(&schema)?;
+    Ok(schema)
+}
+
+fn required_env(name: &'static str) -> Result<String, ExtractionRuntimeConfigError> {
+    optional_env(name).ok_or(ExtractionRuntimeConfigError::MissingRequiredEnv(name))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn validate_statement_schema_contract(schema: &Value) -> Result<(), BlueprintSchemaError> {
+    let root_required = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| BlueprintSchemaError::InvalidContract("root required[] missing".to_string()))?;
+    for key in ["period_start", "period_end", "transactions"] {
+        let has_key = root_required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|item| item == key);
+        if !has_key {
+            return Err(BlueprintSchemaError::InvalidContract(format!(
+                "root required[] missing {key}"
+            )));
+        }
+    }
+
+    let tx_required = schema
+        .get("properties")
+        .and_then(|v| v.get("transactions"))
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.get("required"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            BlueprintSchemaError::InvalidContract(
+                "transactions.items.required[] missing".to_string(),
+            )
+        })?;
+
+    for key in ["booked_at", "description", "amount_cents"] {
+        let has_key = tx_required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|item| item == key);
+        if !has_key {
+            return Err(BlueprintSchemaError::InvalidContract(format!(
+                "transactions.items.required[] missing {key}"
+            )));
+        }
+    }
+
+    let root_is_strict = schema
+        .get("additionalProperties")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|value| !value);
+    if !root_is_strict {
+        return Err(BlueprintSchemaError::InvalidContract(
+            "root additionalProperties must be false".to_string(),
+        ));
+    }
+
+    let tx_item_is_strict = schema
+        .get("properties")
+        .and_then(|v| v.get("transactions"))
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.get("additionalProperties"))
+        .and_then(|v| v.as_bool())
+        .is_some_and(|value| !value);
+    if !tx_item_is_strict {
+        return Err(BlueprintSchemaError::InvalidContract(
+            "transactions.items.additionalProperties must be false".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn health_status_is_ok_and_namespaced() {
@@ -238,5 +370,80 @@ mod tests {
                 || rendered.contains(".runtime"),
             "unexpected app data path: {rendered}"
         );
+    }
+
+    #[test]
+    fn extraction_runtime_config_requires_all_mandatory_envs() {
+        let _guard = env_lock().lock().expect("env lock");
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let err = load_extraction_runtime_config_from_env().expect_err("expected missing env");
+        assert_eq!(
+            err,
+            ExtractionRuntimeConfigError::MissingRequiredEnv("LLAMA_CLOUD_API_KEY")
+        );
+    }
+
+    #[test]
+    fn extraction_runtime_config_accepts_optional_envs_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLAMA_CLOUD_API_KEY", "api-key");
+            std::env::set_var("LLAMA_AGENT_NAME", "statement-agent");
+            std::env::set_var("LLAMA_SCHEMA_VERSION", "statement_v1");
+            std::env::remove_var("LLAMA_CLOUD_ORGANIZATION_ID");
+            std::env::remove_var("LLAMA_CLOUD_PROJECT_ID");
+        }
+
+        let value = load_extraction_runtime_config_from_env().expect("config");
+        assert_eq!(value.llama_cloud_api_key, "api-key");
+        assert_eq!(value.llama_agent_name, "statement-agent");
+        assert_eq!(value.llama_schema_version, "statement_v1");
+        assert!(value.llama_cloud_organization_id.is_none());
+        assert!(value.llama_cloud_project_id.is_none());
+
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn statement_schema_loader_rejects_unknown_version() {
+        let err =
+            load_statement_blueprint_schema("does_not_exist").expect_err("expected version error");
+        assert_eq!(
+            err,
+            BlueprintSchemaError::VersionNotFound("does_not_exist".to_string())
+        );
+    }
+
+    #[test]
+    fn statement_schema_loader_validates_required_contract() {
+        let schema = load_statement_blueprint_schema("statement_v1").expect("statement_v1 schema");
+        let tx_required = schema
+            .get("properties")
+            .and_then(|v| v.get("transactions"))
+            .and_then(|v| v.get("items"))
+            .and_then(|v| v.get("required"))
+            .and_then(|v| v.as_array())
+            .expect("required fields");
+        let required_keys: Vec<&str> = tx_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_keys.contains(&"booked_at"));
+        assert!(required_keys.contains(&"description"));
+        assert!(required_keys.contains(&"amount_cents"));
     }
 }

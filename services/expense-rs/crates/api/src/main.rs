@@ -13,7 +13,10 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use expense_core::{default_app_data_dir, new_health_status, HealthStatus};
+use expense_core::{
+    default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
+    new_health_status, HealthStatus,
+};
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use storage_sqlite::{connect, ensure_default_manual_account, run_migrations, SqlitePool};
@@ -42,6 +45,7 @@ struct Diagnostics {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
+    validate_extraction_runtime_contract()?;
 
     let db_path = PathBuf::from(args.db_path);
     let pool = connect(&db_path).await?;
@@ -95,6 +99,14 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, "expense-api listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
+    let extraction_config = load_extraction_runtime_config_from_env()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    load_statement_blueprint_schema(&extraction_config.llama_schema_version)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(())
 }
 
@@ -221,7 +233,13 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::{Mutex, OnceLock};
     use tower::util::ServiceExt;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     async fn health_returns_ok_payload() {
@@ -386,6 +404,48 @@ mod tests {
             std::env::remove_var("CORS_ALLOWED_ORIGINS");
             std::env::remove_var("CORS_ALLOWED_METHODS");
             std::env::remove_var("CORS_ALLOWED_HEADERS");
+        }
+    }
+
+    #[test]
+    fn extraction_runtime_contract_fails_when_required_env_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let err = validate_extraction_runtime_contract().expect_err("expected missing env");
+        assert!(err
+            .to_string()
+            .contains("EXTRACTION_CONFIG_MISSING_REQUIRED_ENV"));
+    }
+
+    #[test]
+    fn extraction_runtime_contract_succeeds_with_required_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLAMA_CLOUD_API_KEY", "x");
+            std::env::set_var("LLAMA_AGENT_NAME", "agent");
+            std::env::set_var("LLAMA_SCHEMA_VERSION", "statement_v1");
+            std::env::remove_var("LLAMA_CLOUD_ORGANIZATION_ID");
+            std::env::remove_var("LLAMA_CLOUD_PROJECT_ID");
+        }
+
+        validate_extraction_runtime_contract().expect("runtime contract should validate");
+
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
         }
     }
 }

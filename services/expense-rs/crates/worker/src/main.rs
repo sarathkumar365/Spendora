@@ -3,7 +3,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
 use connectors_ai::{local_ocr_stub, ExtractionRequest, ManagedExtractor, StatementExtractor};
 use connectors_manual::{parse_csv, parse_pdf};
-use expense_core::{default_app_data_dir, new_health_status, HealthStatus, ImportStatus};
+use expense_core::{
+    default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
+    new_health_status, HealthStatus, ImportStatus,
+};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use storage_sqlite::{
@@ -36,6 +39,7 @@ struct ImportJobPayload {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
+    validate_extraction_runtime_contract()?;
 
     let db_path = PathBuf::from(args.db_path);
     let pool = connect(&db_path).await?;
@@ -68,6 +72,14 @@ async fn main() -> anyhow::Result<()> {
         }
         sleep(Duration::from_secs(args.poll_seconds)).await;
     }
+}
+
+fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
+    let extraction_config = load_extraction_runtime_config_from_env()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    load_statement_blueprint_schema(&extraction_config.llama_schema_version)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(())
 }
 
 async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyhow::Result<()> {
@@ -290,7 +302,13 @@ fn default_db_path() -> String {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
+    use std::sync::{Mutex, OnceLock};
     use storage_sqlite::{create_import, get_import_status, run_migrations, CreateImportInput};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     async fn health_returns_ok_payload() {
@@ -403,5 +421,47 @@ mod tests {
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[test]
+    fn extraction_runtime_contract_fails_when_required_env_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let err = validate_extraction_runtime_contract().expect_err("expected missing env");
+        assert!(err
+            .to_string()
+            .contains("EXTRACTION_CONFIG_MISSING_REQUIRED_ENV"));
+    }
+
+    #[test]
+    fn extraction_runtime_contract_succeeds_with_required_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLAMA_CLOUD_API_KEY", "x");
+            std::env::set_var("LLAMA_AGENT_NAME", "agent");
+            std::env::set_var("LLAMA_SCHEMA_VERSION", "statement_v1");
+            std::env::remove_var("LLAMA_CLOUD_ORGANIZATION_ID");
+            std::env::remove_var("LLAMA_CLOUD_PROJECT_ID");
+        }
+
+        validate_extraction_runtime_contract().expect("runtime contract should validate");
+
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 }

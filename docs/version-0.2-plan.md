@@ -1,5 +1,38 @@
 # Version 0.2 — 5-Step Technical Implementation Plan
 
+## Implementation Status (Updated March 21, 2026)
+
+- `Step 1` is complete and validated in the current codebase.
+- `Step 2` is the next implementation target.
+
+### Step 1 Completion Record (for Step 2 handoff)
+
+Implemented:
+- Additive migration `0004_statement_foundation`:
+  - created `statements` table,
+  - added nullable `transactions.statement_id`,
+  - added statement/account-period indexes and unique period constraint.
+- Startup runtime contract (API + worker fail-fast):
+  - required envs: `LLAMA_CLOUD_API_KEY`, `LLAMA_AGENT_NAME`, `LLAMA_SCHEMA_VERSION`,
+  - optional envs: `LLAMA_CLOUD_ORGANIZATION_ID`, `LLAMA_CLOUD_PROJECT_ID`.
+- Local versioned blueprint schema added and validated at startup:
+  - `services/expense-rs/schemas/statement_v1.json`.
+- Agent metadata cache contract added in existing `app_settings`:
+  - key `llama_agent_cache` with `{ agent_id, schema_version, updated_at }`,
+  - storage helpers added for get/upsert.
+
+Validated:
+- Rust workspace tests pass (`npm run test:rs`).
+- Runtime DB now includes:
+  - migration version `0004_statement_foundation`,
+  - `statements` table,
+  - `transactions.statement_id` column.
+
+Important current behavior (explicit for Step 2):
+- `load_statement_blueprint_schema` is currently a startup guardrail only.
+- Provider extraction responses are not yet validated against full `statement_v1` at ingest time.
+- No agent auto-ensure logic exists yet (this is Step 2 scope).
+
 ## Summary
 
 Implement blueprint-based statement ingestion using LlamaExtract Jobs with strict validation, additive DB migrations, DB-first reuse for free-tier control, and full test coverage, while preserving current manual upload/review/commit UX.

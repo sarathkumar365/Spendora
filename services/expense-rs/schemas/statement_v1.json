@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "required": [
+    "period_start",
+    "period_end",
+    "transactions"
+  ],
+  "properties": {
+    "period_start": {
+      "type": "string",
+      "format": "date"
+    },
+    "period_end": {
+      "type": "string",
+      "format": "date"
+    },
+    "statement_month": {
+      "type": "string"
+    },
+    "transactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "booked_at",
+          "description",
+          "amount_cents"
+        ],
+        "properties": {
+          "booked_at": {
+            "type": "string",
+            "format": "date"
+          },
+          "description": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

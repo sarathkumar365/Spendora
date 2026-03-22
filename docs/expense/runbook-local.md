@@ -70,10 +70,16 @@ Mode resolution order:
 ### Required environment variables
 - `LLAMAPARSE_API_KEY` for Llama primary path
 - `OPENROUTER_API_KEY` for OpenRouter fallback path
+- Step 1 startup contract (API + worker fail fast when missing):
+  - `LLAMA_CLOUD_API_KEY`
+  - `LLAMA_AGENT_NAME`
+  - `LLAMA_SCHEMA_VERSION` (use `statement_v1` for this phase)
 - Optional:
   - `OPENROUTER_MODEL` (default in code if not set)
   - `LLAMAPARSE_ENDPOINT` (override endpoint)
   - `OPENROUTER_ENDPOINT` (override endpoint)
+  - `LLAMA_CLOUD_ORGANIZATION_ID`
+  - `LLAMA_CLOUD_PROJECT_ID`
 
 ### Response logging (full raw provider responses)
 By default, full provider responses are written for each attempt.
