@@ -4,7 +4,7 @@
 
 - `Step 1` is complete and validated in the current codebase.
 - `Step 2` is complete and validated in the current codebase.
-- `Step 3` is the next implementation target.
+- `Step 3` is complete and validated in the current codebase.
 
 ### Step 1 Completion Record (for Step 2 handoff)
 
@@ -64,8 +64,49 @@ Validated:
 - Managed imports fail fast with structured readiness error when not ready.
 
 Important current behavior (explicit for Step 3):
-- Step 2 does not replace the managed extraction provider internals with LlamaExtract Jobs yet.
-- Managed extraction still uses current provider call path until Step 3 migration is implemented.
+- Managed extraction path is now dual-mode:
+  - `EXTRACTION_MANAGED_FLOW_MODE=new` (default): LlamaExtract Jobs flow.
+  - `EXTRACTION_MANAGED_FLOW_MODE=legacy`: previous managed provider flow.
+
+### Step 3 Completion Record (for future agent handoff)
+
+Implemented:
+- Managed-flow router in worker with `EXTRACTION_MANAGED_FLOW_MODE`:
+  - supported values: `new | legacy`,
+  - default/invalid fallback: `new` with warning.
+- Step 2 readiness gate preserved in-place (unchanged contract):
+  - blocks managed extraction when not ready,
+  - deterministic error remains `EXTRACTION_AGENT_NOT_READY:<state>`.
+- New LlamaExtract Jobs flow in connectors:
+  - file upload + job create + status polling + result fetch,
+  - compatibility handling for endpoint/field drift (`/api/v1/beta/files` and `/api/v1/files` variants).
+- Strict response validation and row mapping:
+  - `transactions[]` required,
+  - statement period resolution and derivation markers in diagnostics.
+- Statement persistence and linkage:
+  - `upsert_or_get_statement(...)`,
+  - `import_rows.statement_id`,
+  - commit path populates `transactions.statement_id`.
+- Additive migration:
+  - `0005_import_rows_statement_link`.
+- Diagnostics expansion on import status:
+  - `managed_flow_mode`,
+  - `provider_lineage`,
+  - `poll_status_trail`,
+  - `statement_context`,
+  - `agent_readiness`.
+- Observability updates:
+  - status transition events (`parsing`, `review_required|ready_to_commit`, `failed`),
+  - structured Jobs lifecycle logs,
+  - common raw external API response log:
+    `~/Library/Application Support/SpendoraDesktop/logs/external-api-raw.log`.
+- Polling guardrail:
+  - hard cap of 3 minutes per Jobs polling lifecycle.
+
+Validated:
+- Rust workspace tests pass (`cargo test --workspace`).
+- Managed `new` flow produces extracted rows and import transitions.
+- Legacy managed flow remains selectable via env fallback mode.
 
 ## Summary
 

@@ -303,6 +303,7 @@ Fallback:
 Worker logs include provider attempts and outcomes.
 Additionally, provider responses are written to:
 - `~/Library/Application Support/SpendoraDesktop/logs/extraction-provider.log`
+- `~/Library/Application Support/SpendoraDesktop/logs/external-api-raw.log` (common external HTTP response log)
 
 Step 2 bootstrap/readiness observability events are written to:
 - `~/Library/Application Support/SpendoraDesktop/logs/extraction-bootstrap.log`
@@ -314,6 +315,8 @@ Each attempt log includes:
 - latency
 - retry decision
 - raw response (capped by configured max bytes)
+
+`external-api-raw.log` includes raw response bodies for all outbound external HTTP calls in extraction/bootstrap/jobs flows with redacted headers and call metadata (`provider`, `operation`, `method`, `url`, status).
 
 This is intentionally verbose for diagnostics and includes sensitive data risk.
 

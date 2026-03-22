@@ -288,6 +288,7 @@ mod tests {
                     parse_error: None,
                     normalized_txn_hash: "h1".to_string(),
                     account_id: Some("manual-default-account".to_string()),
+                    statement_id: None,
                 },
                 storage_sqlite::ParsedRowInput {
                     row_index: 2,
@@ -302,6 +303,7 @@ mod tests {
                     ),
                     normalized_txn_hash: "h2".to_string(),
                     account_id: Some("manual-default-account".to_string()),
+                    statement_id: None,
                 },
             ],
         )

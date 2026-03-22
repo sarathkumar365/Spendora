@@ -49,16 +49,25 @@ struct Diagnostics {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
-    validate_extraction_runtime_contract()?;
+    info!(
+        port = args.port,
+        db_path = %args.db_path,
+        migrate = args.migrate,
+        "api startup args resolved"
+    );
+    let schema_version = validate_extraction_runtime_contract()?;
+    info!(schema_version = %schema_version, "extraction runtime contract validated");
 
     let db_path = PathBuf::from(args.db_path);
     let pool = connect(&db_path).await?;
 
     if args.migrate {
         run_migrations(&pool).await?;
+        info!("api migrations applied");
     }
 
     ensure_default_manual_account(&pool).await?;
+    info!("default manual account ensured");
 
     let state = Arc::new(AppState { db: pool });
     let app = Router::new()
@@ -106,12 +115,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
+fn validate_extraction_runtime_contract() -> anyhow::Result<String> {
     let extraction_config = load_extraction_runtime_config_from_env()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     load_statement_blueprint_schema(&extraction_config.llama_schema_version)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    Ok(())
+    Ok(extraction_config.llama_schema_version)
 }
 
 async fn health() -> Json<HealthStatus> {

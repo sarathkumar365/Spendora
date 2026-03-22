@@ -18,12 +18,12 @@ use std::{net::SocketAddr, path::PathBuf};
 use storage_sqlite::{
     claim_pending_job, clear_import_rows, connect, ensure_default_manual_account,
     get_extraction_settings, get_import_content, get_llama_agent_cache, get_llama_agent_readiness,
-    insert_import_rows, mark_job_completed, mark_job_failed, run_migrations,
+    insert_import_rows, mark_job_completed, mark_job_failed, run_migrations, upsert_or_get_statement,
     update_import_extraction_result, update_import_status, upsert_llama_agent_cache,
     upsert_llama_agent_readiness, LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
 };
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -42,6 +42,36 @@ struct ImportJobPayload {
     import_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedFlowMode {
+    New,
+    Legacy,
+}
+
+impl ManagedFlowMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+fn managed_flow_mode_from_env() -> ManagedFlowMode {
+    match std::env::var("EXTRACTION_MANAGED_FLOW_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("legacy") => ManagedFlowMode::Legacy,
+        Some("new") | None => ManagedFlowMode::New,
+        Some(value) => {
+            warn!(mode = value, "invalid EXTRACTION_MANAGED_FLOW_MODE; defaulting to new");
+            ManagedFlowMode::New
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -57,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = ensure_llama_agent_ready(&pool).await {
         error!(error = %err, "failed to persist llama agent readiness");
     }
+    info!(
+        managed_flow_mode = managed_flow_mode_from_env().as_str(),
+        "managed flow mode resolved"
+    );
 
     let health_addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     tokio::spawn(async move {
@@ -321,6 +355,19 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
 
     let job_attempt = job.attempts + 1;
     let job_payload: ImportJobPayload = serde_json::from_str(&job.payload_json)?;
+    info!(
+        job_id = %job.id,
+        import_id = %job_payload.import_id,
+        attempt = job_attempt,
+        "claimed import_parse job"
+    );
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "import_job_claimed",
+        "job_id": job.id.clone(),
+        "import_id": job_payload.import_id.clone(),
+        "attempt": job_attempt,
+    }));
 
     let result = async {
         update_import_status(
@@ -333,12 +380,46 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             0,
         )
         .await?;
+        info!(
+            import_id = %job_payload.import_id,
+            status = ImportStatus::Parsing.as_str(),
+            "import parse status updated"
+        );
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "import_status_updated",
+            "import_id": job_payload.import_id.clone(),
+            "status": ImportStatus::Parsing.as_str(),
+            "parsed_rows": 0,
+            "errors_count": 0,
+            "warnings_count": 0,
+            "review_required_count": 0,
+        }));
 
         let blob = get_import_content(pool, &job_payload.import_id).await?;
         let account_id = ensure_default_manual_account(pool).await?;
         let decoded = STANDARD.decode(blob.content_base64.as_bytes())?;
         let settings = get_extraction_settings(pool).await?;
+        info!(
+            import_id = %job_payload.import_id,
+            file_name = %blob.file_name,
+            parser_type = %blob.parser_type,
+            extraction_mode = %blob.extraction_mode,
+            "loaded import payload and settings"
+        );
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "import_payload_loaded",
+            "import_id": job_payload.import_id.clone(),
+            "file_name": blob.file_name.clone(),
+            "parser_type": blob.parser_type.clone(),
+            "extraction_mode": blob.extraction_mode.clone(),
+            "provider_timeout_ms": settings.provider_timeout_ms,
+            "max_provider_retries": settings.max_provider_retries,
+            "managed_fallback_enabled": settings.managed_fallback_enabled,
+        }));
 
+        let mut statement_id_for_rows: Option<String> = None;
         let parsed = if blob.parser_type == "csv" {
             parse_csv(&decoded, &account_id)
         } else if blob.parser_type == "pdf" {
@@ -374,6 +455,13 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                     &result.diagnostics,
                 )
                 .await?;
+                log_bootstrap_event(serde_json::json!({
+                    "ts_utc": chrono::Utc::now().to_rfc3339(),
+                    "kind": "local_ocr_stub_result_written",
+                    "import_id": job_payload.import_id.clone(),
+                    "provider": result.effective_provider.clone(),
+                    "errors_count": result.errors.len(),
+                }));
 
                 anyhow::bail!(
                     "{}",
@@ -399,6 +487,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 }));
                 let diagnostics = serde_json::json!({
                     "provider": "managed",
+                    "managed_flow_mode": managed_flow_mode_from_env().as_str(),
                     "agent_readiness": readiness.clone(),
                 });
                 update_import_extraction_result(
@@ -423,20 +512,106 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "schema_version": readiness.schema_version.clone(),
             }));
 
+            let flow_mode = managed_flow_mode_from_env();
+            info!(
+                import_id = %job_payload.import_id,
+                mode = flow_mode.as_str(),
+                "managed extraction flow selected"
+            );
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "managed_flow_selected",
+                "import_id": job_payload.import_id.clone(),
+                "mode": flow_mode.as_str(),
+            }));
             let extractor = ManagedExtractor::default();
-            let result = extractor
-                .extract_pdf(&ExtractionRequest {
-                    import_id: job_payload.import_id.clone(),
-                    account_id: account_id.clone(),
-                    file_name: blob.file_name.clone(),
-                    bytes: decoded,
-                    max_provider_retries: settings.max_provider_retries,
-                    timeout_ms: settings.provider_timeout_ms,
-                    managed_fallback_enabled: settings.managed_fallback_enabled,
-                })
-                .await?;
+            let request = ExtractionRequest {
+                import_id: job_payload.import_id.clone(),
+                account_id: account_id.clone(),
+                file_name: blob.file_name.clone(),
+                bytes: decoded,
+                max_provider_retries: settings.max_provider_retries,
+                timeout_ms: settings.provider_timeout_ms,
+                managed_fallback_enabled: settings.managed_fallback_enabled,
+            };
+            let result = if flow_mode == ManagedFlowMode::New {
+                extractor.extract_pdf_new(&request).await?
+            } else {
+                extractor.extract_pdf(&request).await?
+            };
+            info!(
+                import_id = %job_payload.import_id,
+                mode = flow_mode.as_str(),
+                provider = result.effective_provider.as_deref().unwrap_or("none"),
+                rows = result.rows.len(),
+                warnings = result.warnings.len(),
+                errors = result.errors.len(),
+                "managed extraction completed"
+            );
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "managed_extraction_completed",
+                "import_id": job_payload.import_id.clone(),
+                "mode": flow_mode.as_str(),
+                "provider": result.effective_provider.clone(),
+                "rows_count": result.rows.len(),
+                "warnings_count": result.warnings.len(),
+                "errors_count": result.errors.len(),
+            }));
+
+            if flow_mode == ManagedFlowMode::New {
+                let statement_context = result
+                    .diagnostics
+                    .get("statement_context")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let lineage = result
+                    .diagnostics
+                    .get("provider_lineage")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let (Some(period_start), Some(period_end)) = (
+                    statement_context.get("period_start").and_then(|v| v.as_str()),
+                    statement_context.get("period_end").and_then(|v| v.as_str()),
+                ) {
+                    if !period_start.is_empty() && !period_end.is_empty() {
+                        let statement = upsert_or_get_statement(
+                            pool,
+                            &account_id,
+                            period_start,
+                            period_end,
+                            statement_context
+                                .get("statement_month")
+                                .and_then(|v| v.as_str()),
+                            Some("llamaextract_jobs"),
+                            lineage.get("job_id").and_then(|v| v.as_str()),
+                            lineage.get("run_id").and_then(|v| v.as_str()),
+                            &lineage,
+                            statement_context
+                                .get("schema_version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("statement_v1"),
+                        )
+                        .await?;
+                        statement_id_for_rows = Some(statement.id);
+                        log_bootstrap_event(serde_json::json!({
+                            "ts_utc": chrono::Utc::now().to_rfc3339(),
+                            "kind": "statement_upserted",
+                            "import_id": job_payload.import_id.clone(),
+                            "account_id": account_id.clone(),
+                            "statement_id": statement_id_for_rows.clone(),
+                            "period_start": period_start,
+                            "period_end": period_end,
+                        }));
+                    }
+                }
+            }
 
             let diagnostics = serde_json::json!({
+                "managed_flow_mode": flow_mode.as_str(),
+                "provider_lineage": result.diagnostics.get("provider_lineage").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "poll_status_trail": result.diagnostics.get("poll_status_trail").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "statement_context": result.diagnostics.get("statement_context").cloned().unwrap_or_else(|| serde_json::json!({})),
                 "provider_diagnostics": result.diagnostics.clone(),
                 "agent_readiness": readiness,
             });
@@ -455,6 +630,14 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 &diagnostics,
             )
             .await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "import_extraction_result_written",
+                "import_id": job_payload.import_id.clone(),
+                "mode": flow_mode.as_str(),
+                "provider": result.effective_provider.clone(),
+                "attempts_count": result.attempts.len(),
+            }));
 
             if !result.errors.is_empty() && result.rows.is_empty() {
                 anyhow::bail!("{}", result.errors.join(" | "));
@@ -497,10 +680,18 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 parse_error: row.parse_error.clone(),
                 normalized_txn_hash: row.normalized_txn_hash.clone(),
                 account_id: Some(account_id.clone()),
+                statement_id: statement_id_for_rows.clone(),
             })
             .collect();
 
         insert_import_rows(pool, &job_payload.import_id, parsed_rows).await?;
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "import_rows_inserted",
+            "import_id": job_payload.import_id.clone(),
+            "rows_total": parsed.rows.len(),
+            "statement_id": statement_id_for_rows.clone(),
+        }));
 
         let review_required_count = parsed
             .rows
@@ -513,17 +704,38 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         } else {
             ImportStatus::ReadyToCommit
         };
+        let status_str = status.as_str().to_string();
 
+        let parsed_rows_len = parsed.rows.len();
+        let parsed_errors_len = parsed.errors.len();
+        let parsed_warnings_len = parsed.warnings.len();
         update_import_status(
             pool,
             &job_payload.import_id,
             status,
-            serde_json::json!({ "parsed_rows": parsed.rows.len() }),
+            serde_json::json!({ "parsed_rows": parsed_rows_len }),
             parsed.errors,
             parsed.warnings,
             review_required_count,
         )
         .await?;
+        info!(
+            import_id = %job_payload.import_id,
+            status = %status_str,
+            parsed_rows = parsed_rows_len,
+            review_required_count = review_required_count,
+            "import parse status updated"
+        );
+        log_bootstrap_event(serde_json::json!({
+            "ts_utc": chrono::Utc::now().to_rfc3339(),
+            "kind": "import_status_updated",
+            "import_id": job_payload.import_id.clone(),
+            "status": status_str,
+            "parsed_rows": parsed_rows_len,
+            "errors_count": parsed_errors_len,
+            "warnings_count": parsed_warnings_len,
+            "review_required_count": review_required_count,
+        }));
 
         Ok::<(), anyhow::Error>(())
     }
@@ -532,9 +744,22 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
     match result {
         Ok(_) => {
             mark_job_completed(pool, &job.id).await?;
+            info!(job_id = %job.id, import_id = %job_payload.import_id, "job completed");
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "import_job_completed",
+                "job_id": job.id.clone(),
+                "import_id": job_payload.import_id.clone(),
+            }));
         }
         Err(err) => {
             let err_text = err.to_string();
+            error!(
+                job_id = %job.id,
+                import_id = %job_payload.import_id,
+                error = %err_text,
+                "job failed"
+            );
             update_import_status(
                 pool,
                 &job_payload.import_id,
@@ -545,7 +770,32 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 0,
             )
             .await?;
+            info!(
+                import_id = %job_payload.import_id,
+                status = ImportStatus::Failed.as_str(),
+                error = %err_text,
+                "import parse status updated"
+            );
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "import_status_updated",
+                "import_id": job_payload.import_id.clone(),
+                "status": ImportStatus::Failed.as_str(),
+                "parsed_rows": 0,
+                "errors_count": 1,
+                "warnings_count": 0,
+                "review_required_count": 0,
+                "error": err_text,
+            }));
             mark_job_failed(pool, &job.id, job_attempt, &err_text).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "import_job_failed",
+                "job_id": job.id.clone(),
+                "import_id": job_payload.import_id.clone(),
+                "attempt": job_attempt,
+                "error": err_text,
+            }));
         }
     }
 
@@ -804,5 +1054,22 @@ mod tests {
         ] {
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[test]
+    fn managed_flow_mode_defaults_to_new() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::remove_var("EXTRACTION_MANAGED_FLOW_MODE") };
+        assert_eq!(managed_flow_mode_from_env(), ManagedFlowMode::New);
+    }
+
+    #[test]
+    fn managed_flow_mode_accepts_legacy_and_invalid_defaults_new() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::set_var("EXTRACTION_MANAGED_FLOW_MODE", "legacy") };
+        assert_eq!(managed_flow_mode_from_env(), ManagedFlowMode::Legacy);
+        unsafe { std::env::set_var("EXTRACTION_MANAGED_FLOW_MODE", "invalid") };
+        assert_eq!(managed_flow_mode_from_env(), ManagedFlowMode::New);
+        unsafe { std::env::remove_var("EXTRACTION_MANAGED_FLOW_MODE") };
     }
 }

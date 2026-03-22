@@ -28,6 +28,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 #[tauri::command]
 fn start_services(state: tauri::State<'_, Mutex<ProcessState>>) -> Result<ServiceStatus, String> {
     let mut processes = state.lock().map_err(|_| "lock poisoned".to_string())?;
+    let services_dir = services_root();
+    clear_runtime_logs_for_dev(&services_dir)
+        .map_err(|e| format!("failed to clear dev logs: {e}"))?;
 
     clean_stale_processes_for_port(&mut processes.api, 8081)?;
     if !is_service_running(&mut processes.api, 8081) {
@@ -115,15 +118,70 @@ fn spawn_service(package: &str) -> std::io::Result<Child> {
         .open(log_path)?;
     let log_file_err = log_file.try_clone()?;
 
-    Command::new("cargo")
-        .arg("run")
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
         .arg("-p")
         .arg(package)
         .env("EXPENSE_APP_DATA_DIR", app_data_dir)
-        .current_dir(services_dir)
+        .current_dir(services_dir.clone())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()
+        .stderr(Stdio::from(log_file_err));
+
+    for (key, value) in load_env_file_vars(&services_dir) {
+        cmd.env(key, value);
+    }
+
+    cmd.spawn()
+}
+
+fn load_env_file_vars(services_dir: &Path) -> Vec<(String, String)> {
+    let mut candidates = Vec::new();
+    if let Ok(explicit) = env::var("EXPENSE_ENV_FILE") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join(".env"));
+    }
+    if let Some(services_parent) = services_dir.parent() {
+        candidates.push(services_parent.join(".env"));
+        if let Some(repo_root) = services_parent.parent() {
+            candidates.push(repo_root.join(".env"));
+        }
+    }
+
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return parse_env_file(content.as_str());
+        }
+    }
+    Vec::new()
+}
+
+fn parse_env_file(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key_raw, value_raw)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key_raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = value_raw.trim().to_string();
+        if ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+            && value.len() >= 2
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+        out.push((key.to_string(), value));
+    }
+    out
 }
 
 fn services_root() -> PathBuf {
@@ -256,6 +314,33 @@ fn service_log_path(package: &str) -> PathBuf {
         .join(".runtime")
         .join("logs")
         .join(format!("{package}.log"))
+}
+
+fn clear_runtime_logs_for_dev(services_dir: &Path) -> std::io::Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let logs_dir = services_dir.join(".runtime").join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    for entry in std::fs::read_dir(&logs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+        {
+            // Truncate all runtime .log files for a fresh dev run
+            // (api/worker/bootstrap/provider/external-api-raw).
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_log_tail(package: &str, max_lines: usize) -> String {
