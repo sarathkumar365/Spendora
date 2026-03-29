@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
     let extraction_config = load_extraction_runtime_config_from_env()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;

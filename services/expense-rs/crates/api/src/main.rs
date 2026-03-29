@@ -2,11 +2,12 @@ mod accounts;
 mod imports;
 mod plaid;
 mod settings;
+mod statements;
 mod state;
 mod transactions;
 
 use axum::{
-    http::{header, HeaderName, HeaderValue, Method},
+    http::{HeaderName, HeaderValue, Method},
     extract::State,
     response::IntoResponse,
     routing::{get, post},
@@ -92,6 +93,15 @@ async fn main() -> anyhow::Result<()> {
             get(transactions::get_transactions_handler),
         )
         .route("/api/v1/accounts", get(accounts::get_accounts_handler))
+        .route("/api/v1/statements", get(statements::list_statements_handler))
+        .route(
+            "/api/v1/statements/coverage",
+            get(statements::get_statement_coverage_handler),
+        )
+        .route(
+            "/api/v1/statements/:statement_id/transactions",
+            get(statements::list_statement_transactions_handler),
+        )
         .route(
             "/api/v1/settings/extraction",
             get(settings::get_extraction_settings_handler)
@@ -247,7 +257,7 @@ fn validate_origin(value: &str) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
     use std::sync::{Mutex, OnceLock};
     use storage_sqlite::{upsert_llama_agent_readiness, LlamaAgentReadinessState};
     use tower::util::ServiceExt;

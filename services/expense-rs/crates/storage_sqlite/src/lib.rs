@@ -82,6 +82,7 @@ pub struct TransactionListItem {
     pub explanation: String,
     pub last_sync_at: String,
     pub import_id: Option<String>,
+    pub statement_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +184,33 @@ pub struct StatementRecord {
     pub schema_version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementListItem {
+    pub id: String,
+    pub account_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub statement_month: Option<String>,
+    pub provider_name: Option<String>,
+    pub provider_job_id: Option<String>,
+    pub provider_run_id: Option<String>,
+    pub schema_version: String,
+    pub linked_txn_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementCoverageMonth {
+    pub year: i32,
+    pub month: i32,
+    pub statement_exists: bool,
+    pub statement_id: Option<String>,
+    pub statement_month: Option<String>,
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
+    pub linked_txn_count: i64,
+    pub manual_added_txn_count: i64,
+}
+
 impl Default for ExtractionSettings {
     fn default() -> Self {
         Self {
@@ -238,13 +266,39 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             continue;
         }
 
-        sqlx::query(sql).execute(pool).await?;
+        apply_migration_sql(pool, sql).await?;
         sqlx::query("INSERT INTO schema_migrations (version) VALUES (?1)")
             .bind(*version)
             .execute(pool)
             .await?;
     }
     Ok(())
+}
+
+async fn apply_migration_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
+    for statement in sql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        if let Err(error) = sqlx::query(statement).execute(pool).await {
+            if is_idempotent_sqlite_error(&error) {
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn is_idempotent_sqlite_error(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+    let message = db_error.message().to_ascii_lowercase();
+    message.contains("duplicate column name")
+        || message.contains("already exists")
+        || message.contains("duplicate key name")
 }
 
 pub async fn ensure_default_manual_account(pool: &SqlitePool) -> anyhow::Result<String> {
@@ -289,6 +343,35 @@ pub async fn create_import(pool: &SqlitePool, input: CreateImportInput) -> anyho
 
     let payload = serde_json::json!({ "import_id": import_id });
     enqueue_job(pool, "import_parse", &payload.to_string()).await?;
+
+    Ok(import_id)
+}
+
+pub async fn create_reused_import(
+    pool: &SqlitePool,
+    input: CreateImportInput,
+    summary: &serde_json::Value,
+    diagnostics: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let import_id = new_idempotency_key();
+    let extraction_mode = input
+        .extraction_mode
+        .unwrap_or_else(|| DEFAULT_EXTRACTION_MODE.to_string());
+
+    sqlx::query(
+        "INSERT INTO imports (id, source_type, status, file_name, parser_type, source_hash, content_base64, extraction_mode, effective_provider, provider_attempts_json, extraction_diagnostics_json, provider_attempt_count, review_required_count, summary_json, errors_json, warnings_json, committed_at, updated_at) VALUES (?1, 'manual', ?2, ?3, ?4, ?5, ?6, ?7, 'reused_db', '[]', ?8, 0, 0, ?9, '[]', '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(&import_id)
+    .bind(ImportStatus::Committed.as_str())
+    .bind(&input.file_name)
+    .bind(&input.parser_type)
+    .bind(&input.source_hash)
+    .bind(&input.content_base64)
+    .bind(extraction_mode)
+    .bind(diagnostics.to_string())
+    .bind(summary.to_string())
+    .execute(pool)
+    .await?;
 
     Ok(import_id)
 }
@@ -522,6 +605,203 @@ pub async fn upsert_or_get_statement(
         .ok_or_else(|| anyhow!("statement upsert load failed"))
 }
 
+pub async fn list_statements_for_account(
+    pool: &SqlitePool,
+    account_id: &str,
+    year: Option<i32>,
+    month: Option<i32>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> anyhow::Result<Vec<StatementListItem>> {
+    let mut sql = String::from(
+        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
+    );
+    let mut binds: Vec<String> = vec![account_id.to_string()];
+
+    if let Some(y) = year {
+        sql.push_str(
+            " AND substr(COALESCE(s.statement_month, s.period_start), 1, 4) = ?",
+        );
+        binds.push(format!("{y:04}"));
+    }
+    if let Some(m) = month {
+        sql.push_str(
+            " AND substr(COALESCE(s.statement_month, s.period_start), 6, 2) = ?",
+        );
+        binds.push(format!("{m:02}"));
+    }
+    if let Some(from) = date_from {
+        sql.push_str(" AND date(s.period_end) >= date(?)");
+        binds.push(from.to_string());
+    }
+    if let Some(to) = date_to {
+        sql.push_str(" AND date(s.period_start) <= date(?)");
+        binds.push(to.to_string());
+    }
+
+    sql.push_str(
+        " GROUP BY s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version ORDER BY s.period_start DESC, s.period_end DESC",
+    );
+
+    let mut query = sqlx::query(&sql);
+    for bind in binds {
+        query = query.bind(bind);
+    }
+    let rows = query.fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| StatementListItem {
+            id: row.get("id"),
+            account_id: row.get("account_id"),
+            period_start: row.get("period_start"),
+            period_end: row.get("period_end"),
+            statement_month: row.get("statement_month"),
+            provider_name: row.get("provider_name"),
+            provider_job_id: row.get("provider_job_id"),
+            provider_run_id: row.get("provider_run_id"),
+            schema_version: row.get("schema_version"),
+            linked_txn_count: row.get("linked_txn_count"),
+        })
+        .collect())
+}
+
+pub async fn get_statement_coverage(
+    pool: &SqlitePool,
+    account_id: &str,
+    year: Option<i32>,
+    month: Option<i32>,
+) -> anyhow::Result<Vec<StatementCoverageMonth>> {
+    let statements = list_statements_for_account(pool, account_id, None, None, None, None).await?;
+    let mut by_month: std::collections::BTreeMap<(i32, i32), StatementCoverageMonth> =
+        std::collections::BTreeMap::new();
+
+    for statement in statements {
+        let month_token = statement
+            .statement_month
+            .clone()
+            .or_else(|| statement.period_start.get(..7).map(|value| value.to_string()));
+        let Some((y, m)) = month_token
+            .as_deref()
+            .and_then(parse_year_month_safe)
+        else {
+            continue;
+        };
+        let entry = by_month.entry((y, m)).or_insert_with(|| StatementCoverageMonth {
+            year: y,
+            month: m,
+            statement_exists: true,
+            statement_id: Some(statement.id.clone()),
+            statement_month: statement.statement_month.clone(),
+            period_start: Some(statement.period_start.clone()),
+            period_end: Some(statement.period_end.clone()),
+            linked_txn_count: 0,
+            manual_added_txn_count: 0,
+        });
+        entry.statement_exists = true;
+        entry.linked_txn_count += statement.linked_txn_count;
+        if entry.statement_id.is_none() {
+            entry.statement_id = Some(statement.id.clone());
+        }
+        if entry.statement_month.is_none() {
+            entry.statement_month = statement.statement_month.clone();
+        }
+        if let Some(existing) = entry.period_start.clone() {
+            if statement.period_start < existing {
+                entry.period_start = Some(statement.period_start.clone());
+            }
+        }
+        if let Some(existing) = entry.period_end.clone() {
+            if statement.period_end > existing {
+                entry.period_end = Some(statement.period_end.clone());
+            }
+        }
+    }
+
+    // TODO(step4): Bucket manual rows by booked_at so backfilled entries land in
+    // the statement month they belong to instead of the month they were created.
+    let manual_rows = sqlx::query(
+        "SELECT CAST(strftime('%Y', created_at) AS INTEGER) AS y, CAST(strftime('%m', created_at) AS INTEGER) AS m, COUNT(*) AS cnt FROM transactions WHERE account_id = ?1 AND statement_id IS NULL GROUP BY y, m",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+
+    for row in manual_rows {
+        let y: i32 = row.get("y");
+        let m: i32 = row.get("m");
+        let cnt: i64 = row.get("cnt");
+        let entry = by_month.entry((y, m)).or_insert_with(|| StatementCoverageMonth {
+            year: y,
+            month: m,
+            statement_exists: false,
+            statement_id: None,
+            statement_month: None,
+            period_start: None,
+            period_end: None,
+            linked_txn_count: 0,
+            manual_added_txn_count: 0,
+        });
+        entry.manual_added_txn_count = cnt;
+    }
+
+    Ok(by_month
+        .into_values()
+        .filter(|item| year.map(|v| v == item.year).unwrap_or(true))
+        .filter(|item| month.map(|v| v == item.month).unwrap_or(true))
+        .collect())
+}
+
+pub async fn list_transactions_for_statement(
+    pool: &SqlitePool,
+    statement_id: &str,
+) -> anyhow::Result<Vec<TransactionListItem>> {
+    let rows = sqlx::query(
+        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id FROM transactions t WHERE t.statement_id = ?1 ORDER BY t.booked_at DESC, t.created_at DESC",
+    )
+    .bind(statement_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TransactionListItem {
+            id: row.get("id"),
+            account_id: row.get("account_id"),
+            description: row.get("description"),
+            amount_cents: row.get("amount_cents"),
+            booked_at: row.get("booked_at"),
+            source: row.get("source"),
+            classification_source: row.get("classification_source"),
+            confidence: row.get("confidence"),
+            explanation: row.get("explanation"),
+            last_sync_at: row.get("last_sync_at"),
+            import_id: row.get("import_id"),
+            statement_id: row.get("statement_id"),
+        })
+        .collect())
+}
+
+fn parse_year_month(input: &str) -> anyhow::Result<(i32, i32)> {
+    let mut parts = input.split('-');
+    let year = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing year token"))?
+        .parse::<i32>()?;
+    let month = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing month token"))?
+        .parse::<i32>()?;
+    if !(1..=12).contains(&month) {
+        return Err(anyhow!("month out of range"));
+    }
+    Ok((year, month))
+}
+
+fn parse_year_month_safe(input: &str) -> Option<(i32, i32)> {
+    parse_year_month(input).ok()
+}
+
 pub async fn get_import_content(pool: &SqlitePool, import_id: &str) -> anyhow::Result<ImportBlob> {
     let row = sqlx::query(
         "SELECT parser_type, content_base64, extraction_mode, file_name FROM imports WHERE id = ?1",
@@ -740,7 +1020,7 @@ pub async fn query_transactions(
     query: TransactionQuery,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let mut base = String::from(
-        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id FROM transactions t WHERE 1=1",
+        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id FROM transactions t WHERE 1=1",
     );
 
     let mut binds: Vec<String> = Vec::new();
@@ -791,6 +1071,7 @@ pub async fn query_transactions(
             explanation: row.get("explanation"),
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
+            statement_id: row.get("statement_id"),
         })
         .collect())
 }
@@ -961,6 +1242,31 @@ mod tests {
             .expect("pragma read should succeed");
         let fk_value: i64 = fk.get(0);
         assert_eq!(fk_value, 1);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn run_migrations_recovers_when_schema_migrations_is_truncated() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool).await.expect("initial migrations should pass");
+
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&pool)
+            .await
+            .expect("should clear schema_migrations");
+
+        run_migrations(&pool)
+            .await
+            .expect("rerun should tolerate already-added columns");
+
+        let applied = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("read migration rows");
+        assert_eq!(applied as usize, MIGRATIONS.len());
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -1542,6 +1848,143 @@ mod tests {
         .expect("load tx");
         let saved_statement_id: Option<String> = saved.get("statement_id");
         assert_eq!(saved_statement_id.as_deref(), Some(statement.id.as_str()));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn statement_coverage_marks_statement_and_manual_months() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        let statement = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-05-01",
+            "2026-05-31",
+            Some("2026-05"),
+            Some("llamaextract_jobs"),
+            Some("job-cov"),
+            Some("run-cov"),
+            &serde_json::json!({}),
+            "statement_v1",
+        )
+        .await
+        .expect("statement upsert");
+
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-cov-1', ?1, 'hash-cov-1', 1100, 'CAD', 'Linked Tx', '2026-05-10', 'manual', 'manual', 1.0, 'manual', ?2)")
+            .bind(&account_id)
+            .bind(&statement.id)
+            .execute(&pool)
+            .await
+            .expect("insert linked tx");
+
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, created_at, statement_id) VALUES ('tx-cov-2', ?1, 'hash-cov-2', 1300, 'CAD', 'Manual Tx', '2026-06-03', 'manual', 'manual', 1.0, 'manual', '2026-06-04 12:00:00', NULL)")
+            .bind(&account_id)
+            .execute(&pool)
+            .await
+            .expect("insert manual tx");
+
+        let coverage = get_statement_coverage(&pool, &account_id, None, None)
+            .await
+            .expect("coverage");
+
+        let may = coverage
+            .iter()
+            .find(|item| item.year == 2026 && item.month == 5)
+            .expect("may bucket");
+        assert!(may.statement_exists);
+        assert_eq!(may.linked_txn_count, 1);
+
+        let june = coverage
+            .iter()
+            .find(|item| item.year == 2026 && item.month == 6)
+            .expect("june bucket");
+        assert!(!june.statement_exists);
+        assert_eq!(june.manual_added_txn_count, 1);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn statement_coverage_skips_malformed_statement_period_start() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        sqlx::query(
+            "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, schema_version) VALUES ('st-mal-1', ?1, 'bad', '2026-05-31', NULL, 'statement_v1')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .expect("insert malformed statement");
+
+        let coverage = get_statement_coverage(&pool, &account_id, None, None)
+            .await
+            .expect("coverage should not fail");
+        assert!(coverage.is_empty());
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn list_transactions_for_statement_returns_only_linked_rows() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+        let statement = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-07-01",
+            "2026-07-31",
+            Some("2026-07"),
+            Some("llamaextract_jobs"),
+            Some("job-list"),
+            Some("run-list"),
+            &serde_json::json!({}),
+            "statement_v1",
+        )
+        .await
+        .expect("statement upsert");
+
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-list-1', ?1, 'hash-list-1', 1500, 'CAD', 'Linked 1', '2026-07-03', 'manual', 'manual', 1.0, 'manual', ?2)")
+            .bind(&account_id)
+            .bind(&statement.id)
+            .execute(&pool)
+            .await
+            .expect("insert linked tx");
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES ('tx-list-2', ?1, 'hash-list-2', 1600, 'CAD', 'Unlinked', '2026-07-04', 'manual', 'manual', 1.0, 'manual')")
+            .bind(&account_id)
+            .execute(&pool)
+            .await
+            .expect("insert unlinked tx");
+
+        let rows = list_transactions_for_statement(&pool, &statement.id)
+            .await
+            .expect("list statement tx");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].description, "Linked 1");
+        assert_eq!(rows[0].statement_id.as_deref(), Some(statement.id.as_str()));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;

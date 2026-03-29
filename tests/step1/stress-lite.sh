@@ -12,6 +12,13 @@ RESTART_CYCLES="${RESTART_CYCLES:-4}"
 API_PID=""
 WORKER_PID=""
 
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
 mkdir -p "$TEST_TMP_DIR"
 rm -f "$DB_PATH"
 

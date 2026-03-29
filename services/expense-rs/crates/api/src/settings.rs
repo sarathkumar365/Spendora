@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use storage_sqlite::{
     get_extraction_settings, upsert_extraction_settings, ExtractionSettings,
-    DEFAULT_MAX_PROVIDER_RETRIES, DEFAULT_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS,
+    DEFAULT_MAX_PROVIDER_RETRIES, MAX_PROVIDER_TIMEOUT_MS,
     MIN_PROVIDER_TIMEOUT_MS,
 };
 
@@ -92,7 +92,7 @@ mod tests {
     use crate::state::AppState;
     use axum::extract::State;
     use std::sync::Arc;
-    use storage_sqlite::{connect, run_migrations};
+    use storage_sqlite::{connect, run_migrations, DEFAULT_PROVIDER_TIMEOUT_MS};
 
     fn temp_db_path() -> std::path::PathBuf {
         std::env::current_dir()
