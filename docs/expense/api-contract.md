@@ -38,6 +38,19 @@ Step 2.1 import contract additions:
   - `provider_attempts[]`
   - `diagnostics`
 
+### Implemented in Step 4
+- `GET /api/v1/statements/coverage`
+- `GET /api/v1/statements`
+- `GET /api/v1/statements/:statement_id/transactions`
+
+Step 4 import contract additions:
+- `POST /api/v1/imports` optional request fields:
+  - `account_id`
+  - `year`
+  - `month`
+- `POST /api/v1/imports` response additions:
+  - `reused` (boolean)
+
 ### Deferred (returns 501)
 - `POST /api/v1/connections/plaid/link-token`
 - `POST /api/v1/connections/plaid/exchange`

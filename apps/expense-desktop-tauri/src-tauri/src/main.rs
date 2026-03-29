@@ -108,6 +108,7 @@ fn spawn_service(package: &str) -> std::io::Result<Child> {
 
     let app_data_dir = services_dir.join(".runtime");
     std::fs::create_dir_all(&app_data_dir)?;
+    let db_path = app_data_dir.join("expense.db");
     let logs_dir = app_data_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
@@ -122,6 +123,10 @@ fn spawn_service(package: &str) -> std::io::Result<Child> {
     cmd.arg("run")
         .arg("-p")
         .arg(package)
+        .arg("--")
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--migrate")
         .env("EXPENSE_APP_DATA_DIR", app_data_dir)
         .current_dir(services_dir.clone())
         .stdout(Stdio::from(log_file))

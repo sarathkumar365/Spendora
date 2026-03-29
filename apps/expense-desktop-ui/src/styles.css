@@ -1,76 +1,7 @@
-:root {
-  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-  color: #1d2433;
-  background: radial-gradient(circle at top left, #eef6ff, #f8fbff 40%, #ffffff 100%);
-}
-
 * {
   box-sizing: border-box;
 }
 
 body {
   margin: 0;
-}
-
-.app-shell {
-  min-height: 100vh;
-  padding: 1.5rem;
-  display: grid;
-  gap: 1rem;
-}
-
-.panel {
-  border: 1px solid #d7e2f2;
-  border-radius: 12px;
-  padding: 1rem;
-  background: #ffffff;
-}
-
-.actions {
-  display: flex;
-  gap: 0.75rem;
-  margin: 0.75rem 0;
-  flex-wrap: wrap;
-}
-
-button,
-input,
-select {
-  border: 1px solid #98b3d8;
-  border-radius: 10px;
-  padding: 0.5rem 0.75rem;
-  font: inherit;
-}
-
-button {
-  background: #e9f2ff;
-  color: #0d1f3c;
-  cursor: pointer;
-}
-
-.table-wrap {
-  overflow-x: auto;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-th,
-td {
-  border-bottom: 1px solid #e4edf9;
-  padding: 0.45rem;
-  text-align: left;
-  white-space: nowrap;
-}
-
-.status-box {
-  border: 1px dashed #afc4e3;
-  border-radius: 10px;
-  padding: 0.75rem;
-}
-
-.error {
-  color: #a1002d;
 }
