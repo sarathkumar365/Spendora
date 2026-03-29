@@ -1,10 +1,62 @@
 # Version 0.2 — 5-Step Technical Implementation Plan
 
-## Implementation Status (Updated March 22, 2026)
+## Implementation Status (Updated March 29, 2026)
 
 - `Step 1` is complete and validated in the current codebase.
 - `Step 2` is complete and validated in the current codebase.
 - `Step 3` is complete and validated in the current codebase.
+- `Step 4` is partially complete (startup + UI shell foundation implemented; insights layer still pending).
+
+### Session Update (March 29, 2026) — Startup Revision + UI Foundation
+
+Implemented:
+- Deterministic desktop startup orchestration in Tauri:
+  - auto-start API + worker from Tauri `.setup(...)`,
+  - bounded retry flow (3 attempts) with startup state tracking,
+  - readiness now requires both TCP-open and HTTP health (`/health` or `/api/v1/health`),
+  - startup failure remains hard-blocking (no degraded shell entry).
+- Tauri command surface preserved:
+  - `start_services`, `stop_services`, `service_status` unchanged,
+  - added `startup_status` command for UI loading gate polling.
+- Process lifecycle hardening on app exit:
+  - child processes are terminated on Tauri exit,
+  - graceful TERM window with forced kill fallback.
+- Startup observability additions:
+  - new runtime metrics log:
+    `services/expense-rs/.runtime/logs/startup-metrics.log`,
+  - per startup attempt logs include:
+    `total startup time took = <secs>s (<ms>ms) | mode=<auto|manual> | result=<healthy|failed> | attempts=<n>`.
+- UI shell rebuilt from blank baseline:
+  - minimal startup loading/error gate wired to Tauri startup state,
+  - 3-page navigation scaffold added:
+    `AI Interaction` (default stub), `Import` (stub), `View Your Data` (statements + transactions wired to existing APIs),
+  - pastel modern-minimal styling baseline added.
+- UI stack foundation aligned to shadcn/tailwind direction:
+  - Tailwind + PostCSS config added,
+  - `components.json` and path alias scaffolding added,
+  - utility helpers added for future shadcn component growth.
+- Warning cleanup completed:
+  - removed Rust compile warnings in API/worker startup paths,
+  - optional invalid scope IDs removed from local `.env` to avoid repeated bootstrap warning events.
+
+Validated:
+- Tauri startup test suite expanded and passing:
+  - retry/backoff logic,
+  - startup status state updates,
+  - HTTP health probe behavior,
+  - readiness requiring HTTP health (not just open TCP),
+  - process termination behavior on shutdown.
+- Test run result:
+  - `cargo test --manifest-path apps/expense-desktop-tauri/src-tauri/Cargo.toml` -> pass.
+- Build/compile checks:
+  - `npm run test:ui-build` -> pass,
+  - `cargo check --manifest-path apps/expense-desktop-tauri/src-tauri/Cargo.toml` -> pass,
+  - `cargo check --manifest-path services/expense-rs/Cargo.toml -p api -p worker` -> pass.
+
+Important current behavior:
+- In dev mode, cold startup can still include Rust compile time due to `cargo run` process launches.
+- Startup-time measurement now captures full standup duration every run in `startup-metrics.log`.
+- AI page is intentionally a stub; insight-generation/product intelligence views remain future scope.
 
 ### Step 1 Completion Record (for Step 2 handoff)
 
@@ -167,6 +219,11 @@ Implement blueprint-based statement ingestion using LlamaExtract Jobs with stric
   - partial-success payloads still produce reviewable rows.
 
 ## Step 4 — DB-First Reuse + UI/Query Extensions (cost control + history)
+
+Current implementation note (latest):
+- Desktop startup now auto-starts API/Worker from Tauri shell boot.
+- UI was hard-reset to a blank foundation to rebuild Step 4 UX cleanly.
+- Step 4 backend/query capabilities remain in place; UI wiring is pending redesign.
 
 - Add import preflight for selected account + timeframe:
   - UI collects start/end date or month.

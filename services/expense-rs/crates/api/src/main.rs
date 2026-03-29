@@ -7,7 +7,7 @@ mod state;
 mod transactions;
 
 use axum::{
-    http::{header, HeaderName, HeaderValue, Method},
+    http::{HeaderName, HeaderValue, Method},
     extract::State,
     response::IntoResponse,
     routing::{get, post},
@@ -257,7 +257,7 @@ fn validate_origin(value: &str) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
     use std::sync::{Mutex, OnceLock};
     use storage_sqlite::{upsert_llama_agent_readiness, LlamaAgentReadinessState};
     use tower::util::ServiceExt;

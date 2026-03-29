@@ -266,13 +266,39 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             continue;
         }
 
-        sqlx::query(sql).execute(pool).await?;
+        apply_migration_sql(pool, sql).await?;
         sqlx::query("INSERT INTO schema_migrations (version) VALUES (?1)")
             .bind(*version)
             .execute(pool)
             .await?;
     }
     Ok(())
+}
+
+async fn apply_migration_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
+    for statement in sql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        if let Err(error) = sqlx::query(statement).execute(pool).await {
+            if is_idempotent_sqlite_error(&error) {
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn is_idempotent_sqlite_error(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+    let message = db_error.message().to_ascii_lowercase();
+    message.contains("duplicate column name")
+        || message.contains("already exists")
+        || message.contains("duplicate key name")
 }
 
 pub async fn ensure_default_manual_account(pool: &SqlitePool) -> anyhow::Result<String> {
@@ -1216,6 +1242,31 @@ mod tests {
             .expect("pragma read should succeed");
         let fk_value: i64 = fk.get(0);
         assert_eq!(fk_value, 1);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn run_migrations_recovers_when_schema_migrations_is_truncated() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool).await.expect("initial migrations should pass");
+
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&pool)
+            .await
+            .expect("should clear schema_migrations");
+
+        run_migrations(&pool)
+            .await
+            .expect("rerun should tolerate already-added columns");
+
+        let applied = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("read migration rows");
+        assert_eq!(applied as usize, MIGRATIONS.len());
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
