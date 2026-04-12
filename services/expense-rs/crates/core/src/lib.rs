@@ -262,7 +262,21 @@ fn validate_statement_schema_contract(
         .get("required")
         .and_then(|v| v.as_array())
         .ok_or_else(|| BlueprintSchemaError::InvalidContract("root required[] missing".to_string()))?;
-    for key in ["period_start", "period_end", "transactions"] {
+    let root_required_keys = if version == "statement_v2" {
+        vec![
+            "statement_period",
+            "statement_date",
+            "account_details",
+            "due_this_statement",
+            "account_summary",
+            "interest_information",
+            "transactions",
+            "transaction_subtotals",
+        ]
+    } else {
+        vec!["period_start", "period_end", "transactions"]
+    };
+    for key in root_required_keys {
         let has_key = root_required
             .iter()
             .filter_map(|v| v.as_str())
@@ -286,10 +300,11 @@ fn validate_statement_schema_contract(
             )
         })?;
 
-    let mut tx_required_keys = vec!["booked_at", "description", "amount_cents"];
-    if version == "statement_v2" {
-        tx_required_keys.push("direction");
-    }
+    let tx_required_keys = if version == "statement_v2" {
+        vec!["transaction_date", "details", "amount", "type"]
+    } else {
+        vec!["booked_at", "description", "amount_cents"]
+    };
     for key in tx_required_keys {
         let has_key = tx_required
             .iter()
@@ -326,45 +341,50 @@ fn validate_statement_schema_contract(
     }
 
     if version == "statement_v2" {
-        let has_account_summary = root_required
-            .iter()
-            .filter_map(|v| v.as_str())
-            .any(|item| item == "account_summary");
-        if !has_account_summary {
-            return Err(BlueprintSchemaError::InvalidContract(
-                "root required[] missing account_summary".to_string(),
-            ));
-        }
+        let required_blocks = vec![
+            ("statement_period", vec!["start_date", "end_date"]),
+            (
+                "account_details",
+                vec!["account_type", "account_number_ending", "customer_name"],
+            ),
+            (
+                "due_this_statement",
+                vec!["payment_due_date", "total_minimum_payment"],
+            ),
+            (
+                "account_summary",
+                vec![
+                    "interest_charged",
+                    "account_balance",
+                    "credit_limit",
+                    "available_credit",
+                ],
+            ),
+            (
+                "transaction_subtotals",
+                vec!["credits_total", "debits_total"],
+            ),
+        ];
 
-        let summary_required = schema
-            .get("properties")
-            .and_then(|v| v.get("account_summary"))
-            .and_then(|v| v.get("required"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                BlueprintSchemaError::InvalidContract(
-                    "account_summary.required[] missing".to_string(),
-                )
-            })?;
-
-        for key in [
-            "opening_balance_cents",
-            "opening_balance_date",
-            "closing_balance_cents",
-            "closing_balance_date",
-            "total_debits_cents",
-            "total_credits_cents",
-            "account_type",
-            "account_number_masked",
-        ] {
-            let has_key = summary_required
-                .iter()
-                .filter_map(|v| v.as_str())
-                .any(|item| item == key);
-            if !has_key {
-                return Err(BlueprintSchemaError::InvalidContract(format!(
-                    "account_summary.required[] missing {key}"
-                )));
+        for (block, keys) in required_blocks {
+            let required = schema
+                .get("properties")
+                .and_then(|v| v.get(block))
+                .and_then(|v| v.get("required"))
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    BlueprintSchemaError::InvalidContract(format!("{block}.required[] missing"))
+                })?;
+            for key in keys {
+                let has_key = required
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .any(|item| item == key);
+                if !has_key {
+                    return Err(BlueprintSchemaError::InvalidContract(format!(
+                        "{block}.required[] missing {key}"
+                    )));
+                }
             }
         }
     }
@@ -508,7 +528,8 @@ mod tests {
             .expect("root required fields");
         let root_required_keys: Vec<&str> =
             root_required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(root_required_keys.contains(&"account_summary"));
+        assert!(root_required_keys.contains(&"statement_period"));
+        assert!(root_required_keys.contains(&"transaction_subtotals"));
 
         let tx_required = schema
             .get("properties")
@@ -518,6 +539,7 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("tx required fields");
         let tx_required_keys: Vec<&str> = tx_required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(tx_required_keys.contains(&"direction"));
+        assert!(tx_required_keys.contains(&"transaction_date"));
+        assert!(tx_required_keys.contains(&"type"));
     }
 }

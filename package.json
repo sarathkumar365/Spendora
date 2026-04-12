@@ -22,6 +22,10 @@
     "ui:dev": "npm run dev --workspace expense-desktop-ui",
     "ui:build": "npm run build --workspace expense-desktop-ui",
     "tauri:dev": "npm run tauri:dev --workspace expense-desktop-tauri",
-    "tauri:build": "npm run tauri:build --workspace expense-desktop-tauri"
+    "tauri:build": "npm run tauri:build --workspace expense-desktop-tauri",
+    "db:status": "bash scripts/db-clean.sh status",
+    "db:clean": "bash scripts/db-clean.sh runtime",
+    "db:clean:app": "bash scripts/db-clean.sh app",
+    "db:clean:all": "bash scripts/db-clean.sh all"
   }
 }

@@ -89,6 +89,29 @@ Expected behavior:
 - On first API/Worker run with migration enabled, migrations are applied automatically.
 - Current migration source: `services/expense-rs/migrations`.
 
+## DB Helper Commands
+Run from repo root.
+
+1. Show known DB paths and whether they exist
+```bash
+npm run db:status
+```
+
+2. Clean runtime DB (`services/expense-rs/.runtime/expense.db`)
+```bash
+npm run db:clean
+```
+
+3. Clean app-support DB (`~/Library/Application Support/SpendoraDesktop/expense.db`)
+```bash
+npm run db:clean:app
+```
+
+4. Clean both runtime + app-support DBs
+```bash
+npm run db:clean:all
+```
+
 ## Test and Validation Commands
 Run from repo root.
 

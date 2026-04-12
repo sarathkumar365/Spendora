@@ -624,7 +624,7 @@ impl ManagedExtractor {
             .iter()
             .filter_map(|row| {
                 let parse_error = row.parse_error.as_ref()?;
-                if !parse_error.contains("direction_") && !parse_error.contains("missing_or_invalid_direction") {
+                if !parse_error.contains("sign_conflict") && !parse_error.contains("missing_or_invalid_type") {
                     return None;
                 }
                 Some(serde_json::json!({
@@ -647,7 +647,20 @@ impl ManagedExtractor {
             .account_summary
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
+        let payload_snapshot = validated.payload_snapshot.clone();
         let rows_total = rows.len();
+        let rows_with_missing_required_fields = rows
+            .iter()
+            .filter(|row| row_has_parse_flag(row, "missing_required_field:"))
+            .count();
+        let rows_with_sign_type_conflicts = rows
+            .iter()
+            .filter(|row| row_has_parse_flag(row, "sign_type_conflict"))
+            .count();
+        let rows_with_parse_defaults = rows
+            .iter()
+            .filter(|row| row_has_parse_flag(row, "parse_default_applied:"))
+            .count();
         let direction_review_row_count = direction_review_row_count(&rows, &direction_conflicts);
         let reconciliation = compute_reconciliation(&statement_summary, &rows, RECONCILIATION_TOLERANCE_CENTS);
         let reconciliation_fail_count = reconciliation
@@ -669,6 +682,9 @@ impl ManagedExtractor {
             "manual_override_rate": ratio(0, direction_review_row_count),
             "reconciliation_fail_count": reconciliation_fail_count,
             "reconciliation_fail_rate": ratio(reconciliation_fail_count, reconciliation_total_checks),
+            "rows_with_missing_required_fields": rows_with_missing_required_fields,
+            "rows_with_sign_type_conflicts": rows_with_sign_type_conflicts,
+            "rows_with_parse_defaults": rows_with_parse_defaults,
         });
         let diagnostics = serde_json::json!({
             "provider": "llamaextract_jobs",
@@ -680,6 +696,7 @@ impl ManagedExtractor {
                 "agent_id": agent_id,
             },
             "poll_status_trail": polled.status_trail,
+            "payload_snapshot": payload_snapshot,
             "statement_context": {
                 "period_start": period_start,
                 "period_end": period_end,
@@ -766,17 +783,11 @@ struct JobsResultPayload {
 
 #[derive(Debug, Clone)]
 struct StatementRowCandidate {
-    booked_at: Option<String>,
-    description: Option<String>,
-    amount_cents: Option<i64>,
+    transaction_date: Option<String>,
+    details: Option<String>,
+    amount: Option<f64>,
     confidence: Option<f64>,
-    direction: Option<String>,
-    direction_confidence: Option<f64>,
-    running_balance_cents: Option<i64>,
-    transaction_type_raw: Option<String>,
-    counterparty: Option<String>,
-    reference_id: Option<String>,
-    meta: Option<Value>,
+    tx_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -785,6 +796,7 @@ struct ValidatedJobsStatement {
     period_end: Option<String>,
     statement_month: Option<String>,
     account_summary: Option<Value>,
+    payload_snapshot: Value,
     rows: Vec<StatementRowCandidate>,
 }
 
@@ -1335,18 +1347,61 @@ fn validate_jobs_result_payload(
         .or_else(|| payload.get("data"))
         .or_else(|| payload.get("output"))
         .unwrap_or(payload);
-    let period_start = envelope
-        .get("period_start")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-    let period_end = envelope
-        .get("period_end")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-    let statement_month = envelope
-        .get("statement_month")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
+    if schema_version == "statement_v2" {
+        for key in [
+            "statement_period",
+            "statement_date",
+            "account_details",
+            "due_this_statement",
+            "account_summary",
+            "interest_information",
+            "transactions",
+            "transaction_subtotals",
+        ] {
+            if envelope.get(key).is_none() {
+                return Err(anyhow!(
+                    "MANAGED_PROVIDER_SCHEMA_INVALID: missing {}",
+                    key
+                ));
+            }
+        }
+    }
+    let period_start = if schema_version == "statement_v2" {
+        envelope
+            .get("statement_period")
+            .and_then(|v| v.get("start_date"))
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    } else {
+        envelope
+            .get("period_start")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    };
+    let period_end = if schema_version == "statement_v2" {
+        envelope
+            .get("statement_period")
+            .and_then(|v| v.get("end_date"))
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    } else {
+        envelope
+            .get("period_end")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    };
+    let statement_month = if schema_version == "statement_v2" {
+        envelope
+            .get("statement_date")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.get(0..7))
+            .map(|v| v.to_string())
+    } else {
+        envelope
+            .get("statement_month")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+    };
     let account_summary = envelope.get("account_summary").cloned();
     if schema_version == "statement_v2" && account_summary.is_none() {
         return Err(anyhow!(
@@ -1359,35 +1414,41 @@ fn validate_jobs_result_payload(
         .ok_or_else(|| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: missing transactions[]"))?;
     let mut rows = Vec::new();
     for item in txs {
-        rows.push(StatementRowCandidate {
-            booked_at: item.get("booked_at").and_then(|v| v.as_str()).map(|v| v.to_string()),
-            description: item.get("description").and_then(|v| v.as_str()).map(|v| v.to_string()),
-            amount_cents: item.get("amount_cents").and_then(|v| v.as_i64()),
-            confidence: item.get("confidence").and_then(|v| v.as_f64()),
-            direction: item
-                .get("direction")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            direction_confidence: item
-                .get("direction_confidence")
-                .and_then(|v| v.as_f64()),
-            running_balance_cents: item
-                .get("running_balance_cents")
-                .and_then(|v| v.as_i64()),
-            transaction_type_raw: item
-                .get("transaction_type_raw")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            counterparty: item
-                .get("counterparty")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            reference_id: item
-                .get("reference_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            meta: item.get("meta").cloned(),
-        });
+        if schema_version == "statement_v2" {
+            rows.push(StatementRowCandidate {
+                transaction_date: item
+                    .get("transaction_date")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                details: item
+                    .get("details")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                amount: item.get("amount").and_then(as_f64_from_value),
+                confidence: None,
+                tx_type: item.get("type").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            });
+        } else {
+            rows.push(StatementRowCandidate {
+                transaction_date: item
+                    .get("booked_at")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                details: item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                amount: item
+                    .get("amount_cents")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as f64 / 100.0),
+                confidence: item.get("confidence").and_then(|v| v.as_f64()),
+                tx_type: item
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+            });
+        }
     }
     if rows.is_empty() {
         return Err(anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: no transaction rows"));
@@ -1397,8 +1458,16 @@ fn validate_jobs_result_payload(
         period_end,
         statement_month,
         account_summary,
+        payload_snapshot: envelope.clone(),
         rows,
     })
+}
+
+fn as_f64_from_value(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))
 }
 
 fn resolve_period(
@@ -1411,7 +1480,7 @@ fn resolve_period(
     }
     let mut dates = rows
         .iter()
-        .filter_map(|r| r.booked_at.as_deref())
+        .filter_map(|r| r.transaction_date.as_deref())
         .filter(|d| is_iso_date(d))
         .collect::<Vec<_>>();
     dates.sort_unstable();
@@ -1429,6 +1498,19 @@ fn ratio(numerator: i64, denominator: i64) -> f64 {
         return 0.0;
     }
     numerator as f64 / denominator as f64
+}
+
+fn row_has_parse_flag(row: &ExtractedRow, prefix_or_flag: &str) -> bool {
+    row.metadata
+        .as_ref()
+        .and_then(|v| v.get("parse_flags"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|value| value == prefix_or_flag || value.starts_with(prefix_or_flag))
+            })
+        })
 }
 
 fn direction_review_row_count(rows: &[ExtractedRow], conflicts: &[Value]) -> i64 {
@@ -1741,46 +1823,59 @@ fn classify_from_metadata_cues(
 
 fn map_statement_row(row_index: i64, account_id: &str, row: StatementRowCandidate) -> ExtractedRow {
     let mut parse_errors = Vec::new();
-    let booked_at = match row.booked_at {
+    let mut parse_flags: Vec<String> = Vec::new();
+
+    let booked_at = match row.transaction_date {
         Some(v) if is_iso_date(v.as_str()) => v,
         Some(v) => {
-            parse_errors.push(format!("invalid booked_at format: {v}"));
+            parse_errors.push(format!("invalid transaction_date format: {v}"));
+            parse_flags.push("missing_required_field:transaction_date".to_string());
+            parse_flags.push("parse_default_applied:transaction_date".to_string());
             "1970-01-01".to_string()
         }
         None => {
-            parse_errors.push("missing booked_at".to_string());
+            parse_errors.push("missing transaction_date".to_string());
+            parse_flags.push("missing_required_field:transaction_date".to_string());
+            parse_flags.push("parse_default_applied:transaction_date".to_string());
             "1970-01-01".to_string()
         }
     };
-    let description = row.description.unwrap_or_else(|| {
-        parse_errors.push("missing description".to_string());
+    let description = row.details.unwrap_or_else(|| {
+        parse_errors.push("missing details".to_string());
+        parse_flags.push("missing_required_field:details".to_string());
+        parse_flags.push("parse_default_applied:details".to_string());
         "Unknown transaction".to_string()
     });
-    let amount_cents = row.amount_cents.unwrap_or_else(|| {
-        parse_errors.push("missing amount_cents".to_string());
-        0
-    });
-    let parsed_direction = TransactionDirection::from_value(row.direction.as_deref());
-    let mut direction = parsed_direction.unwrap_or_else(|| {
-        parse_errors.push("missing_or_invalid_direction; review required".to_string());
-        TransactionDirection::Unknown
-    });
-    let direction_confidence = row.direction_confidence.unwrap_or_else(|| {
-        parse_errors.push("missing_direction_confidence; review required".to_string());
+    let amount_units = row.amount.unwrap_or_else(|| {
+        parse_errors.push("missing amount".to_string());
+        parse_flags.push("missing_required_field:amount".to_string());
+        parse_flags.push("parse_default_applied:amount".to_string());
         0.0
     });
-    if direction_confidence < 0.5 {
-        parse_errors.push("low_direction_confidence; review required".to_string());
-        direction = TransactionDirection::Unknown;
-    }
+    let amount_cents = (amount_units * 100.0).round() as i64;
+
+    let mut direction = TransactionDirection::from_value(row.tx_type.as_deref()).unwrap_or_else(|| {
+        parse_errors.push("missing_or_invalid_type; review required".to_string());
+        parse_flags.push("missing_required_field:type".to_string());
+        TransactionDirection::Unknown
+    });
+
     if direction == TransactionDirection::Debit && amount_cents >= 0 {
-        parse_errors.push("direction_sign_conflict: debit requires negative amount".to_string());
-        direction = TransactionDirection::Unknown;
+        parse_errors.push("type_sign_conflict: debit requires non-positive amount".to_string());
+        parse_flags.push("sign_type_conflict".to_string());
     }
     if direction == TransactionDirection::Credit && amount_cents <= 0 {
-        parse_errors.push("direction_sign_conflict: credit requires positive amount".to_string());
-        direction = TransactionDirection::Unknown;
+        parse_errors.push("type_sign_conflict: credit requires non-negative amount".to_string());
+        parse_flags.push("sign_type_conflict".to_string());
     }
+    if direction == TransactionDirection::Unknown {
+        parse_flags.push("parse_default_applied:type".to_string());
+    }
+
+    if !parse_flags.is_empty() {
+        parse_flags.push("hash_fallback_defaults_applied".to_string());
+    }
+
     let normalized_description = normalize_description(description.as_str());
     let normalized_txn_hash =
         compute_row_hash(account_id, booked_at.as_str(), amount_cents, normalized_description.as_str());
@@ -1789,24 +1884,16 @@ fn map_statement_row(row_index: i64, account_id: &str, row: StatementRowCandidat
         "direction".to_string(),
         Value::String(direction.as_str().to_string()),
     );
+    metadata.insert("type".to_string(), Value::String(direction.as_str().to_string()));
     metadata.insert(
-        "direction_confidence".to_string(),
-        Value::from(direction_confidence),
+        "amount_units".to_string(),
+        Value::from(amount_units),
     );
-    if let Some(value) = row.running_balance_cents {
-        metadata.insert("running_balance_cents".to_string(), Value::from(value));
-    }
-    if let Some(value) = row.transaction_type_raw {
-        metadata.insert("transaction_type_raw".to_string(), Value::String(value));
-    }
-    if let Some(value) = row.counterparty {
-        metadata.insert("counterparty".to_string(), Value::String(value));
-    }
-    if let Some(value) = row.reference_id {
-        metadata.insert("reference_id".to_string(), Value::String(value));
-    }
-    if let Some(value) = row.meta {
-        metadata.insert("meta".to_string(), value);
+    if !parse_flags.is_empty() {
+        metadata.insert(
+            "parse_flags".to_string(),
+            Value::Array(parse_flags.into_iter().map(Value::String).collect()),
+        );
     }
     metadata.insert(
         "direction_source".to_string(),
@@ -2766,15 +2853,15 @@ fn extract_rows(value: &Value) -> anyhow::Result<Vec<ProviderRow>> {
     if let Some(rows) = value.get("rows").and_then(|v| v.as_array()) {
         let parsed: Vec<ProviderRow> = rows
             .iter()
-            .map(|item| serde_json::from_value(item.clone()))
-            .collect::<Result<_, _>>()?;
+            .map(parse_provider_row)
+            .collect::<anyhow::Result<_>>()?;
         return Ok(parsed);
     }
     if let Some(rows) = value.get("transactions").and_then(|v| v.as_array()) {
         let parsed: Vec<ProviderRow> = rows
             .iter()
-            .map(|item| serde_json::from_value(item.clone()))
-            .collect::<Result<_, _>>()?;
+            .map(parse_provider_row)
+            .collect::<anyhow::Result<_>>()?;
         return Ok(parsed);
     }
     if let Some(rows) = value
@@ -2784,8 +2871,8 @@ fn extract_rows(value: &Value) -> anyhow::Result<Vec<ProviderRow>> {
     {
         let parsed: Vec<ProviderRow> = rows
             .iter()
-            .map(|item| serde_json::from_value(item.clone()))
-            .collect::<Result<_, _>>()?;
+            .map(parse_provider_row)
+            .collect::<anyhow::Result<_>>()?;
         return Ok(parsed);
     }
     if let Some(rows) = value
@@ -2795,11 +2882,60 @@ fn extract_rows(value: &Value) -> anyhow::Result<Vec<ProviderRow>> {
     {
         let parsed: Vec<ProviderRow> = rows
             .iter()
-            .map(|item| serde_json::from_value(item.clone()))
-            .collect::<Result<_, _>>()?;
+            .map(parse_provider_row)
+            .collect::<anyhow::Result<_>>()?;
         return Ok(parsed);
     }
     Err(anyhow!("provider payload missing rows[]"))
+}
+
+fn parse_provider_row(item: &Value) -> anyhow::Result<ProviderRow> {
+    if item.get("transaction_date").is_some() || item.get("details").is_some() {
+        let booked_at = item
+            .get("transaction_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("1970-01-01")
+            .to_string();
+        let description = item
+            .get("details")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown transaction")
+            .to_string();
+        let amount = item
+            .get("amount")
+            .and_then(as_f64_from_value)
+            .unwrap_or(0.0);
+        let amount_cents = (amount * 100.0).round() as i64;
+        return Ok(ProviderRow {
+            booked_at,
+            description,
+            amount_cents: Some(amount_cents),
+            amount: None,
+            confidence: item.get("confidence").and_then(|v| v.as_f64()),
+            direction: item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            direction_confidence: item.get("direction_confidence").and_then(|v| v.as_f64()),
+            running_balance_cents: item.get("running_balance_cents").and_then(|v| v.as_i64()),
+            transaction_type_raw: item
+                .get("transaction_type_raw")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            counterparty: item
+                .get("counterparty")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            reference_id: item
+                .get("reference_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            meta: item.get("meta").cloned(),
+        });
+    }
+
+    let parsed: ProviderRow = serde_json::from_value(item.clone())?;
+    Ok(parsed)
 }
 
 fn extract_rows_with_pages_fallback(value: &Value) -> anyhow::Result<Vec<ProviderRow>> {
@@ -3030,7 +3166,7 @@ fn month_to_number(value: &str) -> Option<u32> {
 
 fn openrouter_prompt(schema_version: &str) -> &'static str {
     if schema_version == "statement_v2" {
-        "Extract a bank statement as strict JSON. Return period_start, period_end, account_summary, and transactions. For each transaction include booked_at (YYYY-MM-DD), description, amount_cents (signed integer), direction (debit|credit|transfer|reversal|unknown), and confidence. Ensure debit is negative and credit is positive; if direction is uncertain use unknown."
+        "Extract a bank statement as strict JSON using this exact shape: statement_period {start_date,end_date}, statement_date, account_details, due_this_statement, account_summary, interest_information, transactions, transaction_subtotals. Each transaction must include transaction_date (YYYY-MM-DD), details, amount (signed number), and type (credit|debit). Credits are non-negative; debits are non-positive."
     } else {
         "Extract bank statement transactions as strict JSON with key rows. Each row: booked_at (YYYY-MM-DD), description, amount_cents (integer)."
     }
@@ -3046,56 +3182,106 @@ fn openrouter_response_format_schema(schema_version: &str) -> Value {
                 "schema":{
                     "type":"object",
                     "properties":{
-                        "period_start":{"type":"string"},
-                        "period_end":{"type":"string"},
+                        "statement_period":{
+                            "type":"object",
+                            "properties":{
+                                "start_date":{"type":"string"},
+                                "end_date":{"type":"string"}
+                            },
+                            "required":["start_date","end_date"],
+                            "additionalProperties":false
+                        },
+                        "statement_date":{"type":"string"},
+                        "account_details":{
+                            "type":"object",
+                            "properties":{
+                                "account_type":{"type":"string"},
+                                "account_number_ending":{"type":"string"},
+                                "customer_name":{"type":"string"}
+                            },
+                            "required":["account_type","account_number_ending","customer_name"],
+                            "additionalProperties":false
+                        },
+                        "due_this_statement":{
+                            "type":"object",
+                            "properties":{
+                                "payment_due_date":{"type":"string"},
+                                "total_minimum_payment":{"type":"number"}
+                            },
+                            "required":["payment_due_date","total_minimum_payment"],
+                            "additionalProperties":false
+                        },
                         "account_summary":{
                             "type":"object",
                             "properties":{
-                                "opening_balance_cents":{"type":"integer"},
-                                "opening_balance_date":{"type":"string"},
-                                "closing_balance_cents":{"type":"integer"},
-                                "closing_balance_date":{"type":"string"},
-                                "total_debits_cents":{"type":"integer"},
-                                "total_credits_cents":{"type":"integer"},
-                                "account_type":{"type":"string"},
-                                "account_number_masked":{"type":"string"},
-                                "currency_code":{"type":"string"}
+                                "interest_charged":{"type":"number"},
+                                "account_balance":{"type":"number"},
+                                "credit_limit":{"type":"number"},
+                                "available_credit":{"type":"number"}
                             },
                             "required":[
-                                "opening_balance_cents",
-                                "opening_balance_date",
-                                "closing_balance_cents",
-                                "closing_balance_date",
-                                "total_debits_cents",
-                                "total_credits_cents",
-                                "account_type",
-                                "account_number_masked"
+                                "interest_charged",
+                                "account_balance",
+                                "credit_limit",
+                                "available_credit"
                             ],
                             "additionalProperties":false
                         },
-                        "rows":{
+                        "interest_information":{
+                            "anyOf":[
+                                {
+                                    "type":"object",
+                                    "properties":{
+                                        "estimated_payoff_time":{
+                                            "type":"object",
+                                            "properties":{
+                                                "years":{"type":"integer"},
+                                                "months":{"type":"integer"}
+                                            },
+                                            "required":["years","months"],
+                                            "additionalProperties":false
+                                        }
+                                    },
+                                    "required":["estimated_payoff_time"],
+                                    "additionalProperties":false
+                                },
+                                {"type":"null"}
+                            ]
+                        },
+                        "transactions":{
                             "type":"array",
                             "items":{
                                 "type":"object",
                                 "properties":{
-                                    "booked_at":{"type":"string"},
-                                    "description":{"type":"string"},
-                                    "amount_cents":{"type":"integer"},
-                                    "direction":{"type":"string","enum":["debit","credit","transfer","reversal","unknown"]},
-                                    "direction_confidence":{"type":"number"},
-                                    "running_balance_cents":{"type":"integer"},
-                                    "transaction_type_raw":{"type":"string"},
-                                    "counterparty":{"type":"string"},
-                                    "reference_id":{"type":"string"},
-                                    "meta":{"type":"object"},
-                                    "confidence":{"type":"number"}
+                                    "transaction_date":{"type":"string"},
+                                    "details":{"type":"string"},
+                                    "amount":{"type":"number"},
+                                    "type":{"type":"string","enum":["credit","debit"]}
                                 },
-                                "required":["booked_at","description","amount_cents","direction","confidence"],
+                                "required":["transaction_date","details","amount","type"],
                                 "additionalProperties":false
                             }
+                        },
+                        "transaction_subtotals":{
+                            "type":"object",
+                            "properties":{
+                                "credits_total":{"type":"number"},
+                                "debits_total":{"type":"number"}
+                            },
+                            "required":["credits_total","debits_total"],
+                            "additionalProperties":false
                         }
                     },
-                    "required":["period_start","period_end","account_summary","rows"],
+                    "required":[
+                        "statement_period",
+                        "statement_date",
+                        "account_details",
+                        "due_this_statement",
+                        "account_summary",
+                        "interest_information",
+                        "transactions",
+                        "transaction_subtotals"
+                    ],
                     "additionalProperties":false
                 }
             }
@@ -3774,7 +3960,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_statement_v2_schema_requires_direction_and_summary() {
+    fn openrouter_statement_v2_schema_requires_statement_period_and_transactions() {
         let schema = openrouter_response_format_schema("statement_v2");
         let required = schema
             .get("json_schema")
@@ -3786,14 +3972,14 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
-        assert!(root_required.contains(&"account_summary".to_string()));
-        assert!(root_required.contains(&"rows".to_string()));
+        assert!(root_required.contains(&"statement_period".to_string()));
+        assert!(root_required.contains(&"transactions".to_string()));
 
         let tx_required = schema
             .get("json_schema")
             .and_then(|v| v.get("schema"))
             .and_then(|v| v.get("properties"))
-            .and_then(|v| v.get("rows"))
+            .and_then(|v| v.get("transactions"))
             .and_then(|v| v.get("items"))
             .and_then(|v| v.get("required"))
             .and_then(|v| v.as_array())
@@ -3802,23 +3988,18 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
-        assert!(tx_required_keys.contains(&"direction".to_string()));
+        assert!(tx_required_keys.contains(&"transaction_date".to_string()));
+        assert!(tx_required_keys.contains(&"type".to_string()));
     }
 
     #[test]
-    fn map_statement_row_marks_unknown_on_direction_sign_conflict() {
+    fn map_statement_row_flags_sign_conflict_but_keeps_direction() {
         let row = StatementRowCandidate {
-            booked_at: Some("2026-03-10".to_string()),
-            description: Some("Salary".to_string()),
-            amount_cents: Some(-5000),
+            transaction_date: Some("2026-03-10".to_string()),
+            details: Some("Salary".to_string()),
+            amount: Some(-50.0),
             confidence: Some(0.9),
-            direction: Some("credit".to_string()),
-            direction_confidence: Some(0.95),
-            running_balance_cents: None,
-            transaction_type_raw: None,
-            counterparty: None,
-            reference_id: None,
-            meta: None,
+            tx_type: Some("credit".to_string()),
         };
         let mapped = map_statement_row(1, "acct-1", row);
         let direction = mapped
@@ -3826,28 +4007,22 @@ mod tests {
             .as_ref()
             .and_then(|v| v.get("direction"))
             .and_then(|v| v.as_str());
-        assert_eq!(direction, Some("unknown"));
+        assert_eq!(direction, Some("credit"));
         assert!(mapped
             .parse_error
             .as_deref()
             .unwrap_or_default()
-            .contains("direction_sign_conflict"));
+            .contains("type_sign_conflict"));
     }
 
     #[test]
-    fn map_statement_row_marks_unknown_when_direction_missing() {
+    fn map_statement_row_marks_unknown_when_type_missing() {
         let row = StatementRowCandidate {
-            booked_at: Some("2026-03-10".to_string()),
-            description: Some("Txn".to_string()),
-            amount_cents: Some(5000),
+            transaction_date: Some("2026-03-10".to_string()),
+            details: Some("Txn".to_string()),
+            amount: Some(50.0),
             confidence: Some(0.9),
-            direction: None,
-            direction_confidence: None,
-            running_balance_cents: None,
-            transaction_type_raw: None,
-            counterparty: None,
-            reference_id: None,
-            meta: None,
+            tx_type: None,
         };
         let mapped = map_statement_row(1, "acct-1", row);
         let direction = mapped
@@ -4277,16 +4452,33 @@ mod tests {
     fn validate_jobs_result_payload_v2_requires_account_summary() {
         let payload = serde_json::json!({
             "result": {
-                "period_start": "2026-03-01",
-                "period_end": "2026-03-31",
+                "statement_date": "2026-03-31",
+                "statement_period": {
+                    "start_date": "2026-03-01",
+                    "end_date": "2026-03-31"
+                },
+                "account_details": {
+                    "account_type": "Card",
+                    "account_number_ending": "1234",
+                    "customer_name": "Test User"
+                },
+                "due_this_statement": {
+                    "payment_due_date": "2026-04-10",
+                    "total_minimum_payment": 25.0
+                },
+                "interest_information": null,
                 "transactions": [
                     {
-                        "booked_at":"2026-03-10",
-                        "description":"x",
-                        "amount_cents":100,
-                        "direction":"credit"
+                        "transaction_date":"2026-03-10",
+                        "details":"x",
+                        "amount":1.0,
+                        "type":"credit"
                     }
-                ]
+                ],
+                "transaction_subtotals": {
+                    "credits_total": 1.0,
+                    "debits_total": 0.0
+                }
             }
         });
         let err = validate_jobs_result_payload(&payload, "statement_v2")
@@ -4298,30 +4490,18 @@ mod tests {
     fn resolve_period_derives_when_missing() {
         let rows = vec![
             StatementRowCandidate {
-                booked_at: Some("2026-03-01".to_string()),
-                description: Some("a".to_string()),
-                amount_cents: Some(10),
+                transaction_date: Some("2026-03-01".to_string()),
+                details: Some("a".to_string()),
+                amount: Some(0.1),
                 confidence: Some(0.8),
-                direction: None,
-                direction_confidence: None,
-                running_balance_cents: None,
-                transaction_type_raw: None,
-                counterparty: None,
-                reference_id: None,
-                meta: None,
+                tx_type: None,
             },
             StatementRowCandidate {
-                booked_at: Some("2026-03-31".to_string()),
-                description: Some("b".to_string()),
-                amount_cents: Some(20),
+                transaction_date: Some("2026-03-31".to_string()),
+                details: Some("b".to_string()),
+                amount: Some(0.2),
                 confidence: Some(0.8),
-                direction: None,
-                direction_confidence: None,
-                running_balance_cents: None,
-                transaction_type_raw: None,
-                counterparty: None,
-                reference_id: None,
-                meta: None,
+                tx_type: None,
             },
         ];
         let (start, end, derived) = resolve_period(None, None, &rows).expect("derived");

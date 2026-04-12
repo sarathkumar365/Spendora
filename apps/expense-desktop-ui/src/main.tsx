@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { Settings2 } from "lucide-react";
+import appIcon from "./assets/app-icon.png";
 import "./styles.css";
 
 type ServiceStartupState = "starting" | "healthy" | "failed";
@@ -828,6 +829,7 @@ export function App() {
       return (
         <main className="screen">
           <section className="panel gate brand-startup-gate">
+            <img className="brand-startup-icon" src={appIcon} alt="Spendora app icon" />
             <h1 className="brand-startup-title">Spendora</h1>
             <div className="loading-line" aria-label="loading" />
             {startup.state === "failed" ? (
@@ -881,7 +883,10 @@ export function App() {
     <main className="screen">
       <div className="app-shell">
         <header className="panel topbar">
-          <h1>Spendora</h1>
+          <div className="topbar-brand">
+            <img className="topbar-icon" src={appIcon} alt="" aria-hidden="true" />
+            <h1>Spendora</h1>
+          </div>
           <nav>
             <button
               className={section === "ai" ? "button active" : "button ghost"}

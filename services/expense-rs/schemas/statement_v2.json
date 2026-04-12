@@ -1,120 +1,202 @@
 {
   "type": "object",
   "required": [
-    "period_start",
-    "period_end",
+    "statement_period",
+    "statement_date",
+    "account_details",
+    "due_this_statement",
     "account_summary",
-    "transactions"
+    "interest_information",
+    "transactions",
+    "transaction_subtotals"
   ],
   "properties": {
-    "period_start": {
-      "type": "string",
-      "format": "date"
+    "statement_period": {
+      "type": "object",
+      "required": [
+        "start_date",
+        "end_date"
+      ],
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "description": "The start date of the statement period. Format: YYYY-MM-DD."
+        },
+        "end_date": {
+          "type": "string",
+          "description": "The end date of the statement period. Format: YYYY-MM-DD."
+        }
+      },
+      "description": "The period covered by this statement.",
+      "additionalProperties": false
     },
-    "period_end": {
+    "statement_date": {
       "type": "string",
-      "format": "date"
+      "description": "The date the statement was issued. Format: YYYY-MM-DD."
+    },
+    "account_details": {
+      "type": "object",
+      "required": [
+        "account_type",
+        "account_number_ending",
+        "customer_name"
+      ],
+      "properties": {
+        "account_type": {
+          "type": "string",
+          "description": "The type of account, e.g., 'Scotiabank Scene+ Visa Card'."
+        },
+        "account_number_ending": {
+          "type": "string",
+          "description": "The last four digits of the account number."
+        },
+        "customer_name": {
+          "type": "string",
+          "description": "The name of the primary account holder."
+        }
+      },
+      "description": "Details pertaining to the account.",
+      "additionalProperties": false
+    },
+    "due_this_statement": {
+      "type": "object",
+      "required": [
+        "payment_due_date",
+        "total_minimum_payment"
+      ],
+      "properties": {
+        "payment_due_date": {
+          "type": "string",
+          "description": "The date by which payment is due. Format: YYYY-MM-DD."
+        },
+        "total_minimum_payment": {
+          "type": "number",
+          "description": "The total minimum payment required, in currency units."
+        }
+      },
+      "description": "Key payment information for the current statement.",
+      "additionalProperties": false
     },
     "account_summary": {
       "type": "object",
       "required": [
-        "opening_balance_cents",
-        "opening_balance_date",
-        "closing_balance_cents",
-        "closing_balance_date",
-        "total_debits_cents",
-        "total_credits_cents",
-        "account_type",
-        "account_number_masked"
+        "interest_charged",
+        "account_balance",
+        "credit_limit",
+        "available_credit"
       ],
       "properties": {
-        "opening_balance_cents": {
-          "type": "integer"
+        "interest_charged": {
+          "type": "number",
+          "description": "Total interest charged during the statement period, in currency units."
         },
-        "opening_balance_date": {
-          "type": "string",
-          "format": "date"
+        "account_balance": {
+          "type": "number",
+          "description": "The final account balance as of the statement date, in currency units."
         },
-        "closing_balance_cents": {
-          "type": "integer"
+        "credit_limit": {
+          "type": "number",
+          "description": "The total credit limit for the account, in currency units."
         },
-        "closing_balance_date": {
-          "type": "string",
-          "format": "date"
-        },
-        "total_debits_cents": {
-          "type": "integer"
-        },
-        "total_credits_cents": {
-          "type": "integer"
-        },
-        "account_type": {
-          "type": "string"
-        },
-        "account_number_masked": {
-          "type": "string"
-        },
-        "currency_code": {
-          "type": "string"
+        "available_credit": {
+          "type": "number",
+          "description": "The amount of credit currently available, in currency units."
         }
       },
+      "description": "A summary of account activity and balances.",
       "additionalProperties": false
+    },
+    "interest_information": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "estimated_payoff_time"
+          ],
+          "properties": {
+            "estimated_payoff_time": {
+              "type": "object",
+              "required": [
+                "years",
+                "months"
+              ],
+              "properties": {
+                "years": {
+                  "type": "integer",
+                  "description": "Number of years for the estimated payoff time."
+                },
+                "months": {
+                  "type": "integer",
+                  "description": "Number of months for the estimated payoff time."
+                }
+              },
+              "description": "Estimate of the time it will take to pay off the account balance with minimum payments.",
+              "additionalProperties": false
+            }
+          },
+          "description": "Details regarding interest rates and payment estimates.",
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Details regarding interest rates and payment estimates."
     },
     "transactions": {
       "type": "array",
       "items": {
         "type": "object",
         "required": [
-          "booked_at",
-          "description",
-          "amount_cents",
-          "direction"
+          "transaction_date",
+          "details",
+          "amount",
+          "type"
         ],
         "properties": {
-          "booked_at": {
+          "transaction_date": {
             "type": "string",
-            "format": "date"
+            "description": "The date the transaction occurred. Format: YYYY-MM-DD."
           },
-          "description": {
-            "type": "string"
-          },
-          "amount_cents": {
-            "type": "integer"
-          },
-          "direction": {
+          "details": {
             "type": "string",
+            "description": "A description of the transaction."
+          },
+          "amount": {
+            "type": "number",
+            "description": "The amount of the transaction, in currency units. Positive for credits, negative for debits."
+          },
+          "type": {
             "enum": [
-              "debit",
               "credit",
-              "transfer",
-              "reversal",
-              "unknown"
-            ]
-          },
-          "direction_confidence": {
-            "type": "number"
-          },
-          "running_balance_cents": {
-            "type": "integer"
-          },
-          "transaction_type_raw": {
-            "type": "string"
-          },
-          "counterparty": {
-            "type": "string"
-          },
-          "reference_id": {
-            "type": "string"
-          },
-          "meta": {
-            "type": "object"
-          },
-          "confidence": {
-            "type": "number"
+              "debit"
+            ],
+            "type": "string",
+            "description": "Indicates if the transaction was a 'credit' (money received) or 'debit' (money spent)."
           }
         },
         "additionalProperties": false
-      }
+      },
+      "description": "A list of individual transactions posted to the account."
+    },
+    "transaction_subtotals": {
+      "type": "object",
+      "required": [
+        "credits_total",
+        "debits_total"
+      ],
+      "properties": {
+        "credits_total": {
+          "type": "number",
+          "description": "The total amount of all credit transactions, in currency units."
+        },
+        "debits_total": {
+          "type": "number",
+          "description": "The total amount of all debit transactions, in currency units."
+        }
+      },
+      "description": "Subtotals for credits and debits within the transaction list.",
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

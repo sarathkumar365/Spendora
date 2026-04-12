@@ -39,6 +39,12 @@ Troubleshooting preflight:
 ## Database
 - Default DB file path is OS app-data directory + `expense.db`.
 - On first boot, migrations from `services/expense-rs/migrations` are applied.
+- DB cleanup/status helper script:
+  - `npm run db:status` (show runtime + app DB status)
+  - `npm run db:clean` (clean runtime DB)
+  - `npm run db:clean:app` (clean app-support DB)
+  - `npm run db:clean:all` (clean both)
+  - Direct script usage: `bash scripts/db-clean.sh [status|runtime|app|all]`
 
 ## Extraction Settings and Provider Config
 
