@@ -531,6 +531,20 @@ select.input::-ms-expand {
   margin: 0 0 12px;
 }
 
+.quality-card {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, var(--surface-solid) 85%, #f5f7fb 15%);
+}
+
+.quality-card small {
+  color: var(--text-secondary);
+}
+
 .list {
   list-style: none;
   padding: 0;

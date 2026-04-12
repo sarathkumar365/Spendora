@@ -234,6 +234,7 @@ pub fn load_extraction_runtime_config_from_env(
 pub fn load_statement_blueprint_schema(version: &str) -> Result<Value, BlueprintSchemaError> {
     let raw = match version {
         "statement_v1" => include_str!("../../../schemas/statement_v1.json"),
+        "statement_v2" => include_str!("../../../schemas/statement_v2.json"),
         _ => {
             return Err(BlueprintSchemaError::VersionNotFound(version.to_string()));
         }
@@ -241,7 +242,7 @@ pub fn load_statement_blueprint_schema(version: &str) -> Result<Value, Blueprint
 
     let schema: Value =
         serde_json::from_str(raw).map_err(|e| BlueprintSchemaError::InvalidJson(e.to_string()))?;
-    validate_statement_schema_contract(&schema)?;
+    validate_statement_schema_contract(&schema, version)?;
     Ok(schema)
 }
 
@@ -253,7 +254,10 @@ fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn validate_statement_schema_contract(schema: &Value) -> Result<(), BlueprintSchemaError> {
+fn validate_statement_schema_contract(
+    schema: &Value,
+    version: &str,
+) -> Result<(), BlueprintSchemaError> {
     let root_required = schema
         .get("required")
         .and_then(|v| v.as_array())
@@ -282,7 +286,11 @@ fn validate_statement_schema_contract(schema: &Value) -> Result<(), BlueprintSch
             )
         })?;
 
-    for key in ["booked_at", "description", "amount_cents"] {
+    let mut tx_required_keys = vec!["booked_at", "description", "amount_cents"];
+    if version == "statement_v2" {
+        tx_required_keys.push("direction");
+    }
+    for key in tx_required_keys {
         let has_key = tx_required
             .iter()
             .filter_map(|v| v.as_str())
@@ -315,6 +323,50 @@ fn validate_statement_schema_contract(schema: &Value) -> Result<(), BlueprintSch
         return Err(BlueprintSchemaError::InvalidContract(
             "transactions.items.additionalProperties must be false".to_string(),
         ));
+    }
+
+    if version == "statement_v2" {
+        let has_account_summary = root_required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|item| item == "account_summary");
+        if !has_account_summary {
+            return Err(BlueprintSchemaError::InvalidContract(
+                "root required[] missing account_summary".to_string(),
+            ));
+        }
+
+        let summary_required = schema
+            .get("properties")
+            .and_then(|v| v.get("account_summary"))
+            .and_then(|v| v.get("required"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                BlueprintSchemaError::InvalidContract(
+                    "account_summary.required[] missing".to_string(),
+                )
+            })?;
+
+        for key in [
+            "opening_balance_cents",
+            "opening_balance_date",
+            "closing_balance_cents",
+            "closing_balance_date",
+            "total_debits_cents",
+            "total_credits_cents",
+            "account_type",
+            "account_number_masked",
+        ] {
+            let has_key = summary_required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|item| item == key);
+            if !has_key {
+                return Err(BlueprintSchemaError::InvalidContract(format!(
+                    "account_summary.required[] missing {key}"
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -445,5 +497,27 @@ mod tests {
         assert!(required_keys.contains(&"booked_at"));
         assert!(required_keys.contains(&"description"));
         assert!(required_keys.contains(&"amount_cents"));
+    }
+
+    #[test]
+    fn statement_v2_schema_loader_validates_required_contract() {
+        let schema = load_statement_blueprint_schema("statement_v2").expect("statement_v2 schema");
+        let root_required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("root required fields");
+        let root_required_keys: Vec<&str> =
+            root_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(root_required_keys.contains(&"account_summary"));
+
+        let tx_required = schema
+            .get("properties")
+            .and_then(|v| v.get("transactions"))
+            .and_then(|v| v.get("items"))
+            .and_then(|v| v.get("required"))
+            .and_then(|v| v.as_array())
+            .expect("tx required fields");
+        let tx_required_keys: Vec<&str> = tx_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(tx_required_keys.contains(&"direction"));
     }
 }

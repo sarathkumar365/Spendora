@@ -1,0 +1,121 @@
+{
+  "type": "object",
+  "required": [
+    "period_start",
+    "period_end",
+    "account_summary",
+    "transactions"
+  ],
+  "properties": {
+    "period_start": {
+      "type": "string",
+      "format": "date"
+    },
+    "period_end": {
+      "type": "string",
+      "format": "date"
+    },
+    "account_summary": {
+      "type": "object",
+      "required": [
+        "opening_balance_cents",
+        "opening_balance_date",
+        "closing_balance_cents",
+        "closing_balance_date",
+        "total_debits_cents",
+        "total_credits_cents",
+        "account_type",
+        "account_number_masked"
+      ],
+      "properties": {
+        "opening_balance_cents": {
+          "type": "integer"
+        },
+        "opening_balance_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "closing_balance_cents": {
+          "type": "integer"
+        },
+        "closing_balance_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "total_debits_cents": {
+          "type": "integer"
+        },
+        "total_credits_cents": {
+          "type": "integer"
+        },
+        "account_type": {
+          "type": "string"
+        },
+        "account_number_masked": {
+          "type": "string"
+        },
+        "currency_code": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "transactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "booked_at",
+          "description",
+          "amount_cents",
+          "direction"
+        ],
+        "properties": {
+          "booked_at": {
+            "type": "string",
+            "format": "date"
+          },
+          "description": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "debit",
+              "credit",
+              "transfer",
+              "reversal",
+              "unknown"
+            ]
+          },
+          "direction_confidence": {
+            "type": "number"
+          },
+          "running_balance_cents": {
+            "type": "integer"
+          },
+          "transaction_type_raw": {
+            "type": "string"
+          },
+          "counterparty": {
+            "type": "string"
+          },
+          "reference_id": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object"
+          },
+          "confidence": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

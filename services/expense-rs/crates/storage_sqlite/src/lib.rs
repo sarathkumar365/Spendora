@@ -56,6 +56,9 @@ pub struct ReviewRow {
     pub row_id: String,
     pub row_index: i64,
     pub normalized_json: serde_json::Value,
+    pub direction: String,
+    pub direction_confidence: Option<f64>,
+    pub direction_source: String,
     pub confidence: f64,
     pub parse_error: Option<String>,
     pub approved: bool,
@@ -67,6 +70,8 @@ pub struct ReviewDecision {
     pub row_id: String,
     pub approved: bool,
     pub rejection_reason: Option<String>,
+    pub direction: Option<String>,
+    pub direction_confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +88,9 @@ pub struct TransactionListItem {
     pub last_sync_at: String,
     pub import_id: Option<String>,
     pub statement_id: Option<String>,
+    pub direction: String,
+    pub direction_confidence: Option<f64>,
+    pub direction_source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,6 +190,15 @@ pub struct StatementRecord {
     pub provider_run_id: Option<String>,
     pub provider_metadata_json: serde_json::Value,
     pub schema_version: String,
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +213,15 @@ pub struct StatementListItem {
     pub provider_run_id: Option<String>,
     pub schema_version: String,
     pub linked_txn_count: i64,
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +235,28 @@ pub struct StatementCoverageMonth {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StatementSummaryInput {
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
 }
 
 impl Default for ExtractionSettings {
@@ -539,7 +587,7 @@ pub async fn get_statement_by_account_period(
     period_end: &str,
 ) -> anyhow::Result<Option<StatementRecord>> {
     let row = sqlx::query(
-        "SELECT id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3",
+        "SELECT id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3",
     )
     .bind(account_id)
     .bind(period_start)
@@ -562,6 +610,15 @@ pub async fn get_statement_by_account_period(
         provider_metadata_json: serde_json::from_str(metadata_raw.as_str())
             .unwrap_or_else(|_| serde_json::json!({})),
         schema_version: row.get("schema_version"),
+        opening_balance_cents: row.get("opening_balance_cents"),
+        opening_balance_date: row.get("opening_balance_date"),
+        closing_balance_cents: row.get("closing_balance_cents"),
+        closing_balance_date: row.get("closing_balance_date"),
+        total_debits_cents: row.get("total_debits_cents"),
+        total_credits_cents: row.get("total_credits_cents"),
+        account_type: row.get("account_type"),
+        account_number_masked: row.get("account_number_masked"),
+        currency_code: row.get("currency_code"),
     }))
 }
 
@@ -576,6 +633,7 @@ pub async fn upsert_or_get_statement(
     provider_run_id: Option<&str>,
     provider_metadata_json: &serde_json::Value,
     schema_version: &str,
+    summary: StatementSummaryInput,
 ) -> anyhow::Result<StatementRecord> {
     if let Some(existing) =
         get_statement_by_account_period(pool, account_id, period_start, period_end).await?
@@ -585,7 +643,7 @@ pub async fn upsert_or_get_statement(
 
     let statement_id = new_idempotency_key();
     sqlx::query(
-        "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)",
+        "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, CURRENT_TIMESTAMP)",
     )
     .bind(&statement_id)
     .bind(account_id)
@@ -597,6 +655,15 @@ pub async fn upsert_or_get_statement(
     .bind(provider_run_id)
     .bind(provider_metadata_json.to_string())
     .bind(schema_version)
+    .bind(summary.opening_balance_cents)
+    .bind(summary.opening_balance_date)
+    .bind(summary.closing_balance_cents)
+    .bind(summary.closing_balance_date)
+    .bind(summary.total_debits_cents)
+    .bind(summary.total_credits_cents)
+    .bind(summary.account_type)
+    .bind(summary.account_number_masked)
+    .bind(summary.currency_code)
     .execute(pool)
     .await?;
 
@@ -614,7 +681,7 @@ pub async fn list_statements_for_account(
     date_to: Option<&str>,
 ) -> anyhow::Result<Vec<StatementListItem>> {
     let mut sql = String::from(
-        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
+        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
     );
     let mut binds: Vec<String> = vec![account_id.to_string()];
 
@@ -640,7 +707,7 @@ pub async fn list_statements_for_account(
     }
 
     sql.push_str(
-        " GROUP BY s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version ORDER BY s.period_start DESC, s.period_end DESC",
+        " GROUP BY s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code ORDER BY s.period_start DESC, s.period_end DESC",
     );
 
     let mut query = sqlx::query(&sql);
@@ -662,6 +729,15 @@ pub async fn list_statements_for_account(
             provider_run_id: row.get("provider_run_id"),
             schema_version: row.get("schema_version"),
             linked_txn_count: row.get("linked_txn_count"),
+            opening_balance_cents: row.get("opening_balance_cents"),
+            opening_balance_date: row.get("opening_balance_date"),
+            closing_balance_cents: row.get("closing_balance_cents"),
+            closing_balance_date: row.get("closing_balance_date"),
+            total_debits_cents: row.get("total_debits_cents"),
+            total_credits_cents: row.get("total_credits_cents"),
+            account_type: row.get("account_type"),
+            account_number_masked: row.get("account_number_masked"),
+            currency_code: row.get("currency_code"),
         })
         .collect())
 }
@@ -697,6 +773,15 @@ pub async fn get_statement_coverage(
             period_end: Some(statement.period_end.clone()),
             linked_txn_count: 0,
             manual_added_txn_count: 0,
+            opening_balance_cents: statement.opening_balance_cents,
+            opening_balance_date: statement.opening_balance_date.clone(),
+            closing_balance_cents: statement.closing_balance_cents,
+            closing_balance_date: statement.closing_balance_date.clone(),
+            total_debits_cents: statement.total_debits_cents,
+            total_credits_cents: statement.total_credits_cents,
+            account_type: statement.account_type.clone(),
+            account_number_masked: statement.account_number_masked.clone(),
+            currency_code: statement.currency_code.clone(),
         });
         entry.statement_exists = true;
         entry.linked_txn_count += statement.linked_txn_count;
@@ -715,6 +800,33 @@ pub async fn get_statement_coverage(
             if statement.period_end > existing {
                 entry.period_end = Some(statement.period_end.clone());
             }
+        }
+        if entry.opening_balance_cents.is_none() {
+            entry.opening_balance_cents = statement.opening_balance_cents;
+        }
+        if entry.opening_balance_date.is_none() {
+            entry.opening_balance_date = statement.opening_balance_date.clone();
+        }
+        if entry.closing_balance_cents.is_none() {
+            entry.closing_balance_cents = statement.closing_balance_cents;
+        }
+        if entry.closing_balance_date.is_none() {
+            entry.closing_balance_date = statement.closing_balance_date.clone();
+        }
+        if entry.total_debits_cents.is_none() {
+            entry.total_debits_cents = statement.total_debits_cents;
+        }
+        if entry.total_credits_cents.is_none() {
+            entry.total_credits_cents = statement.total_credits_cents;
+        }
+        if entry.account_type.is_none() {
+            entry.account_type = statement.account_type.clone();
+        }
+        if entry.account_number_masked.is_none() {
+            entry.account_number_masked = statement.account_number_masked.clone();
+        }
+        if entry.currency_code.is_none() {
+            entry.currency_code = statement.currency_code.clone();
         }
     }
 
@@ -741,6 +853,15 @@ pub async fn get_statement_coverage(
             period_end: None,
             linked_txn_count: 0,
             manual_added_txn_count: 0,
+            opening_balance_cents: None,
+            opening_balance_date: None,
+            closing_balance_cents: None,
+            closing_balance_date: None,
+            total_debits_cents: None,
+            total_credits_cents: None,
+            account_type: None,
+            account_number_masked: None,
+            currency_code: None,
         });
         entry.manual_added_txn_count = cnt;
     }
@@ -757,7 +878,7 @@ pub async fn list_transactions_for_statement(
     statement_id: &str,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let rows = sqlx::query(
-        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id FROM transactions t WHERE t.statement_id = ?1 ORDER BY t.booked_at DESC, t.created_at DESC",
+        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.direction, 'unknown') AS direction, t.direction_confidence, COALESCE(t.direction_source, 'legacy') AS direction_source FROM transactions t WHERE t.statement_id = ?1 ORDER BY t.booked_at DESC, t.created_at DESC",
     )
     .bind(statement_id)
     .fetch_all(pool)
@@ -778,6 +899,9 @@ pub async fn list_transactions_for_statement(
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
             statement_id: row.get("statement_id"),
+            direction: row.get("direction"),
+            direction_confidence: row.get("direction_confidence"),
+            direction_source: row.get("direction_source"),
         })
         .collect())
 }
@@ -833,7 +957,6 @@ pub async fn insert_import_rows(
     rows: Vec<ParsedRowInput>,
 ) -> anyhow::Result<()> {
     for row in rows {
-        let has_parse_error = row.parse_error.is_some();
         sqlx::query(
             "INSERT INTO import_rows (id, import_id, row_index, normalized_json, confidence, parse_error, normalized_txn_hash, approved, rejection_reason, account_id, statement_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
@@ -844,7 +967,7 @@ pub async fn insert_import_rows(
         .bind(row.confidence)
         .bind(row.parse_error)
         .bind(row.normalized_txn_hash)
-        .bind(if has_parse_error { 0 } else { 1 })
+        .bind(1_i64)
         .bind(Option::<String>::None)
         .bind(row.account_id)
         .bind(row.statement_id)
@@ -906,15 +1029,32 @@ pub async fn list_import_rows_for_review(
 
     Ok(rows
         .into_iter()
-        .map(|row| ReviewRow {
-            row_id: row.get("id"),
-            row_index: row.get("row_index"),
-            normalized_json: serde_json::from_str(row.get::<String, _>("normalized_json").as_str())
-                .unwrap_or_else(|_| serde_json::json!({})),
-            confidence: row.get("confidence"),
-            parse_error: row.get("parse_error"),
-            approved: row.get::<i64, _>("approved") == 1,
-            rejection_reason: row.get("rejection_reason"),
+        .map(|row| {
+            let normalized_json: serde_json::Value =
+                serde_json::from_str(row.get::<String, _>("normalized_json").as_str())
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            ReviewRow {
+                row_id: row.get("id"),
+                row_index: row.get("row_index"),
+                direction: normalized_json
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                direction_confidence: normalized_json
+                    .get("direction_confidence")
+                    .and_then(|v| v.as_f64()),
+                direction_source: normalized_json
+                    .get("direction_source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("legacy")
+                    .to_string(),
+                normalized_json,
+                confidence: row.get("confidence"),
+                parse_error: row.get("parse_error"),
+                approved: row.get::<i64, _>("approved") == 1,
+                rejection_reason: row.get("rejection_reason"),
+            }
         })
         .collect())
 }
@@ -924,14 +1064,59 @@ pub async fn apply_review_decisions(
     import_id: &str,
     decisions: &[ReviewDecision],
 ) -> anyhow::Result<()> {
+    fn is_supported_direction(value: &str) -> bool {
+        matches!(
+            value,
+            "debit" | "credit" | "transfer" | "reversal" | "unknown"
+        )
+    }
+
     for decision in decisions {
-        sqlx::query(
-            "UPDATE import_rows SET approved = ?3, rejection_reason = ?4 WHERE import_id = ?1 AND id = ?2",
+        let row = sqlx::query(
+            "SELECT normalized_json FROM import_rows WHERE import_id = ?1 AND id = ?2",
         )
         .bind(import_id)
         .bind(&decision.row_id)
-        .bind(if decision.approved { 1 } else { 0 })
-        .bind(&decision.rejection_reason)
+        .fetch_optional(pool)
+        .await?;
+
+        let normalized_json = if let Some(existing) = row {
+            let raw: String = existing.get("normalized_json");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(raw.as_str()).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(direction) = decision.direction.as_ref() {
+                if !is_supported_direction(direction.as_str()) {
+                    return Err(anyhow!("invalid direction value: {}", direction));
+                }
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("direction".to_string(), serde_json::json!(direction));
+                    obj.insert(
+                        "direction_source".to_string(),
+                        serde_json::json!("manual"),
+                    );
+                    if let Some(confidence) = decision.direction_confidence {
+                        obj.insert(
+                            "direction_confidence".to_string(),
+                            serde_json::json!(confidence),
+                        );
+                    } else {
+                        obj.remove("direction_confidence");
+                    }
+                }
+            }
+            payload.to_string()
+        } else {
+            "{}".to_string()
+        };
+
+        sqlx::query(
+            "UPDATE import_rows SET approved = ?3, rejection_reason = ?4, normalized_json = ?5 WHERE import_id = ?1 AND id = ?2",
+        )
+        .bind(import_id)
+        .bind(&decision.row_id)
+        .bind(1_i64)
+        .bind(Option::<String>::None)
+        .bind(normalized_json)
         .execute(pool)
         .await?;
     }
@@ -946,11 +1131,31 @@ pub async fn commit_import_rows(
     let mut tx = pool.begin().await?;
 
     let rows = sqlx::query(
-        "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id, statement_id FROM import_rows WHERE import_id = ?1 AND parse_error IS NULL AND approved = 1",
+        "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id, statement_id FROM import_rows WHERE import_id = ?1",
     )
     .bind(import_id)
     .fetch_all(&mut *tx)
     .await?;
+
+    let unresolved_unknown_count = rows
+        .iter()
+        .filter(|row| {
+            let normalized_json: String = row.get("normalized_json");
+            let payload: serde_json::Value =
+                serde_json::from_str(&normalized_json).unwrap_or_else(|_| serde_json::json!({}));
+            payload
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                == "unknown"
+        })
+        .count();
+    if unresolved_unknown_count > 0 {
+        return Err(anyhow!(
+            "IMPORT_REVIEW_REQUIRED_UNKNOWN_DIRECTION: {} unresolved direction rows",
+            unresolved_unknown_count
+        ));
+    }
 
     let mut inserted_count = 0_i64;
     let mut duplicate_count = 0_i64;
@@ -965,18 +1170,31 @@ pub async fn commit_import_rows(
         let description = payload
             .get("description")
             .and_then(|v| v.as_str())
-            .unwrap_or("Imported transaction");
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("Unknown transaction");
         let amount_cents = payload
             .get("amount_cents")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("normalized row missing amount_cents"))?;
+            .unwrap_or(0);
         let booked_at = payload
             .get("booked_at")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("normalized row missing booked_at"))?;
+            .filter(|v| is_valid_iso_date(v))
+            .unwrap_or("1970-01-01");
+        let direction = payload
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let direction_confidence = payload
+            .get("direction_confidence")
+            .and_then(|v| v.as_f64());
+        let direction_source = payload
+            .get("direction_source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("legacy");
 
         let result = sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id, direction, direction_confidence, direction_source, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
         )
         .bind(new_idempotency_key())
         .bind(&account_id)
@@ -989,6 +1207,9 @@ pub async fn commit_import_rows(
         .bind(row.get::<f64, _>("confidence"))
         .bind("Imported from statement")
         .bind(row.get::<Option<String>, _>("statement_id"))
+        .bind(direction)
+        .bind(direction_confidence)
+        .bind(direction_source)
         .execute(&mut *tx)
         .await?;
 
@@ -1015,12 +1236,16 @@ pub async fn commit_import_rows(
     })
 }
 
+fn is_valid_iso_date(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
 pub async fn query_transactions(
     pool: &SqlitePool,
     query: TransactionQuery,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let mut base = String::from(
-        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id FROM transactions t WHERE 1=1",
+        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.direction, 'unknown') AS direction, t.direction_confidence, COALESCE(t.direction_source, 'legacy') AS direction_source FROM transactions t WHERE 1=1",
     );
 
     let mut binds: Vec<String> = Vec::new();
@@ -1072,6 +1297,9 @@ pub async fn query_transactions(
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
             statement_id: row.get("statement_id"),
+            direction: row.get("direction"),
+            direction_confidence: row.get("direction_confidence"),
+            direction_source: row.get("direction_source"),
         })
         .collect())
 }
@@ -1205,6 +1433,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_import_rows_statement_link",
         include_str!("../../../migrations/0005_import_rows_statement_link.sql"),
     ),
+    (
+        "0006_direction_and_statement_summary",
+        include_str!("../../../migrations/0006_direction_and_statement_summary.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -1299,7 +1531,8 @@ mod tests {
         let normalized = serde_json::json!({
             "booked_at": "2026-03-04",
             "amount_cents": 1234,
-            "description": "coffee"
+            "description": "coffee",
+            "direction": "credit"
         });
 
         insert_import_rows(
@@ -1373,7 +1606,8 @@ mod tests {
                     normalized_json: serde_json::json!({
                         "booked_at": "2026-03-05",
                         "amount_cents": 3300,
-                        "description": "salary"
+                        "description": "salary",
+                        "direction": "credit"
                     }),
                     confidence: 0.99,
                     parse_error: None,
@@ -1386,7 +1620,8 @@ mod tests {
                     normalized_json: serde_json::json!({
                         "booked_at": "2026-03-05",
                         "amount_cents": -1200,
-                        "description": "unknown"
+                        "description": "unknown",
+                        "direction": "debit"
                     }),
                     confidence: 0.4,
                     parse_error: Some("failed parse".to_string()),
@@ -1413,6 +1648,8 @@ mod tests {
                 row_id: second_row.row_id.clone(),
                 approved: false,
                 rejection_reason: Some("invalid row".to_string()),
+                direction: None,
+                direction_confidence: None,
             }],
         )
         .await
@@ -1421,7 +1658,7 @@ mod tests {
         let result = commit_import_rows(&pool, &import_id)
             .await
             .expect("commit import rows");
-        assert_eq!(result.inserted_count, 1);
+        assert_eq!(result.inserted_count, 2);
         assert_eq!(result.duplicate_count, 0);
 
         let txs = query_transactions(
@@ -1749,6 +1986,7 @@ mod tests {
             Some("run-1"),
             &serde_json::json!({"job_id":"job-1","run_id":"run-1"}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("first upsert");
@@ -1763,6 +2001,7 @@ mod tests {
             Some("run-2"),
             &serde_json::json!({"job_id":"job-2","run_id":"run-2"}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("second upsert");
@@ -1809,6 +2048,7 @@ mod tests {
             Some("run-link"),
             &serde_json::json!({"job_id":"job-link","run_id":"run-link"}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("upsert statement");
@@ -1821,7 +2061,8 @@ mod tests {
                 normalized_json: serde_json::json!({
                     "booked_at": "2026-04-10",
                     "amount_cents": 4200,
-                    "description": "linked row"
+                    "description": "linked row",
+                    "direction": "credit"
                 }),
                 confidence: 0.9,
                 parse_error: None,
@@ -1854,6 +2095,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_import_rows_blocks_unknown_direction() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "sample.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: "".to_string(),
+                source_hash: "hash-direction".to_string(),
+                extraction_mode: None,
+            },
+        )
+        .await
+        .expect("create import");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        insert_import_rows(
+            &pool,
+            &import_id,
+            vec![
+                ParsedRowInput {
+                    row_index: 1,
+                    normalized_json: serde_json::json!({
+                        "booked_at": "2026-04-10",
+                        "amount_cents": -4200,
+                        "description": "debit row",
+                        "direction": "debit",
+                        "direction_confidence": 0.91,
+                        "direction_source": "model"
+                    }),
+                    confidence: 0.9,
+                    parse_error: None,
+                    normalized_txn_hash: "dir-hash-1".to_string(),
+                    account_id: Some(account_id.clone()),
+                    statement_id: None,
+                },
+                ParsedRowInput {
+                    row_index: 2,
+                    normalized_json: serde_json::json!({
+                        "booked_at": "2026-04-11",
+                        "amount_cents": 2500,
+                        "description": "legacy row"
+                    }),
+                    confidence: 0.9,
+                    parse_error: None,
+                    normalized_txn_hash: "dir-hash-2".to_string(),
+                    account_id: Some(account_id.clone()),
+                    statement_id: None,
+                },
+            ],
+        )
+        .await
+        .expect("insert import rows");
+
+        let err = commit_import_rows(&pool, &import_id)
+            .await
+            .expect_err("unknown direction should block commit");
+        assert!(err
+            .to_string()
+            .contains("IMPORT_REVIEW_REQUIRED_UNKNOWN_DIRECTION"));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn commit_import_rows_applies_defaults_for_missing_structural_fields() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "sample.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: "".to_string(),
+                source_hash: "hash-defaults".to_string(),
+                extraction_mode: None,
+            },
+        )
+        .await
+        .expect("create import");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        insert_import_rows(
+            &pool,
+            &import_id,
+            vec![ParsedRowInput {
+                row_index: 1,
+                normalized_json: serde_json::json!({
+                    "direction": "debit",
+                    "direction_source": "manual"
+                }),
+                confidence: 0.3,
+                parse_error: Some("missing core fields".to_string()),
+                normalized_txn_hash: "dir-hash-default".to_string(),
+                account_id: Some(account_id.clone()),
+                statement_id: None,
+            }],
+        )
+        .await
+        .expect("insert import row");
+
+        commit_import_rows(&pool, &import_id)
+            .await
+            .expect("commit");
+
+        let row = sqlx::query(
+            "SELECT booked_at, amount_cents, description, direction, direction_source FROM transactions WHERE account_id = ?1 AND external_txn_id = 'dir-hash-default'",
+        )
+        .bind(&account_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load committed defaults row");
+        let booked_at: String = row.get("booked_at");
+        let amount_cents: i64 = row.get("amount_cents");
+        let description: String = row.get("description");
+        let direction: String = row.get("direction");
+        let direction_source: String = row.get("direction_source");
+        assert_eq!(booked_at, "1970-01-01");
+        assert_eq!(amount_cents, 0);
+        assert_eq!(description, "Unknown transaction");
+        assert_eq!(direction, "debit");
+        assert_eq!(direction_source, "manual");
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn apply_review_decisions_can_override_direction_metadata() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let import_id = create_import(
+            &pool,
+            CreateImportInput {
+                file_name: "sample.pdf".to_string(),
+                parser_type: "pdf".to_string(),
+                content_base64: "".to_string(),
+                source_hash: "hash-review-direction".to_string(),
+                extraction_mode: None,
+            },
+        )
+        .await
+        .expect("create import");
+
+        insert_import_rows(
+            &pool,
+            &import_id,
+            vec![ParsedRowInput {
+                row_index: 1,
+                normalized_json: serde_json::json!({
+                    "booked_at": "2026-04-10",
+                    "amount_cents": 1000,
+                    "description": "row",
+                    "direction": "unknown"
+                }),
+                confidence: 0.9,
+                parse_error: None,
+                normalized_txn_hash: "review-dir-hash".to_string(),
+                account_id: None,
+                statement_id: None,
+            }],
+        )
+        .await
+        .expect("insert import row");
+
+        let rows = list_import_rows_for_review(&pool, &import_id)
+            .await
+            .expect("review rows");
+        let row_id = rows.first().expect("row").row_id.clone();
+        apply_review_decisions(
+            &pool,
+            &import_id,
+            &[ReviewDecision {
+                row_id,
+                approved: true,
+                rejection_reason: None,
+                direction: Some("credit".to_string()),
+                direction_confidence: Some(0.88),
+            }],
+        )
+        .await
+        .expect("apply decision");
+
+        let updated = list_import_rows_for_review(&pool, &import_id)
+            .await
+            .expect("updated rows");
+        assert_eq!(updated[0].direction, "credit");
+        assert_eq!(updated[0].direction_source, "manual");
+        assert_eq!(updated[0].direction_confidence, Some(0.88));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn upsert_statement_persists_summary_columns() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+        let account_id = ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
+
+        let statement = upsert_or_get_statement(
+            &pool,
+            &account_id,
+            "2026-11-01",
+            "2026-11-30",
+            Some("2026-11"),
+            Some("llamaextract_jobs"),
+            Some("job-summary"),
+            Some("run-summary"),
+            &serde_json::json!({}),
+            "statement_v2",
+            StatementSummaryInput {
+                opening_balance_cents: Some(100_000),
+                opening_balance_date: Some("2026-11-01".to_string()),
+                closing_balance_cents: Some(95_000),
+                closing_balance_date: Some("2026-11-30".to_string()),
+                total_debits_cents: Some(15_000),
+                total_credits_cents: Some(10_000),
+                account_type: Some("chequing".to_string()),
+                account_number_masked: Some("****1234".to_string()),
+                currency_code: Some("CAD".to_string()),
+            },
+        )
+        .await
+        .expect("upsert statement");
+
+        assert_eq!(statement.opening_balance_cents, Some(100_000));
+        assert_eq!(statement.closing_balance_cents, Some(95_000));
+        assert_eq!(statement.account_number_masked.as_deref(), Some("****1234"));
+        assert_eq!(statement.currency_code.as_deref(), Some("CAD"));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
     async fn statement_coverage_marks_statement_and_manual_months() {
         let db_path = temp_db_path();
         let pool = connect(&db_path).await.expect("connect should succeed");
@@ -1875,6 +2375,7 @@ mod tests {
             Some("run-cov"),
             &serde_json::json!({}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("statement upsert");
@@ -1963,6 +2464,7 @@ mod tests {
             Some("run-list"),
             &serde_json::json!({}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("statement upsert");

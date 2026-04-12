@@ -1,5 +1,6 @@
 use expense_core::{compute_row_hash, normalize_description, parse_amount_cents};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedRow {
@@ -10,6 +11,7 @@ pub struct ParsedRow {
     pub confidence: f64,
     pub parse_error: Option<String>,
     pub normalized_txn_hash: String,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ fn parse_text_like_statement(bytes: &[u8], account_id: &str, parser_label: &str)
                     confidence: 0.0,
                     parse_error: Some(err.to_string()),
                     normalized_txn_hash: String::new(),
+                    metadata: None,
                 });
                 continue;
             }
@@ -106,6 +109,7 @@ fn parse_text_like_statement(bytes: &[u8], account_id: &str, parser_label: &str)
             confidence,
             parse_error,
             normalized_txn_hash,
+            metadata: None,
         });
     }
 

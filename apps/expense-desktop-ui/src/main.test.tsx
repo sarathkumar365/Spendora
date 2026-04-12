@@ -340,15 +340,16 @@ describe("Import page revamp", () => {
           {
             row_id: "row-2",
             row_index: 1,
+            direction: "credit",
+            direction_source: "model",
+            direction_confidence: 0.93,
             normalized_json: {
               booked_at: "2026-04-10",
               description: "Store",
               amount_cents: 1200
             },
             confidence: 0.95,
-            parse_error: null,
-            approved: true,
-            rejection_reason: null
+            parse_error: null
           }
         ]);
       }

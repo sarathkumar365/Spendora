@@ -39,6 +39,15 @@ pub struct CoverageMonthView {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +71,15 @@ pub struct CoverageSelectedView {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub opening_balance_cents: Option<i64>,
+    pub opening_balance_date: Option<String>,
+    pub closing_balance_cents: Option<i64>,
+    pub closing_balance_date: Option<String>,
+    pub total_debits_cents: Option<i64>,
+    pub total_credits_cents: Option<i64>,
+    pub account_type: Option<String>,
+    pub account_number_masked: Option<String>,
+    pub currency_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +166,15 @@ pub async fn get_statement_coverage_handler(
                 period_end: item.period_end.clone(),
                 linked_txn_count: item.linked_txn_count,
                 manual_added_txn_count: item.manual_added_txn_count,
+                opening_balance_cents: item.opening_balance_cents,
+                opening_balance_date: item.opening_balance_date.clone(),
+                closing_balance_cents: item.closing_balance_cents,
+                closing_balance_date: item.closing_balance_date.clone(),
+                total_debits_cents: item.total_debits_cents,
+                total_credits_cents: item.total_credits_cents,
+                account_type: item.account_type.clone(),
+                account_number_masked: item.account_number_masked.clone(),
+                currency_code: item.currency_code.clone(),
             });
     }
 
@@ -173,9 +200,18 @@ pub async fn get_statement_coverage_handler(
                     statement_month: None,
                     period_start: None,
                     period_end: None,
-                    linked_txn_count: 0,
-                    manual_added_txn_count: 0,
-                });
+                linked_txn_count: 0,
+                manual_added_txn_count: 0,
+                opening_balance_cents: None,
+                opening_balance_date: None,
+                closing_balance_cents: None,
+                closing_balance_date: None,
+                total_debits_cents: None,
+                total_credits_cents: None,
+                account_type: None,
+                account_number_masked: None,
+                currency_code: None,
+            });
 
             Some(CoverageSelectedView {
                 year,
@@ -198,6 +234,15 @@ pub async fn get_statement_coverage_handler(
                 period_end: selected_item.period_end,
                 linked_txn_count: selected_item.linked_txn_count,
                 manual_added_txn_count: selected_item.manual_added_txn_count,
+                opening_balance_cents: selected_item.opening_balance_cents,
+                opening_balance_date: selected_item.opening_balance_date,
+                closing_balance_cents: selected_item.closing_balance_cents,
+                closing_balance_date: selected_item.closing_balance_date,
+                total_debits_cents: selected_item.total_debits_cents,
+                total_credits_cents: selected_item.total_credits_cents,
+                account_type: selected_item.account_type,
+                account_number_masked: selected_item.account_number_masked,
+                currency_code: selected_item.currency_code,
             })
         }
         _ => None,
@@ -236,6 +281,7 @@ mod tests {
     use std::sync::Arc;
     use storage_sqlite::{
         connect, ensure_default_manual_account, run_migrations, upsert_or_get_statement,
+        StatementSummaryInput,
     };
 
     fn temp_db_path() -> std::path::PathBuf {
@@ -295,6 +341,7 @@ mod tests {
             Some("run-api"),
             &serde_json::json!({}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("statement upsert");
@@ -379,6 +426,7 @@ mod tests {
             Some("run-flow"),
             &serde_json::json!({}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("statement upsert");

@@ -92,6 +92,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/transactions",
             get(transactions::get_transactions_handler),
         )
+        .route(
+            "/api/v1/transactions/safe-summary",
+            get(transactions::get_transactions_safe_summary_handler),
+        )
         .route("/api/v1/accounts", get(accounts::get_accounts_handler))
         .route("/api/v1/statements", get(statements::list_statements_handler))
         .route(

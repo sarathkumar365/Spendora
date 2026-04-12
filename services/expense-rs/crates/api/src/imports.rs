@@ -9,7 +9,7 @@ use std::sync::Arc;
 use storage_sqlite::{
     apply_review_decisions, commit_import_rows, create_import, create_reused_import,
     get_import_status, get_statement_coverage, list_import_rows_for_review, update_import_status,
-    CreateImportInput, ReviewDecision,
+    CreateImportInput, ReviewDecision, StatementSummaryInput,
 };
 
 use crate::state::AppState;
@@ -194,6 +194,19 @@ pub async fn get_import_status_handler(
     let status = get_import_status(&state.db, &import_id)
         .await
         .map_err(not_found_or_internal)?;
+    let mut diagnostics = status.diagnostics.clone();
+    if let Some(obj) = diagnostics.as_object_mut() {
+        if !obj.contains_key("quality_metrics") {
+            if let Some(metrics) = status.summary.get("quality_metrics").cloned() {
+                obj.insert("quality_metrics".to_string(), metrics);
+            }
+        }
+        if !obj.contains_key("reconciliation") {
+            if let Some(reconciliation) = status.summary.get("reconciliation").cloned() {
+                obj.insert("reconciliation".to_string(), reconciliation);
+            }
+        }
+    }
 
     Ok(Json(ImportStatusEnvelope {
         import_id: status.import_id,
@@ -201,7 +214,7 @@ pub async fn get_import_status_handler(
         extraction_mode: status.extraction_mode,
         effective_provider: status.effective_provider,
         provider_attempts: status.provider_attempts,
-        diagnostics: status.diagnostics,
+        diagnostics,
         summary: status.summary,
         errors: status.errors,
         warnings: status.warnings,
@@ -224,6 +237,13 @@ pub async fn update_import_review_handler(
     Path(import_id): Path<String>,
     Json(payload): Json<ReviewUpdateRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    fn ratio(numerator: i64, denominator: i64) -> f64 {
+        if denominator <= 0 {
+            return 0.0;
+        }
+        numerator as f64 / denominator as f64
+    }
+
     let existing_status = get_import_status(&state.db, &import_id)
         .await
         .map_err(not_found_or_internal)?;
@@ -235,22 +255,111 @@ pub async fn update_import_review_handler(
     let rows = list_import_rows_for_review(&state.db, &import_id)
         .await
         .map_err(not_found_or_internal)?;
-    let review_required_count = rows
+    let unknown_count = rows
         .iter()
-        .filter(|row| row.approved && (row.parse_error.is_some() || row.confidence < 0.75))
+        .filter(|row| row.direction == "unknown")
         .count() as i64;
+    let review_required_count = unknown_count;
+    let rows_total = rows.len() as i64;
+    let manual_override_count = rows
+        .iter()
+        .filter(|row| row.direction_source == "manual")
+        .count() as i64;
+    let direction_review_row_count = existing_status
+        .summary
+        .get("quality_metrics")
+        .and_then(|v| v.get("direction_review_row_count"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            existing_status
+                .diagnostics
+                .get("quality_metrics")
+                .and_then(|v| v.get("direction_review_row_count"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(rows_total.max(1));
+    let conflict_count = existing_status
+        .summary
+        .get("quality_metrics")
+        .and_then(|v| v.get("conflict_count"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            existing_status
+                .diagnostics
+                .get("quality_metrics")
+                .and_then(|v| v.get("conflict_count"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    let reconciliation_fail_count = existing_status
+        .summary
+        .get("reconciliation")
+        .and_then(|v| v.get("fail_count"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            existing_status
+                .diagnostics
+                .get("reconciliation")
+                .and_then(|v| v.get("fail_count"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    let reconciliation_total_checks = existing_status
+        .summary
+        .get("reconciliation")
+        .and_then(|v| v.get("total_checks"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            existing_status
+                .diagnostics
+                .get("reconciliation")
+                .and_then(|v| v.get("total_checks"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
 
     let status = if review_required_count > 0 {
         ImportStatus::ReviewRequired
     } else {
         ImportStatus::ReadyToCommit
     };
+    let quality_metrics = serde_json::json!({
+        "rows_total": rows_total,
+        "direction_review_row_count": direction_review_row_count,
+        "unknown_count": unknown_count,
+        "unknown_rate": ratio(unknown_count, rows_total),
+        "conflict_count": conflict_count,
+        "conflict_rate": ratio(conflict_count, rows_total),
+        "manual_override_count": manual_override_count,
+        "manual_override_rate": ratio(manual_override_count, direction_review_row_count),
+        "reconciliation_fail_count": reconciliation_fail_count,
+        "reconciliation_fail_rate": ratio(reconciliation_fail_count, reconciliation_total_checks),
+    });
+    let mut summary = existing_status.summary.clone();
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert("rows".to_string(), serde_json::json!(rows_total));
+        obj.insert(
+            "unresolved_direction_count".to_string(),
+            serde_json::json!(review_required_count),
+        );
+        obj.insert("quality_metrics".to_string(), quality_metrics);
+        if !obj.contains_key("reconciliation") {
+            obj.insert(
+                "reconciliation".to_string(),
+                existing_status
+                    .diagnostics
+                    .get("reconciliation")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            );
+        }
+    }
 
     update_import_status(
         &state.db,
         &import_id,
         status,
-        serde_json::json!({ "rows": rows.len() }),
+        summary,
         existing_status.errors,
         existing_status.warnings,
         review_required_count,
@@ -267,7 +376,14 @@ pub async fn commit_import_handler(
 ) -> Result<Json<storage_sqlite::CommitResult>, (StatusCode, String)> {
     let result = commit_import_rows(&state.db, &import_id)
         .await
-        .map_err(not_found_or_internal)?;
+        .map_err(|err| {
+            let text = err.to_string();
+            if text.contains("IMPORT_REVIEW_REQUIRED_UNKNOWN_DIRECTION") {
+                (StatusCode::CONFLICT, text)
+            } else {
+                not_found_or_internal(err)
+            }
+        })?;
     Ok(Json(result))
 }
 
@@ -376,7 +492,8 @@ mod tests {
                     normalized_json: serde_json::json!({
                         "booked_at": "2026-03-01",
                         "amount_cents": 1240,
-                        "description": "Coffee"
+                        "description": "Coffee",
+                        "direction": "credit"
                     }),
                     confidence: 0.92,
                     parse_error: None,
@@ -389,7 +506,8 @@ mod tests {
                     normalized_json: serde_json::json!({
                         "booked_at": "2026-03-01",
                         "amount_cents": 510,
-                        "description": "Broken Date"
+                        "description": "Broken Date",
+                        "direction": "unknown"
                     }),
                     confidence: 0.4,
                     parse_error: Some("invalid date format".to_string()),
@@ -424,12 +542,14 @@ mod tests {
             .iter()
             .map(|row| storage_sqlite::ReviewDecision {
                 row_id: row.row_id.clone(),
-                approved: row.row_index == 1,
-                rejection_reason: if row.row_index == 2 {
-                    Some("bad date".to_string())
+                approved: true,
+                rejection_reason: None,
+                direction: if row.row_index == 2 {
+                    Some("credit".to_string())
                 } else {
                     None
                 },
+                direction_confidence: None,
             })
             .collect::<Vec<_>>();
 
@@ -518,6 +638,7 @@ mod tests {
             Some("run-1"),
             &serde_json::json!({}),
             "statement_v1",
+            StatementSummaryInput::default(),
         )
         .await
         .expect("upsert statement");

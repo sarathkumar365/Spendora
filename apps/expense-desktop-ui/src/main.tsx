@@ -31,7 +31,18 @@ type StatementItem = {
   period_start: string;
   period_end: string;
   linked_txn_count: number;
+  opening_balance_cents?: number | null;
+  opening_balance_date?: string | null;
+  closing_balance_cents?: number | null;
+  closing_balance_date?: string | null;
+  total_debits_cents?: number | null;
+  total_credits_cents?: number | null;
+  account_type?: string | null;
+  account_number_masked?: string | null;
+  currency_code?: string | null;
 };
+
+type DirectionValue = "debit" | "credit" | "transfer" | "reversal" | "unknown";
 
 type TransactionItem = {
   id: string;
@@ -39,6 +50,9 @@ type TransactionItem = {
   booked_at: string;
   amount_cents: number;
   source: string;
+  direction?: DirectionValue;
+  direction_source?: string;
+  direction_confidence?: number | null;
 };
 
 type CoverageSelected = {
@@ -99,6 +113,10 @@ type ImportStatusEnvelope = {
 type ReviewRow = {
   row_id: string;
   row_index: number;
+  direction: DirectionValue;
+  initial_direction: DirectionValue;
+  direction_source: string;
+  direction_confidence?: number | null;
   normalized_json: {
     booked_at?: string;
     description?: string;
@@ -107,8 +125,6 @@ type ReviewRow = {
   };
   confidence: number;
   parse_error?: string | null;
-  approved: boolean;
-  rejection_reason?: string | null;
 };
 
 type CommitResult = {
@@ -258,6 +274,37 @@ function toStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
+const DIRECTION_OPTIONS: DirectionValue[] = [
+  "debit",
+  "credit",
+  "transfer",
+  "reversal",
+  "unknown"
+];
+
+function normalizeDirection(value: unknown): DirectionValue {
+  if (typeof value !== "string") {
+    return "unknown";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "debit" ||
+    normalized === "credit" ||
+    normalized === "transfer" ||
+    normalized === "reversal"
+  ) {
+    return normalized;
+  }
+  return "unknown";
+}
+
+function ratio(numerator: number, denominator: number) {
+  if (denominator <= 0) {
+    return 0;
+  }
+  return numerator / denominator;
+}
+
 export function App() {
   const isProductionBuild = import.meta.env.PROD;
   const [section, setSection] = React.useState<AppSection>("ai");
@@ -299,6 +346,76 @@ export function App() {
 
   const coverageExists = coverage?.statement_exists ?? false;
   const selectedMonthToken = importYear !== null && importMonth !== null ? `${importYear}-${String(importMonth).padStart(2, "0")}` : null;
+  const unresolvedDirectionCount = reviewRows.filter((row) => row.direction === "unknown").length;
+  const activeQualityMetrics =
+    (activeImportStatus?.summary?.quality_metrics as Record<string, unknown> | undefined) ??
+    (activeImportStatus?.diagnostics?.quality_metrics as Record<string, unknown> | undefined) ??
+    null;
+  const qualityUnknownCount = Number(activeQualityMetrics?.unknown_count ?? 0);
+  const qualityUnknownRate = Number(activeQualityMetrics?.unknown_rate ?? 0);
+  const qualityConflictCount = Number(activeQualityMetrics?.conflict_count ?? 0);
+  const qualityConflictRate = Number(activeQualityMetrics?.conflict_rate ?? 0);
+  const qualityManualOverrideCount = Number(activeQualityMetrics?.manual_override_count ?? 0);
+  const qualityManualOverrideRate = Number(activeQualityMetrics?.manual_override_rate ?? 0);
+  const qualityReconciliationFailCount = Number(activeQualityMetrics?.reconciliation_fail_count ?? 0);
+  const qualityReconciliationFailRate = Number(activeQualityMetrics?.reconciliation_fail_rate ?? 0);
+  const selectedStatement = statements.find((item) => item.id === selectedStatementId) ?? null;
+  const dataUnknownCount = statementTransactions.filter((item) => (item.direction || "unknown") === "unknown").length;
+  const dataConflictCount = statementTransactions.filter((item) => {
+    const direction = item.direction || "unknown";
+    if (direction === "debit") {
+      return item.amount_cents >= 0;
+    }
+    if (direction === "credit") {
+      return item.amount_cents <= 0;
+    }
+    return false;
+  }).length;
+  const dataManualOverrideCount = statementTransactions.filter((item) => item.direction_source === "manual").length;
+  const dataRowsTotal = statementTransactions.length;
+  const dataUnknownRate = ratio(dataUnknownCount, dataRowsTotal);
+  const dataConflictRate = ratio(dataConflictCount, dataRowsTotal);
+  const dataManualOverrideRate = ratio(
+    dataManualOverrideCount,
+    Math.max(dataUnknownCount + dataConflictCount, 1)
+  );
+  const reconciliation = React.useMemo(() => {
+    if (!selectedStatement) {
+      return { status: "skipped", failCount: 0, totalChecks: 0 };
+    }
+    const opening = selectedStatement.opening_balance_cents;
+    const closing = selectedStatement.closing_balance_cents;
+    const expectedDebits = selectedStatement.total_debits_cents;
+    const expectedCredits = selectedStatement.total_credits_cents;
+    if (
+      opening === undefined || opening === null ||
+      closing === undefined || closing === null ||
+      expectedDebits === undefined || expectedDebits === null ||
+      expectedCredits === undefined || expectedCredits === null
+    ) {
+      return { status: "skipped", failCount: 0, totalChecks: 0 };
+    }
+    const netMovement = statementTransactions.reduce((sum, item) => sum + item.amount_cents, 0);
+    const actualClosing = opening + netMovement;
+    const actualDebits = statementTransactions
+      .filter((item) => (item.direction || "unknown") === "debit")
+      .reduce((sum, item) => sum + Math.abs(item.amount_cents), 0);
+    const actualCredits = statementTransactions
+      .filter((item) => (item.direction || "unknown") === "credit")
+      .reduce((sum, item) => sum + Math.abs(item.amount_cents), 0);
+    const tolerance = 1;
+    const checks = [
+      Math.abs(actualClosing - closing) <= tolerance,
+      Math.abs(actualDebits - expectedDebits) <= tolerance,
+      Math.abs(actualCredits - expectedCredits) <= tolerance
+    ];
+    const failCount = checks.filter((pass) => !pass).length;
+    return {
+      status: failCount === 0 ? "pass" : "fail",
+      failCount,
+      totalChecks: checks.length
+    };
+  }, [selectedStatement, statementTransactions]);
 
   React.useEffect(() => {
     let mounted = true;
@@ -494,8 +611,38 @@ export function App() {
   }, [section, selectedStatementId, startup.state]);
 
   const loadReviewRows = React.useCallback(async (importId: string) => {
-    const rows = await apiFetchJson<ReviewRow[]>(`/api/v1/imports/${encodeURIComponent(importId)}/review`);
-    setReviewRows(rows);
+    type ApiReviewRow = {
+      row_id: string;
+      row_index: number;
+      normalized_json: {
+        booked_at?: string;
+        description?: string;
+        amount_cents?: number;
+        [key: string]: unknown;
+      };
+      confidence: number;
+      parse_error?: string | null;
+      direction?: string;
+      direction_source?: string;
+      direction_confidence?: number | null;
+    };
+    const rows = await apiFetchJson<ApiReviewRow[]>(`/api/v1/imports/${encodeURIComponent(importId)}/review`);
+    setReviewRows(
+      rows.map((row) => {
+        const direction = normalizeDirection(row.direction);
+        return {
+          row_id: row.row_id,
+          row_index: row.row_index,
+          normalized_json: row.normalized_json,
+          confidence: row.confidence,
+          parse_error: row.parse_error,
+          direction,
+          initial_direction: direction,
+          direction_source: typeof row.direction_source === "string" ? row.direction_source : "legacy",
+          direction_confidence: typeof row.direction_confidence === "number" ? row.direction_confidence : null
+        };
+      })
+    );
   }, []);
 
   const refreshImportStatus = React.useCallback(
@@ -637,11 +784,15 @@ export function App() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          decisions: reviewRows.map((row) => ({
-            row_id: row.row_id,
-            approved: row.approved,
-            rejection_reason: row.approved ? null : row.rejection_reason || null
-          }))
+          decisions: reviewRows
+            .filter((row) => row.direction !== row.initial_direction)
+            .map((row) => ({
+              row_id: row.row_id,
+              approved: true,
+              rejection_reason: null,
+              direction: row.direction,
+              direction_confidence: null
+            }))
         })
       });
       await refreshImportStatus(activeImportId);
@@ -915,7 +1066,7 @@ export function App() {
                     </div>
                     <div>
                       <span>Review Required</span>
-                      <strong>{activeImportStatus?.review_required_count ?? 0}</strong>
+                      <strong>{unresolvedDirectionCount}</strong>
                     </div>
                     <div>
                       <span>Warnings</span>
@@ -934,6 +1085,19 @@ export function App() {
                       <strong>{activeImportStatus?.extraction_mode || "managed"}</strong>
                     </div>
                   </div>
+                  {activeQualityMetrics ? (
+                    <div className="quality-card">
+                      <strong>Quality metrics</strong>
+                      <small>
+                        Unknown: {qualityUnknownCount} ({(qualityUnknownRate * 100).toFixed(1)}%) ·
+                        Conflict: {qualityConflictCount} ({(qualityConflictRate * 100).toFixed(1)}%)
+                      </small>
+                      <small>
+                        Manual override: {qualityManualOverrideCount} ({(qualityManualOverrideRate * 100).toFixed(1)}%) ·
+                        Reconciliation fails: {qualityReconciliationFailCount} ({(qualityReconciliationFailRate * 100).toFixed(1)}%)
+                      </small>
+                    </div>
+                  ) : null}
 
                   {commitResult ? (
                     <p className="success-text" data-testid="commit-summary">
@@ -975,11 +1139,20 @@ export function App() {
                     <button
                       className="button"
                       onClick={() => void commitImport()}
-                      disabled={isCommittingImport || activeImportStatus?.status === "failed"}
+                      disabled={
+                        isCommittingImport ||
+                        activeImportStatus?.status === "failed" ||
+                        unresolvedDirectionCount > 0
+                      }
                     >
                       {isCommittingImport ? "Committing..." : "Commit Import"}
                     </button>
                   </div>
+                  {unresolvedDirectionCount > 0 ? (
+                    <p className="error-text">
+                      Resolve direction for all rows before commit. Unresolved rows: {unresolvedDirectionCount}
+                    </p>
+                  ) : null}
                 </article>
 
                 <article className="panel results-rows" data-testid="results-rows">
@@ -997,52 +1170,45 @@ export function App() {
                             <small>
                               {row.normalized_json.booked_at || "(no date)"} · {formatMoney(Number(row.normalized_json.amount_cents || 0))} · confidence {row.confidence.toFixed(2)}
                             </small>
+                            <small>
+                              Direction source: {row.direction_source}
+                              {typeof row.direction_confidence === "number"
+                                ? ` · dir confidence ${row.direction_confidence.toFixed(2)}`
+                                : ""}
+                            </small>
                             {row.parse_error ? <small className="error-text">Parse error: {row.parse_error}</small> : null}
                           </div>
 
                           <div className="review-actions">
-                            <label className="review-approve-label">
-                              <input
-                                className="review-checkbox"
-                                type="checkbox"
-                                checked={row.approved}
-                                onChange={(event) => {
-                                  const approved = event.target.checked;
-                                  setReviewRows((current) =>
-                                    current.map((item) =>
-                                      item.row_id === row.row_id
-                                        ? {
-                                            ...item,
-                                            approved,
-                                            rejection_reason: approved ? null : item.rejection_reason
-                                          }
-                                        : item
-                                    )
-                                  );
-                                }}
-                              />
-                              <span>Approve</span>
-                            </label>
-                            {!row.approved ? (
-                              <input
-                                className="input"
-                                placeholder="Rejection reason"
-                                value={row.rejection_reason || ""}
-                                onChange={(event) => {
-                                  const reason = event.target.value;
-                                  setReviewRows((current) =>
-                                    current.map((item) =>
-                                      item.row_id === row.row_id
-                                        ? {
-                                            ...item,
-                                            rejection_reason: reason
-                                          }
-                                        : item
-                                    )
-                                  );
-                                }}
-                              />
-                            ) : null}
+                            <label htmlFor={`direction-${row.row_id}`}>Direction</label>
+                            <select
+                              id={`direction-${row.row_id}`}
+                              className="input"
+                              value={row.direction}
+                              onChange={(event) => {
+                                const direction = normalizeDirection(event.target.value);
+                                setReviewRows((current) =>
+                                  current.map((item) =>
+                                    item.row_id === row.row_id
+                                      ? {
+                                          ...item,
+                                          direction,
+                                          direction_source:
+                                            direction === item.initial_direction
+                                              ? item.direction_source
+                                              : "manual"
+                                        }
+                                      : item
+                                  )
+                                );
+                              }}
+                            >
+                              {DIRECTION_OPTIONS.map((option) => (
+                                <option key={option} value={option}>
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
                           </div>
                         </li>
                       ))}
@@ -1092,6 +1258,20 @@ export function App() {
 
               <div className="panel inset">
                 <h3>Transactions</h3>
+                <div className="quality-card">
+                  <strong>Quality</strong>
+                  <small>
+                    Reconciliation: {reconciliation.status}
+                    {reconciliation.totalChecks > 0 ? ` (${reconciliation.totalChecks - reconciliation.failCount}/${reconciliation.totalChecks} checks pass)` : ""}
+                  </small>
+                  <small>
+                    Unknown: {dataUnknownCount} ({(dataUnknownRate * 100).toFixed(1)}%) ·
+                    Conflict: {dataConflictCount} ({(dataConflictRate * 100).toFixed(1)}%)
+                  </small>
+                  <small>
+                    Manual override: {dataManualOverrideCount} ({(dataManualOverrideRate * 100).toFixed(1)}%)
+                  </small>
+                </div>
                 {statementTransactions.length === 0 ? (
                   <p className="muted">No transactions for selected statement.</p>
                 ) : (
@@ -1100,7 +1280,12 @@ export function App() {
                       <li key={transaction.id} className="txn-row">
                         <div>
                           <strong>{transaction.description}</strong>
-                          <small>{transaction.booked_at}</small>
+                          <small>
+                            {transaction.booked_at} · {transaction.direction || "unknown"} · {transaction.direction_source || "legacy"}
+                            {typeof transaction.direction_confidence === "number"
+                              ? ` · ${transaction.direction_confidence.toFixed(2)}`
+                              : ""}
+                          </small>
                         </div>
                         <div className="amount">{formatMoney(transaction.amount_cents)}</div>
                       </li>

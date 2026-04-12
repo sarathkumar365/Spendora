@@ -21,6 +21,7 @@ use storage_sqlite::{
     insert_import_rows, mark_job_completed, mark_job_failed, run_migrations, upsert_or_get_statement,
     update_import_extraction_result, update_import_status, upsert_llama_agent_cache,
     upsert_llama_agent_readiness, LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
+    StatementSummaryInput,
 };
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -421,6 +422,8 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         }));
 
         let mut statement_id_for_rows: Option<String> = None;
+        let mut extraction_quality_metrics = serde_json::json!({});
+        let mut extraction_reconciliation = serde_json::json!({});
         let parsed = if blob.parser_type == "csv" {
             parse_csv(&decoded, &account_id)
         } else if blob.parser_type == "pdf" {
@@ -566,6 +569,11 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                     .get("statement_context")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
+                let statement_summary = result
+                    .diagnostics
+                    .get("statement_summary")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 let lineage = result
                     .diagnostics
                     .get("provider_lineage")
@@ -592,6 +600,40 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                                 .get("schema_version")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("statement_v1"),
+                            StatementSummaryInput {
+                                opening_balance_cents: statement_summary
+                                    .get("opening_balance_cents")
+                                    .and_then(|v| v.as_i64()),
+                                opening_balance_date: statement_summary
+                                    .get("opening_balance_date")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string()),
+                                closing_balance_cents: statement_summary
+                                    .get("closing_balance_cents")
+                                    .and_then(|v| v.as_i64()),
+                                closing_balance_date: statement_summary
+                                    .get("closing_balance_date")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string()),
+                                total_debits_cents: statement_summary
+                                    .get("total_debits_cents")
+                                    .and_then(|v| v.as_i64()),
+                                total_credits_cents: statement_summary
+                                    .get("total_credits_cents")
+                                    .and_then(|v| v.as_i64()),
+                                account_type: statement_summary
+                                    .get("account_type")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string()),
+                                account_number_masked: statement_summary
+                                    .get("account_number_masked")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string()),
+                                currency_code: statement_summary
+                                    .get("currency_code")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string()),
+                            },
                         )
                         .await?;
                         statement_id_for_rows = Some(statement.id);
@@ -613,9 +655,28 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "provider_lineage": result.diagnostics.get("provider_lineage").cloned().unwrap_or_else(|| serde_json::json!({})),
                 "poll_status_trail": result.diagnostics.get("poll_status_trail").cloned().unwrap_or_else(|| serde_json::json!([])),
                 "statement_context": result.diagnostics.get("statement_context").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "statement_summary": result.diagnostics.get("statement_summary").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "direction_quality": result.diagnostics.get("direction_quality").cloned().unwrap_or_else(|| serde_json::json!({
+                    "unknown_count": 0,
+                    "conflict_count": 0,
+                    "conflicts": []
+                })),
+                "reconciliation": result.diagnostics.get("reconciliation").cloned().unwrap_or_else(|| serde_json::json!({
+                    "skipped": true,
+                    "reason": "not_available"
+                })),
+                "quality_metrics": result.diagnostics.get("quality_metrics").cloned().unwrap_or_else(|| serde_json::json!({})),
                 "provider_diagnostics": result.diagnostics.clone(),
                 "agent_readiness": readiness,
             });
+            extraction_quality_metrics = diagnostics
+                .get("quality_metrics")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            extraction_reconciliation = diagnostics
+                .get("reconciliation")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
 
             update_import_extraction_result(
                 pool,
@@ -656,6 +717,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                         confidence: row.confidence,
                         parse_error: row.parse_error,
                         normalized_txn_hash: row.normalized_txn_hash,
+                        metadata: row.metadata,
                     })
                     .collect(),
                 warnings: result.warnings,
@@ -670,18 +732,29 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         let parsed_rows: Vec<ParsedRowInput> = parsed
             .rows
             .iter()
-            .map(|row| ParsedRowInput {
-                row_index: row.row_index,
-                normalized_json: serde_json::json!({
+            .map(|row| {
+                let mut normalized_json = serde_json::json!({
                     "booked_at": row.booked_at,
                     "amount_cents": row.amount_cents,
                     "description": row.description,
-                }),
-                confidence: row.confidence,
-                parse_error: row.parse_error.clone(),
-                normalized_txn_hash: row.normalized_txn_hash.clone(),
-                account_id: Some(account_id.clone()),
-                statement_id: statement_id_for_rows.clone(),
+                });
+                if let Some(metadata) = row.metadata.as_ref().and_then(|v| v.as_object()) {
+                    if let Some(obj) = normalized_json.as_object_mut() {
+                        for (key, value) in metadata {
+                            obj.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+
+                ParsedRowInput {
+                    row_index: row.row_index,
+                    normalized_json,
+                    confidence: row.confidence,
+                    parse_error: row.parse_error.clone(),
+                    normalized_txn_hash: row.normalized_txn_hash.clone(),
+                    account_id: Some(account_id.clone()),
+                    statement_id: statement_id_for_rows.clone(),
+                }
             })
             .collect();
 
@@ -697,7 +770,14 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         let review_required_count = parsed
             .rows
             .iter()
-            .filter(|row| row.parse_error.is_some() || row.confidence < 0.75)
+            .filter(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|v| v.get("direction"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    == "unknown"
+            })
             .count() as i64;
 
         let status = if review_required_count > 0 {
@@ -714,7 +794,12 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             pool,
             &job_payload.import_id,
             status,
-            serde_json::json!({ "parsed_rows": parsed_rows_len }),
+            serde_json::json!({
+                "parsed_rows": parsed_rows_len,
+                "unresolved_direction_count": review_required_count,
+                "quality_metrics": extraction_quality_metrics,
+                "reconciliation": extraction_reconciliation
+            }),
             parsed.errors,
             parsed.warnings,
             review_required_count,
@@ -890,7 +975,7 @@ mod tests {
             .await
             .expect("get status");
         assert_eq!(status.status, ImportStatus::ReviewRequired.as_str());
-        assert_eq!(status.review_required_count, 1);
+        assert_eq!(status.review_required_count, 2);
         assert!(status.summary.to_string().contains("parsed_rows"));
 
         let rows = storage_sqlite::list_import_rows_for_review(&pool, &import_id)
@@ -1040,6 +1125,30 @@ mod tests {
             std::env::set_var("LLAMA_CLOUD_API_KEY", "x");
             std::env::set_var("LLAMA_AGENT_NAME", "agent");
             std::env::set_var("LLAMA_SCHEMA_VERSION", "statement_v1");
+            std::env::remove_var("LLAMA_CLOUD_ORGANIZATION_ID");
+            std::env::remove_var("LLAMA_CLOUD_PROJECT_ID");
+        }
+
+        validate_extraction_runtime_contract().expect("runtime contract should validate");
+
+        for key in [
+            "LLAMA_CLOUD_API_KEY",
+            "LLAMA_AGENT_NAME",
+            "LLAMA_SCHEMA_VERSION",
+            "LLAMA_CLOUD_ORGANIZATION_ID",
+            "LLAMA_CLOUD_PROJECT_ID",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn extraction_runtime_contract_succeeds_with_statement_v2() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLAMA_CLOUD_API_KEY", "x");
+            std::env::set_var("LLAMA_AGENT_NAME", "agent");
+            std::env::set_var("LLAMA_SCHEMA_VERSION", "statement_v2");
             std::env::remove_var("LLAMA_CLOUD_ORGANIZATION_ID");
             std::env::remove_var("LLAMA_CLOUD_PROJECT_ID");
         }

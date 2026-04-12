@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 expense_core = { path = "../core" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
