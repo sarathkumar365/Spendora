@@ -37,6 +37,15 @@ pub struct SafeSummaryResponse {
     pub safety_note: String,
 }
 
+fn amount_text_to_cents(value: Option<&str>) -> Option<i64> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let parsed = text.parse::<f64>().ok()?;
+    Some((parsed * 100.0).round() as i64)
+}
+
 pub async fn get_transactions_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TransactionsQueryParams>,
@@ -118,20 +127,21 @@ pub async fn get_transactions_safe_summary_handler(
     };
 
     for item in all {
-        match item.direction.as_str() {
+        let amount_cents = amount_text_to_cents(item.amount.as_deref()).unwrap_or(0);
+        match item.tx_type.as_deref().unwrap_or("unknown") {
             "credit" => {
-                response.inflow_cents += item.amount_cents.abs();
+                response.inflow_cents += amount_cents.abs();
                 response.included_count += 1;
             }
             "debit" => {
-                response.outflow_cents += item.amount_cents.abs();
+                response.outflow_cents += amount_cents.abs();
                 response.included_count += 1;
             }
             "unknown" if include_unknown => {
-                if item.amount_cents >= 0 {
-                    response.inflow_cents += item.amount_cents.abs();
+                if amount_cents >= 0 {
+                    response.inflow_cents += amount_cents.abs();
                 } else {
-                    response.outflow_cents += item.amount_cents.abs();
+                    response.outflow_cents += amount_cents.abs();
                 }
                 response.included_count += 1;
             }
@@ -176,12 +186,12 @@ mod tests {
             .await
             .expect("default account");
 
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES ('tx-api-1', ?1, 'h-api-1', 1250, 'CAD', 'Coffee Run', '2026-03-10', 'manual', 'manual', 0.9, 'manual import')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation) VALUES ('tx-api-1', ?1, 'h-api-1', 1250, 'CAD', 'Coffee Run', '2026-03-10', '12.50', 'Coffee Run', '2026-03-10', 'manual', 'manual', 0.9, 'manual import')")
             .bind(&account_id)
             .execute(&pool)
             .await
             .expect("insert tx1");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES ('tx-api-2', ?1, 'h-api-2', 8200, 'CAD', 'Salary', '2026-03-11', 'manual', 'manual', 1.0, 'manual import')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation) VALUES ('tx-api-2', ?1, 'h-api-2', 8200, 'CAD', 'Salary', '2026-03-11', '82.00', 'Salary', '2026-03-11', 'manual', 'manual', 1.0, 'manual import')")
             .bind(&account_id)
             .execute(&pool)
             .await
@@ -205,9 +215,8 @@ mod tests {
         .0;
 
         assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].description, "Coffee Run");
-        assert_eq!(resp[0].direction, "unknown");
-        assert_eq!(resp[0].direction_source, "legacy");
+        assert_eq!(resp[0].details.as_deref(), Some("Coffee Run"));
+        assert_eq!(resp[0].tx_type.as_deref(), Some("unknown"));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -225,17 +234,17 @@ mod tests {
             .await
             .expect("default account");
 
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, direction, direction_source) VALUES ('tx-safe-1', ?1, 'h-safe-1', -1200, 'CAD', 'Debit', '2026-03-10', 'manual', 'manual', 1.0, 'manual import', 'debit', 'model')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation, direction, type) VALUES ('tx-safe-1', ?1, 'h-safe-1', -1200, 'CAD', 'Debit', '2026-03-10', '-12.00', 'Debit', '2026-03-10', 'manual', 'manual', 1.0, 'manual import', 'debit', 'debit')")
             .bind(&account_id)
             .execute(&pool)
             .await
             .expect("insert tx1");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, direction, direction_source) VALUES ('tx-safe-2', ?1, 'h-safe-2', 3000, 'CAD', 'Credit', '2026-03-11', 'manual', 'manual', 1.0, 'manual import', 'credit', 'model')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation, direction, type) VALUES ('tx-safe-2', ?1, 'h-safe-2', 3000, 'CAD', 'Credit', '2026-03-11', '30.00', 'Credit', '2026-03-11', 'manual', 'manual', 1.0, 'manual import', 'credit', 'credit')")
             .bind(&account_id)
             .execute(&pool)
             .await
             .expect("insert tx2");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, direction, direction_source) VALUES ('tx-safe-3', ?1, 'h-safe-3', -800, 'CAD', 'Unknown', '2026-03-12', 'manual', 'manual', 1.0, 'manual import', 'unknown', 'legacy')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation, direction, type) VALUES ('tx-safe-3', ?1, 'h-safe-3', -800, 'CAD', 'Unknown', '2026-03-12', '-8.00', 'Unknown', '2026-03-12', 'manual', 'manual', 1.0, 'manual import', 'unknown', NULL)")
             .bind(&account_id)
             .execute(&pool)
             .await

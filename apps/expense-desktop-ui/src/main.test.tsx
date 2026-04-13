@@ -188,10 +188,14 @@ describe("Import page revamp", () => {
         return jsonResponse([
           {
             id: "txn-1",
-            description: "Coffee",
-            booked_at: "2026-03-02",
-            amount_cents: 450,
-            source: "manual"
+            details: "Coffee",
+            transaction_date: "2026-03-02",
+            amount: "-4.50",
+            source: "manual",
+            classification_source: "manual",
+            confidence: 1.0,
+            explanation: "imported",
+            last_sync_at: "2026-03-02T00:00:00Z"
           }
         ]);
       }
@@ -467,5 +471,106 @@ describe("Import page revamp", () => {
     expect(await screen.findByTestId("upload-blob")).toBeInTheDocument();
     expect(screen.queryByTestId("import-results-stage")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start Extraction" })).not.toBeInTheDocument();
+  });
+
+  it("shows card resolution panel for pending_card_resolution imports", async () => {
+    const user = userEvent.setup();
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+
+    let statusCalls = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = toUrl(input);
+      const method = (init?.method || "GET").toUpperCase();
+
+      if (url.includes("/api/v1/imports") && method === "POST") {
+        return jsonResponse({ import_id: "imp-4", status: "queued", reused: false }, 201);
+      }
+      if (url.includes("/api/v1/imports/imp-4/status") && method === "GET") {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return jsonResponse({
+            import_id: "imp-4",
+            status: "queued",
+            extraction_mode: "managed",
+            effective_provider: null,
+            provider_attempts: [],
+            diagnostics: {},
+            summary: {},
+            errors: [],
+            warnings: [],
+            review_required_count: 0
+          });
+        }
+        return jsonResponse({
+          import_id: "imp-4",
+          status: "pending_card_resolution",
+          extraction_mode: "managed",
+          effective_provider: "llamaextract_jobs",
+          provider_attempts: [],
+          diagnostics: {},
+          summary: { parsed_rows: 1 },
+          errors: [],
+          warnings: [],
+          review_required_count: 0,
+          card_resolution_status: "pending",
+          resolved_account_id: null,
+          card_resolution_reason: "manual_selection_required",
+          card_resolution_metadata: {
+            account_type: "Scotiabank Scene+ Visa Card",
+            account_number_ending: "1234",
+            customer_name: "Jane Doe"
+          }
+        });
+      }
+      if (url.includes("/api/v1/imports/imp-4/review") && method === "GET") {
+        return jsonResponse([
+          {
+            row_id: "row-4",
+            row_index: 1,
+            direction: "debit",
+            direction_source: "model",
+            direction_confidence: 0.9,
+            normalized_json: {
+              transaction_date: "2026-05-10",
+              details: "Cafe",
+              amount: -7.5
+            },
+            confidence: 0.95,
+            parse_error: null
+          }
+        ]);
+      }
+      if (url.includes("/api/v1/imports/imp-4/card-resolution") && method === "GET") {
+        return jsonResponse({
+          import_id: "imp-4",
+          card_resolution_status: "pending",
+          resolved_account_id: null,
+          card_resolution_reason: "manual_selection_required",
+          card_resolution_metadata: {
+            account_type: "Scotiabank Scene+ Visa Card",
+            account_number_ending: "1234",
+            customer_name: "Jane Doe"
+          },
+          candidate_accounts: [
+            { id: "manual-default-account", name: "Manual Imported Account", currency_code: "CAD" }
+          ]
+        });
+      }
+      return withDefaultRoutes()(url, init);
+    });
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Import" }));
+
+    const fileInput = screen.getByTestId("import-file-input") as HTMLInputElement;
+    fireEvent.change(fileInput, {
+      target: { files: [new File(["dummy"], "statement.pdf", { type: "application/pdf" })] }
+    });
+    await user.click(screen.getByRole("button", { name: "Start Extraction" }));
+
+    await screen.findByTestId("import-results-stage");
+    expect(screen.getByText("Select Card For This Import")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use Selected Card" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create And Use New Card" })).toBeInTheDocument();
   });
 });

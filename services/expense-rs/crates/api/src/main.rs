@@ -2,13 +2,13 @@ mod accounts;
 mod imports;
 mod plaid;
 mod settings;
-mod statements;
 mod state;
+mod statements;
 mod transactions;
 
 use axum::{
-    http::{HeaderName, HeaderValue, Method},
     extract::State,
+    http::{HeaderName, HeaderValue, Method},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -81,6 +81,11 @@ async fn main() -> anyhow::Result<()> {
             get(imports::get_import_status_handler),
         )
         .route(
+            "/api/v1/imports/:id/card-resolution",
+            get(imports::get_import_card_resolution_handler)
+                .post(imports::resolve_import_card_handler),
+        )
+        .route(
             "/api/v1/imports/:id/review",
             get(imports::get_import_review_handler).post(imports::update_import_review_handler),
         )
@@ -97,7 +102,10 @@ async fn main() -> anyhow::Result<()> {
             get(transactions::get_transactions_safe_summary_handler),
         )
         .route("/api/v1/accounts", get(accounts::get_accounts_handler))
-        .route("/api/v1/statements", get(statements::list_statements_handler))
+        .route(
+            "/api/v1/statements",
+            get(statements::list_statements_handler),
+        )
         .route(
             "/api/v1/statements/coverage",
             get(statements::get_statement_coverage_handler),
@@ -130,8 +138,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn validate_extraction_runtime_contract() -> anyhow::Result<String> {
-    let extraction_config = load_extraction_runtime_config_from_env()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let extraction_config =
+        load_extraction_runtime_config_from_env().map_err(|e| anyhow::anyhow!(e.to_string()))?;
     load_statement_blueprint_schema(&extraction_config.llama_schema_version)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(extraction_config.llama_schema_version)
@@ -202,9 +210,8 @@ fn parse_allowed_origins() -> anyhow::Result<Vec<HeaderValue>> {
                 if !valid {
                     anyhow::bail!("invalid value in CORS_ALLOWED_ORIGINS: {item}");
                 }
-                HeaderValue::from_str(item).map_err(|_| {
-                    anyhow::anyhow!("invalid value in CORS_ALLOWED_ORIGINS: {item}")
-                })
+                HeaderValue::from_str(item)
+                    .map_err(|_| anyhow::anyhow!("invalid value in CORS_ALLOWED_ORIGINS: {item}"))
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -283,13 +290,18 @@ mod tests {
         let db_path = std::env::current_dir()
             .expect("cwd")
             .join(".tmp")
-            .join(format!("api-diagnostics-test-{}.db", expense_core::new_idempotency_key()));
+            .join(format!(
+                "api-diagnostics-test-{}.db",
+                expense_core::new_idempotency_key()
+            ));
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).expect("create parent");
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        ensure_default_manual_account(&pool).await.expect("default account");
+        ensure_default_manual_account(&pool)
+            .await
+            .expect("default account");
 
         upsert_llama_agent_readiness(
             &pool,
@@ -336,9 +348,10 @@ mod tests {
     #[test]
     fn cors_origin_parser_rejects_invalid_values() {
         unsafe { std::env::set_var("CORS_ALLOWED_ORIGINS", "http://ok,not-an-origin") };
-        let err = parse_allowed_origins()
-            .expect_err("invalid origin should fail");
-        assert!(err.to_string().contains("invalid value in CORS_ALLOWED_ORIGINS"));
+        let err = parse_allowed_origins().expect_err("invalid origin should fail");
+        assert!(err
+            .to_string()
+            .contains("invalid value in CORS_ALLOWED_ORIGINS"));
         unsafe { std::env::remove_var("CORS_ALLOWED_ORIGINS") };
     }
 

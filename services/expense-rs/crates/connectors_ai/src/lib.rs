@@ -220,7 +220,8 @@ impl LlamaPhaseBudget {
         if remaining == 0 {
             return None;
         }
-        let configured = configured_timeout_ms.clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS) as u64;
+        let configured =
+            configured_timeout_ms.clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS) as u64;
         Some(remaining.min(configured).max(1))
     }
 }
@@ -543,7 +544,10 @@ impl StatementExtractor for ManagedExtractor {
 }
 
 impl ManagedExtractor {
-    pub async fn extract_pdf_new(&self, request: &ExtractionRequest) -> anyhow::Result<ExtractionResult> {
+    pub async fn extract_pdf_new(
+        &self,
+        request: &ExtractionRequest,
+    ) -> anyhow::Result<ExtractionResult> {
         let cfg = load_extraction_runtime_config_from_env().map_err(|e| anyhow!(e.to_string()))?;
         let base_url = env::var("LLAMA_CLOUD_BASE_URL")
             .unwrap_or_else(|_| "https://api.cloud.llamaindex.ai".to_string());
@@ -560,7 +564,9 @@ impl ManagedExtractor {
         let agent_id = find_llama_agent_id(&self.http, &base_url, &cfg, &agent_name)
             .await
             .map_err(|e| anyhow!(e.to_string()))?
-            .ok_or_else(|| anyhow!("MANAGED_PROVIDER_BAD_REQUEST: agent_id not found for {agent_name}"))?;
+            .ok_or_else(|| {
+                anyhow!("MANAGED_PROVIDER_BAD_REQUEST: agent_id not found for {agent_name}")
+            })?;
         log_bootstrap_event(serde_json::json!({
             "ts_utc": chrono::Utc::now().to_rfc3339(),
             "kind": "jobs_agent_resolved",
@@ -571,7 +577,8 @@ impl ManagedExtractor {
 
         let timeout_ms = request
             .timeout_ms
-            .clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS) as u64;
+            .clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS)
+            as u64;
 
         let uploaded = jobs_upload_file(
             &self.http,
@@ -611,8 +618,11 @@ impl ManagedExtractor {
         .await?;
 
         let validated = validate_jobs_result_payload(&fetched.payload, &cfg.llama_schema_version)?;
-        let (period_start, period_end, period_derived) =
-            resolve_period(validated.period_start.clone(), validated.period_end.clone(), &validated.rows)?;
+        let (period_start, period_end, period_derived) = resolve_period(
+            validated.period_start.clone(),
+            validated.period_end.clone(),
+            &validated.rows,
+        )?;
 
         let mut out_rows = Vec::new();
         for (idx, item) in validated.rows.into_iter().enumerate() {
@@ -624,7 +634,9 @@ impl ManagedExtractor {
             .iter()
             .filter_map(|row| {
                 let parse_error = row.parse_error.as_ref()?;
-                if !parse_error.contains("sign_conflict") && !parse_error.contains("missing_or_invalid_type") {
+                if !parse_error.contains("sign_conflict")
+                    && !parse_error.contains("missing_or_invalid_type")
+                {
                     return None;
                 }
                 Some(serde_json::json!({
@@ -662,7 +674,8 @@ impl ManagedExtractor {
             .filter(|row| row_has_parse_flag(row, "parse_default_applied:"))
             .count();
         let direction_review_row_count = direction_review_row_count(&rows, &direction_conflicts);
-        let reconciliation = compute_reconciliation(&statement_summary, &rows, RECONCILIATION_TOLERANCE_CENTS);
+        let reconciliation =
+            compute_reconciliation(&statement_summary, &rows, RECONCILIATION_TOLERANCE_CENTS);
         let reconciliation_fail_count = reconciliation
             .get("fail_count")
             .and_then(|v| v.as_i64())
@@ -1013,7 +1026,10 @@ async fn jobs_create_extraction_job(
                 "body_keys": body_keys,
                 "response_body": raw_trimmed,
             }));
-            if matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY) {
+            if matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ) {
                 continue;
             }
             return Err(anyhow!(
@@ -1082,7 +1098,9 @@ async fn jobs_poll_status(
                 "elapsed_ms": poll_started_at.elapsed().as_millis(),
                 "hard_cap_ms": hard_cap.as_millis(),
             }));
-            return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+            return Err(anyhow!(
+                "MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"
+            ));
         }
         let endpoint = format!("{base_url}/api/v1/extraction/jobs/{job_id}");
         let response = http
@@ -1132,7 +1150,14 @@ async fn jobs_poll_status(
             .map_err(|e| anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: poll invalid json: {e}"))?;
         let state = find_string_field(
             &value,
-            &["status", "state", "data.status", "data.state", "job.status", "job.state"],
+            &[
+                "status",
+                "state",
+                "data.status",
+                "data.state",
+                "job.status",
+                "job.state",
+            ],
         )
         .unwrap_or_else(|| "UNKNOWN".to_string());
         trail.push(serde_json::json!({
@@ -1190,7 +1215,9 @@ async fn jobs_poll_status(
                         "hard_cap_ms": hard_cap.as_millis(),
                         "poll_no": poll_no,
                     }));
-                    return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+                    return Err(anyhow!(
+                        "MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"
+                    ));
                 }
                 sleep(delay).await;
             }
@@ -1220,7 +1247,9 @@ async fn jobs_poll_status(
                         "poll_no": poll_no,
                         "status": state,
                     }));
-                    return Err(anyhow!("MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"));
+                    return Err(anyhow!(
+                        "MANAGED_PROVIDER_TIMEOUT: polling hard cap exceeded"
+                    ));
                 }
                 sleep(delay).await;
             }
@@ -1359,10 +1388,7 @@ fn validate_jobs_result_payload(
             "transaction_subtotals",
         ] {
             if envelope.get(key).is_none() {
-                return Err(anyhow!(
-                    "MANAGED_PROVIDER_SCHEMA_INVALID: missing {}",
-                    key
-                ));
+                return Err(anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: missing {}", key));
             }
         }
     }
@@ -1426,7 +1452,10 @@ fn validate_jobs_result_payload(
                     .map(|v| v.to_string()),
                 amount: item.get("amount").and_then(as_f64_from_value),
                 confidence: None,
-                tx_type: item.get("type").and_then(|v| v.as_str()).map(|v| v.to_string()),
+                tx_type: item
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
             });
         } else {
             rows.push(StatementRowCandidate {
@@ -1451,7 +1480,9 @@ fn validate_jobs_result_payload(
         }
     }
     if rows.is_empty() {
-        return Err(anyhow!("MANAGED_PROVIDER_SCHEMA_INVALID: no transaction rows"));
+        return Err(anyhow!(
+            "MANAGED_PROVIDER_SCHEMA_INVALID: no transaction rows"
+        ));
     }
     Ok(ValidatedJobsStatement {
         period_start,
@@ -1507,8 +1538,9 @@ fn row_has_parse_flag(row: &ExtractedRow, prefix_or_flag: &str) -> bool {
         .and_then(|v| v.as_array())
         .is_some_and(|items| {
             items.iter().any(|item| {
-                item.as_str()
-                    .is_some_and(|value| value == prefix_or_flag || value.starts_with(prefix_or_flag))
+                item.as_str().is_some_and(|value| {
+                    value == prefix_or_flag || value.starts_with(prefix_or_flag)
+                })
             })
         })
 }
@@ -1535,8 +1567,12 @@ fn direction_review_row_count(rows: &[ExtractedRow], conflicts: &[Value]) -> i64
 }
 
 fn compute_reconciliation(summary: &Value, rows: &[ExtractedRow], tolerance_cents: i64) -> Value {
-    let opening_balance_cents = summary.get("opening_balance_cents").and_then(|v| v.as_i64());
-    let closing_balance_cents = summary.get("closing_balance_cents").and_then(|v| v.as_i64());
+    let opening_balance_cents = summary
+        .get("opening_balance_cents")
+        .and_then(|v| v.as_i64());
+    let closing_balance_cents = summary
+        .get("closing_balance_cents")
+        .and_then(|v| v.as_i64());
     let total_debits_cents = summary.get("total_debits_cents").and_then(|v| v.as_i64());
     let total_credits_cents = summary.get("total_credits_cents").and_then(|v| v.as_i64());
 
@@ -1586,14 +1622,19 @@ fn compute_reconciliation(summary: &Value, rows: &[ExtractedRow], tolerance_cent
 
     let actual_closing = opening + net_movement;
     let checks = vec![
+        build_reconciliation_check("balance_equation", closing, actual_closing, tolerance_cents),
         build_reconciliation_check(
-            "balance_equation",
-            closing,
-            actual_closing,
+            "debits_total",
+            expected_debits,
+            actual_debits,
             tolerance_cents,
         ),
-        build_reconciliation_check("debits_total", expected_debits, actual_debits, tolerance_cents),
-        build_reconciliation_check("credits_total", expected_credits, actual_credits, tolerance_cents),
+        build_reconciliation_check(
+            "credits_total",
+            expected_credits,
+            actual_credits,
+            tolerance_cents,
+        ),
     ];
     let fail_count = checks
         .iter()
@@ -1757,7 +1798,10 @@ fn classify_from_wording(
     ];
     let transfer_keywords = ["etransfer", "e-transfer", "transfer"];
 
-    if let Some(keyword) = debit_keywords.iter().find(|item| description.contains(**item)) {
+    if let Some(keyword) = debit_keywords
+        .iter()
+        .find(|item| description.contains(**item))
+    {
         return Some((
             "debit",
             "rule",
@@ -1854,7 +1898,7 @@ fn map_statement_row(row_index: i64, account_id: &str, row: StatementRowCandidat
     });
     let amount_cents = (amount_units * 100.0).round() as i64;
 
-    let mut direction = TransactionDirection::from_value(row.tx_type.as_deref()).unwrap_or_else(|| {
+    let direction = TransactionDirection::from_value(row.tx_type.as_deref()).unwrap_or_else(|| {
         parse_errors.push("missing_or_invalid_type; review required".to_string());
         parse_flags.push("missing_required_field:type".to_string());
         TransactionDirection::Unknown
@@ -1877,18 +1921,22 @@ fn map_statement_row(row_index: i64, account_id: &str, row: StatementRowCandidat
     }
 
     let normalized_description = normalize_description(description.as_str());
-    let normalized_txn_hash =
-        compute_row_hash(account_id, booked_at.as_str(), amount_cents, normalized_description.as_str());
+    let normalized_txn_hash = compute_row_hash(
+        account_id,
+        booked_at.as_str(),
+        amount_cents,
+        normalized_description.as_str(),
+    );
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "direction".to_string(),
         Value::String(direction.as_str().to_string()),
     );
-    metadata.insert("type".to_string(), Value::String(direction.as_str().to_string()));
     metadata.insert(
-        "amount_units".to_string(),
-        Value::from(amount_units),
+        "type".to_string(),
+        Value::String(direction.as_str().to_string()),
     );
+    metadata.insert("amount_units".to_string(), Value::from(amount_units));
     if !parse_flags.is_empty() {
         metadata.insert(
             "parse_flags".to_string(),
@@ -1943,6 +1991,12 @@ pub fn versioned_agent_name(base_name: &str, schema_version: &str) -> String {
     format!("{}--{}", base_name.trim(), schema_version.trim())
 }
 
+#[derive(Debug, Clone)]
+struct LlamaAgentRecord {
+    id: String,
+    data_schema: Option<Value>,
+}
+
 pub async fn ensure_llama_extraction_agent(
     config: &ExtractionRuntimeConfig,
     schema: &Value,
@@ -1960,17 +2014,51 @@ pub async fn ensure_llama_extraction_agent(
 
     validate_schema_with_llama(&http, &base_url, config, schema).await?;
 
-    if let Some(found_id) = find_llama_agent_id(&http, &base_url, config, &agent_name).await? {
+    if let Some(found_agent) = find_llama_agent_by_name(&http, &base_url, config, &agent_name).await?
+    {
+        let schema_matches = found_agent
+            .data_schema
+            .as_ref()
+            .is_some_and(|remote| schema_contract_matches_version(remote, &config.llama_schema_version));
+        if !schema_matches {
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "bootstrap_agent_schema_mismatch",
+                "agent_name": agent_name,
+                "agent_id": found_agent.id,
+                "schema_version": config.llama_schema_version,
+                "remote_root_required": found_agent
+                    .data_schema
+                    .as_ref()
+                    .and_then(|v| v.get("required"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
+            delete_llama_agent(&http, &base_url, config, &found_agent.id, &agent_name).await?;
+            let recreated_id = create_llama_agent(&http, &base_url, config, &agent_name, schema).await?;
+            log_bootstrap_event(serde_json::json!({
+                "ts_utc": chrono::Utc::now().to_rfc3339(),
+                "kind": "bootstrap_ensure_success",
+                "source": "recreated_agent_mismatch",
+                "agent_name": agent_name,
+                "agent_id": recreated_id,
+                "schema_version": config.llama_schema_version,
+            }));
+            return Ok(LlamaAgentDescriptor {
+                agent_id: recreated_id,
+                agent_name,
+            });
+        }
         log_bootstrap_event(serde_json::json!({
             "ts_utc": chrono::Utc::now().to_rfc3339(),
             "kind": "bootstrap_ensure_success",
             "source": "existing_agent",
             "agent_name": agent_name,
-            "agent_id": found_id,
+            "agent_id": found_agent.id,
             "schema_version": config.llama_schema_version,
         }));
         return Ok(LlamaAgentDescriptor {
-            agent_id: found_id,
+            agent_id: found_agent.id,
             agent_name,
         });
     }
@@ -2128,6 +2216,16 @@ async fn find_llama_agent_id(
     config: &ExtractionRuntimeConfig,
     desired_name: &str,
 ) -> Result<Option<String>, LlamaAgentBootstrapError> {
+    let found = find_llama_agent_by_name(http, base_url, config, desired_name).await?;
+    Ok(found.map(|record| record.id))
+}
+
+async fn find_llama_agent_by_name(
+    http: &reqwest::Client,
+    base_url: &str,
+    config: &ExtractionRuntimeConfig,
+    desired_name: &str,
+) -> Result<Option<LlamaAgentRecord>, LlamaAgentBootstrapError> {
     let url = scoped_url(base_url, "/api/v1/extraction/extraction-agents", config)?;
     let url_for_log = url.to_string();
     log_bootstrap_event(serde_json::json!({
@@ -2171,14 +2269,14 @@ async fn find_llama_agent_id(
         });
     }
 
-    let body: Value = serde_json::from_str(raw_body.as_str())
-        .map_err(|e| LlamaAgentBootstrapError {
+    let body: Value =
+        serde_json::from_str(raw_body.as_str()).map_err(|e| LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
             message: format!("agent list returned invalid json: {e}"),
             status_code: None,
         })?;
 
-    let found = extract_agent_id_by_name(&body, desired_name);
+    let found = extract_agent_record_by_name(&body, desired_name);
     log_bootstrap_event(serde_json::json!({
         "ts_utc": chrono::Utc::now().to_rfc3339(),
         "kind": "bootstrap_agent_list_success",
@@ -2250,8 +2348,8 @@ async fn create_llama_agent(
         });
     }
 
-    let body: Value = serde_json::from_str(raw_body.as_str())
-        .map_err(|e| LlamaAgentBootstrapError {
+    let body: Value =
+        serde_json::from_str(raw_body.as_str()).map_err(|e| LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
             message: format!("agent create returned invalid json: {e}"),
             status_code: None,
@@ -2260,7 +2358,11 @@ async fn create_llama_agent(
     let agent_id = body
         .get("id")
         .and_then(|v| v.as_str())
-        .or_else(|| body.get("data").and_then(|v| v.get("id")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            body.get("data")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        })
         .ok_or_else(|| LlamaAgentBootstrapError {
             code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
             message: "agent create response missing id".to_string(),
@@ -2275,7 +2377,12 @@ async fn create_llama_agent(
     Ok(agent_id.to_string())
 }
 
+#[cfg(test)]
 fn extract_agent_id_by_name(body: &Value, desired_name: &str) -> Option<String> {
+    extract_agent_record_by_name(body, desired_name).map(|record| record.id)
+}
+
+fn extract_agent_record_by_name(body: &Value, desired_name: &str) -> Option<LlamaAgentRecord> {
     let list = if let Some(arr) = body.as_array() {
         Some(arr)
     } else {
@@ -2289,11 +2396,145 @@ fn extract_agent_id_by_name(body: &Value, desired_name: &str) -> Option<String> 
             .or_else(|| item.get("extraction_agent_name").and_then(|v| v.as_str()));
         if name == Some(desired_name) {
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                return Some(id.to_string());
+                return Some(LlamaAgentRecord {
+                    id: id.to_string(),
+                    data_schema: item.get("data_schema").cloned(),
+                });
             }
         }
     }
     None
+}
+
+fn schema_contract_matches_version(schema: &Value, version: &str) -> bool {
+    let root_required = match schema.get("required").and_then(|v| v.as_array()) {
+        Some(v) => v,
+        None => return false,
+    };
+    let expected_root_required: Vec<&str> = if version == "statement_v2" {
+        vec![
+            "statement_period",
+            "statement_date",
+            "account_details",
+            "due_this_statement",
+            "account_summary",
+            "interest_information",
+            "transactions",
+            "transaction_subtotals",
+        ]
+    } else {
+        vec!["period_start", "period_end", "transactions"]
+    };
+    for key in expected_root_required {
+        let has_key = root_required.iter().any(|item| item.as_str() == Some(key));
+        if !has_key {
+            return false;
+        }
+    }
+    if schema
+        .get("additionalProperties")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|value| value)
+    {
+        return false;
+    }
+
+    let tx_required = match schema
+        .get("properties")
+        .and_then(|v| v.get("transactions"))
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.get("required"))
+        .and_then(|v| v.as_array())
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let expected_tx_required: Vec<&str> = if version == "statement_v2" {
+        vec!["transaction_date", "details", "amount", "type"]
+    } else {
+        vec!["booked_at", "description", "amount_cents"]
+    };
+    for key in expected_tx_required {
+        let has_key = tx_required.iter().any(|item| item.as_str() == Some(key));
+        if !has_key {
+            return false;
+        }
+    }
+    if schema
+        .get("properties")
+        .and_then(|v| v.get("transactions"))
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.get("additionalProperties"))
+        .and_then(|v| v.as_bool())
+        .is_some_and(|value| value)
+    {
+        return false;
+    }
+    true
+}
+
+async fn delete_llama_agent(
+    http: &reqwest::Client,
+    base_url: &str,
+    config: &ExtractionRuntimeConfig,
+    agent_id: &str,
+    agent_name: &str,
+) -> Result<(), LlamaAgentBootstrapError> {
+    let path = format!("/api/v1/extraction/extraction-agents/{agent_id}");
+    let url = scoped_url(base_url, path.as_str(), config)?;
+    let url_for_log = url.to_string();
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_delete_request",
+        "url": url.as_str(),
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+    }));
+
+    let response = http
+        .delete(url)
+        .bearer_auth(&config.llama_cloud_api_key)
+        .send()
+        .await
+        .map_err(map_bootstrap_network_error)?;
+
+    let status_code = response.status().as_u16();
+    let response_headers = redact_headers(response.headers());
+    let raw_body = response.text().await.unwrap_or_default();
+    log_external_api_raw_event(&ExternalApiRawEvent {
+        ts_utc: chrono::Utc::now().to_rfc3339(),
+        kind: "external_api_raw",
+        import_id: None,
+        file_name: None,
+        provider: "llamaextract_bootstrap".to_string(),
+        attempt_no: None,
+        operation: "bootstrap_delete_agent".to_string(),
+        method: "DELETE".to_string(),
+        url: url_for_log,
+        request_body_meta: Some(serde_json::json!({
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+        })),
+        status_code: Some(status_code),
+        response_headers_redacted: response_headers,
+        response_body_raw: Some(raw_body.clone()),
+        error_message: None,
+    });
+
+    if !(200..300).contains(&status_code) {
+        return Err(LlamaAgentBootstrapError {
+            code: "EXTRACTION_AGENT_BOOTSTRAP_API_UNREACHABLE".to_string(),
+            message: format!("agent delete failed ({status_code}): {raw_body}"),
+            status_code: Some(status_code),
+        });
+    }
+    log_bootstrap_event(serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "kind": "bootstrap_agent_delete_success",
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+    }));
+    Ok(())
 }
 
 fn map_bootstrap_network_error(err: reqwest::Error) -> LlamaAgentBootstrapError {
@@ -2702,8 +2943,8 @@ async fn openrouter_call(
     let timeout_ms = request
         .timeout_ms
         .clamp(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS) as u64;
-    let schema_version = std::env::var("LLAMA_SCHEMA_VERSION")
-        .unwrap_or_else(|_| "statement_v1".to_string());
+    let schema_version =
+        std::env::var("LLAMA_SCHEMA_VERSION").unwrap_or_else(|_| "statement_v1".to_string());
     let prompt = openrouter_prompt(&schema_version);
     let pdf_data_url = format!(
         "data:application/pdf;base64,{}",
@@ -4395,6 +4636,55 @@ mod tests {
     }
 
     #[test]
+    fn schema_contract_matches_version_accepts_statement_v2_contract() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "required":[
+                "statement_period",
+                "statement_date",
+                "account_details",
+                "due_this_statement",
+                "account_summary",
+                "interest_information",
+                "transactions",
+                "transaction_subtotals"
+            ],
+            "properties":{
+                "transactions":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "required":["transaction_date","details","amount","type"],
+                        "additionalProperties":false
+                    }
+                }
+            },
+            "additionalProperties":false
+        });
+        assert!(schema_contract_matches_version(&schema, "statement_v2"));
+    }
+
+    #[test]
+    fn schema_contract_matches_version_rejects_v1_contract_for_statement_v2() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "required":["period_start","period_end","transactions"],
+            "properties":{
+                "transactions":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "required":["booked_at","description","amount_cents"],
+                        "additionalProperties":false
+                    }
+                }
+            },
+            "additionalProperties":false
+        });
+        assert!(!schema_contract_matches_version(&schema, "statement_v2"));
+    }
+
+    #[test]
     fn scoped_url_ignores_invalid_optional_scope_ids() {
         let cfg = ExtractionRuntimeConfig {
             llama_cloud_api_key: "k".to_string(),
@@ -4432,7 +4722,10 @@ mod tests {
             classify_job_status("RUNNING"),
             JobStatusClass::InProgress
         ));
-        assert!(matches!(classify_job_status("UNSEEN"), JobStatusClass::Unknown));
+        assert!(matches!(
+            classify_job_status("UNSEEN"),
+            JobStatusClass::Unknown
+        ));
     }
 
     #[test]

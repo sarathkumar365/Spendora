@@ -39,6 +39,22 @@ pub struct CoverageMonthView {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: serde_json::Value,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -71,6 +87,22 @@ pub struct CoverageSelectedView {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: serde_json::Value,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -166,6 +198,22 @@ pub async fn get_statement_coverage_handler(
                 period_end: item.period_end.clone(),
                 linked_txn_count: item.linked_txn_count,
                 manual_added_txn_count: item.manual_added_txn_count,
+                statement_period_start: item.statement_period_start.clone(),
+                statement_period_end: item.statement_period_end.clone(),
+                statement_date: item.statement_date.clone(),
+                account_number_ending: item.account_number_ending.clone(),
+                customer_name: item.customer_name.clone(),
+                payment_due_date: item.payment_due_date.clone(),
+                total_minimum_payment: item.total_minimum_payment,
+                interest_charged: item.interest_charged,
+                account_balance: item.account_balance,
+                credit_limit: item.credit_limit,
+                available_credit: item.available_credit,
+                estimated_payoff_years: item.estimated_payoff_years,
+                estimated_payoff_months: item.estimated_payoff_months,
+                credits_total: item.credits_total,
+                debits_total: item.debits_total,
+                statement_payload_json: item.statement_payload_json.clone(),
                 opening_balance_cents: item.opening_balance_cents,
                 opening_balance_date: item.opening_balance_date.clone(),
                 closing_balance_cents: item.closing_balance_cents,
@@ -200,18 +248,34 @@ pub async fn get_statement_coverage_handler(
                     statement_month: None,
                     period_start: None,
                     period_end: None,
-                linked_txn_count: 0,
-                manual_added_txn_count: 0,
-                opening_balance_cents: None,
-                opening_balance_date: None,
-                closing_balance_cents: None,
-                closing_balance_date: None,
-                total_debits_cents: None,
-                total_credits_cents: None,
-                account_type: None,
-                account_number_masked: None,
-                currency_code: None,
-            });
+                    linked_txn_count: 0,
+                    manual_added_txn_count: 0,
+                    statement_period_start: None,
+                    statement_period_end: None,
+                    statement_date: None,
+                    account_number_ending: None,
+                    customer_name: None,
+                    payment_due_date: None,
+                    total_minimum_payment: None,
+                    interest_charged: None,
+                    account_balance: None,
+                    credit_limit: None,
+                    available_credit: None,
+                    estimated_payoff_years: None,
+                    estimated_payoff_months: None,
+                    credits_total: None,
+                    debits_total: None,
+                    statement_payload_json: serde_json::json!({}),
+                    opening_balance_cents: None,
+                    opening_balance_date: None,
+                    closing_balance_cents: None,
+                    closing_balance_date: None,
+                    total_debits_cents: None,
+                    total_credits_cents: None,
+                    account_type: None,
+                    account_number_masked: None,
+                    currency_code: None,
+                });
 
             Some(CoverageSelectedView {
                 year,
@@ -234,6 +298,22 @@ pub async fn get_statement_coverage_handler(
                 period_end: selected_item.period_end,
                 linked_txn_count: selected_item.linked_txn_count,
                 manual_added_txn_count: selected_item.manual_added_txn_count,
+                statement_period_start: selected_item.statement_period_start,
+                statement_period_end: selected_item.statement_period_end,
+                statement_date: selected_item.statement_date,
+                account_number_ending: selected_item.account_number_ending,
+                customer_name: selected_item.customer_name,
+                payment_due_date: selected_item.payment_due_date,
+                total_minimum_payment: selected_item.total_minimum_payment,
+                interest_charged: selected_item.interest_charged,
+                account_balance: selected_item.account_balance,
+                credit_limit: selected_item.credit_limit,
+                available_credit: selected_item.available_credit,
+                estimated_payoff_years: selected_item.estimated_payoff_years,
+                estimated_payoff_months: selected_item.estimated_payoff_months,
+                credits_total: selected_item.credits_total,
+                debits_total: selected_item.debits_total,
+                statement_payload_json: selected_item.statement_payload_json,
                 opening_balance_cents: selected_item.opening_balance_cents,
                 opening_balance_date: selected_item.opening_balance_date,
                 closing_balance_cents: selected_item.closing_balance_cents,
@@ -358,7 +438,7 @@ mod tests {
             .expect("statement tx response")
             .0;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].description, "Statement Row");
+        assert_eq!(rows[0].details.as_deref(), Some("Statement Row"));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -449,13 +529,11 @@ mod tests {
         .await
         .expect("coverage response")
         .0;
-        assert!(
-            coverage
-                .selected
-                .as_ref()
-                .map(|v| v.reusable)
-                .unwrap_or(false)
-        );
+        assert!(coverage
+            .selected
+            .as_ref()
+            .map(|v| v.reusable)
+            .unwrap_or(false));
 
         let created = create_import_handler(
             State(state.clone()),
@@ -472,7 +550,7 @@ mod tests {
         .await
         .expect("reused import")
         .1
-        .0;
+         .0;
         assert!(created.reused);
         assert_eq!(created.status, "committed");
 
@@ -496,7 +574,7 @@ mod tests {
             .expect("statement tx list")
             .0;
         assert_eq!(tx_rows.len(), 1);
-        assert_eq!(tx_rows[0].description, "Flow Linked Tx");
+        assert_eq!(tx_rows[0].details.as_deref(), Some("Flow Linked Tx"));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;

@@ -564,6 +564,31 @@ select.input::-ms-expand {
   color: var(--text-secondary);
 }
 
+.card-resolution-panel {
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  background: color-mix(in srgb, var(--surface-solid) 85%, #eef7f5 15%);
+}
+
+.card-resolution-panel h4 {
+  margin: 0;
+}
+
+.card-resolution-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.card-resolution-col {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
 .list {
   list-style: none;
   padding: 0;
@@ -651,5 +676,9 @@ select.input::-ms-expand {
   .review-actions {
     justify-items: start;
     min-width: 0;
+  }
+
+  .card-resolution-grid {
+    grid-template-columns: 1fr;
   }
 }

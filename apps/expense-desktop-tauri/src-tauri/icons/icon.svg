@@ -15,16 +15,18 @@
     </filter>
   </defs>
 
-  <rect width="1024" height="1024" rx="220" fill="url(#bgA)"/>
+  <g transform="translate(61.44 61.44) scale(0.88)">
+    <rect width="1024" height="1024" rx="220" fill="url(#bgA)"/>
 
-  <g filter="url(#shadowA)">
-    <rect x="264" y="246" width="496" height="550" rx="140" fill="#1E3C41"/>
+    <g filter="url(#shadowA)">
+      <rect x="264" y="246" width="496" height="550" rx="140" fill="#1E3C41"/>
+    </g>
+
+    <rect x="314" y="296" width="142" height="448" rx="70" fill="#2D565C"/>
+    <rect x="568" y="296" width="142" height="448" rx="70" fill="#2D565C"/>
+
+    <path d="M620 330C520 314 412 362 412 452C412 542 620 510 620 600C620 675 526 716 416 696" stroke="#D6ECE7" stroke-width="98" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M620 330C520 314 412 362 412 452" stroke="#89D4C7" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
   </g>
-
-  <rect x="314" y="296" width="142" height="448" rx="70" fill="#2D565C"/>
-  <rect x="568" y="296" width="142" height="448" rx="70" fill="#2D565C"/>
-
-  <path d="M620 330C520 314 412 362 412 452C412 542 620 510 620 600C620 675 526 716 416 696" stroke="#D6ECE7" stroke-width="98" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <path d="M620 330C520 314 412 362 412 452" stroke="#89D4C7" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
 </svg>

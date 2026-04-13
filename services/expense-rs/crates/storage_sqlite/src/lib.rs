@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context};
-use expense_core::{new_idempotency_key, ClassificationSource, ImportStatus, TransactionSource};
+use expense_core::{
+    compute_row_hash, new_idempotency_key, ClassificationSource, ImportStatus, TransactionSource,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -22,6 +24,7 @@ pub struct CreateImportInput {
     pub content_base64: String,
     pub source_hash: String,
     pub extraction_mode: Option<String>,
+    pub resolved_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +41,10 @@ pub struct ImportStatusView {
     pub summary: serde_json::Value,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    pub resolved_account_id: Option<String>,
+    pub card_resolution_status: String,
+    pub card_resolution_reason: Option<String>,
+    pub card_resolution_metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +85,9 @@ pub struct ReviewDecision {
 pub struct TransactionListItem {
     pub id: String,
     pub account_id: String,
-    pub description: String,
-    pub amount_cents: i64,
-    pub booked_at: String,
+    pub details: Option<String>,
+    pub amount: Option<String>,
+    pub transaction_date: Option<String>,
     pub source: String,
     pub classification_source: String,
     pub confidence: f64,
@@ -88,9 +95,7 @@ pub struct TransactionListItem {
     pub last_sync_at: String,
     pub import_id: Option<String>,
     pub statement_id: Option<String>,
-    pub direction: String,
-    pub direction_confidence: Option<f64>,
-    pub direction_source: String,
+    pub tx_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,6 +114,20 @@ pub struct AccountItem {
     pub id: String,
     pub name: String,
     pub currency_code: String,
+    pub account_type: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateAccountCardInput {
+    pub name: String,
+    pub currency_code: String,
+    pub account_type: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +197,7 @@ pub struct LlamaAgentReadiness {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatementRecord {
     pub id: String,
     pub account_id: String,
@@ -190,6 +209,22 @@ pub struct StatementRecord {
     pub provider_run_id: Option<String>,
     pub provider_metadata_json: serde_json::Value,
     pub schema_version: String,
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: serde_json::Value,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -213,6 +248,22 @@ pub struct StatementListItem {
     pub provider_run_id: Option<String>,
     pub schema_version: String,
     pub linked_txn_count: i64,
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: serde_json::Value,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -235,6 +286,22 @@ pub struct StatementCoverageMonth {
     pub period_end: Option<String>,
     pub linked_txn_count: i64,
     pub manual_added_txn_count: i64,
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: serde_json::Value,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -248,6 +315,22 @@ pub struct StatementCoverageMonth {
 
 #[derive(Debug, Clone, Default)]
 pub struct StatementSummaryInput {
+    pub statement_period_start: Option<String>,
+    pub statement_period_end: Option<String>,
+    pub statement_date: Option<String>,
+    pub account_number_ending: Option<String>,
+    pub customer_name: Option<String>,
+    pub payment_due_date: Option<String>,
+    pub total_minimum_payment: Option<f64>,
+    pub interest_charged: Option<f64>,
+    pub account_balance: Option<f64>,
+    pub credit_limit: Option<f64>,
+    pub available_credit: Option<f64>,
+    pub estimated_payoff_years: Option<i64>,
+    pub estimated_payoff_months: Option<i64>,
+    pub credits_total: Option<f64>,
+    pub debits_total: Option<f64>,
+    pub statement_payload_json: Option<serde_json::Value>,
     pub opening_balance_cents: Option<i64>,
     pub opening_balance_date: Option<String>,
     pub closing_balance_cents: Option<i64>,
@@ -376,8 +459,13 @@ pub async fn create_import(pool: &SqlitePool, input: CreateImportInput) -> anyho
     let extraction_mode = input
         .extraction_mode
         .unwrap_or_else(|| DEFAULT_EXTRACTION_MODE.to_string());
+    let card_resolution_status = if input.resolved_account_id.is_some() {
+        "resolved"
+    } else {
+        "pending"
+    };
     sqlx::query(
-        "INSERT INTO imports (id, source_type, status, file_name, parser_type, source_hash, content_base64, extraction_mode, updated_at) VALUES (?1, 'manual', ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+        "INSERT INTO imports (id, source_type, status, file_name, parser_type, source_hash, content_base64, extraction_mode, resolved_account_id, card_resolution_status, card_resolution_metadata_json, card_resolved_at, updated_at) VALUES (?1, 'manual', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '{}', CASE WHEN ?8 IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END, CURRENT_TIMESTAMP)",
     )
     .bind(&import_id)
     .bind(ImportStatus::Queued.as_str())
@@ -386,6 +474,8 @@ pub async fn create_import(pool: &SqlitePool, input: CreateImportInput) -> anyho
     .bind(&input.source_hash)
     .bind(&input.content_base64)
     .bind(extraction_mode)
+    .bind(input.resolved_account_id)
+    .bind(card_resolution_status)
     .execute(pool)
     .await?;
 
@@ -406,8 +496,13 @@ pub async fn create_reused_import(
         .extraction_mode
         .unwrap_or_else(|| DEFAULT_EXTRACTION_MODE.to_string());
 
+    let card_resolution_status = if input.resolved_account_id.is_some() {
+        "resolved"
+    } else {
+        "pending"
+    };
     sqlx::query(
-        "INSERT INTO imports (id, source_type, status, file_name, parser_type, source_hash, content_base64, extraction_mode, effective_provider, provider_attempts_json, extraction_diagnostics_json, provider_attempt_count, review_required_count, summary_json, errors_json, warnings_json, committed_at, updated_at) VALUES (?1, 'manual', ?2, ?3, ?4, ?5, ?6, ?7, 'reused_db', '[]', ?8, 0, 0, ?9, '[]', '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO imports (id, source_type, status, file_name, parser_type, source_hash, content_base64, extraction_mode, effective_provider, provider_attempts_json, extraction_diagnostics_json, provider_attempt_count, review_required_count, summary_json, errors_json, warnings_json, resolved_account_id, card_resolution_status, card_resolution_metadata_json, card_resolved_at, committed_at, updated_at) VALUES (?1, 'manual', ?2, ?3, ?4, ?5, ?6, ?7, 'reused_db', '[]', ?8, 0, 0, ?9, '[]', '[]', ?10, ?11, '{}', CASE WHEN ?10 IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .bind(&import_id)
     .bind(ImportStatus::Committed.as_str())
@@ -418,6 +513,8 @@ pub async fn create_reused_import(
     .bind(extraction_mode)
     .bind(diagnostics.to_string())
     .bind(summary.to_string())
+    .bind(input.resolved_account_id)
+    .bind(card_resolution_status)
     .execute(pool)
     .await?;
 
@@ -465,6 +562,141 @@ pub async fn update_import_extraction_result(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn find_high_confidence_account_match(
+    pool: &SqlitePool,
+    account_type: Option<&str>,
+    account_number_ending: Option<&str>,
+    customer_name: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(account_type) = account_type.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(account_number_ending) = account_number_ending
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(customer_name) = customer_name.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+
+    let rows = sqlx::query(
+        "SELECT id FROM accounts WHERE lower(trim(COALESCE(account_type, ''))) = lower(trim(?1)) AND lower(trim(COALESCE(account_number_ending, ''))) = lower(trim(?2)) AND lower(trim(COALESCE(customer_name, ''))) = lower(trim(?3)) ORDER BY created_at ASC LIMIT 2",
+    )
+    .bind(account_type)
+    .bind(account_number_ending)
+    .bind(customer_name)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() == 1 {
+        return Ok(Some(rows[0].get("id")));
+    }
+    Ok(None)
+}
+
+pub async fn set_import_card_resolution(
+    pool: &SqlitePool,
+    import_id: &str,
+    resolved_account_id: Option<&str>,
+    reason: Option<&str>,
+    metadata: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let status = if resolved_account_id.is_some() {
+        "resolved"
+    } else {
+        "pending"
+    };
+
+    sqlx::query(
+        "UPDATE imports SET resolved_account_id = ?2, card_resolution_status = ?3, card_resolution_reason = ?4, card_resolution_metadata_json = ?5, card_resolved_at = CASE WHEN ?2 IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+    )
+    .bind(import_id)
+    .bind(resolved_account_id)
+    .bind(status)
+    .bind(reason)
+    .bind(metadata.to_string())
+    .execute(pool)
+    .await?;
+
+    if let Some(account_id) = resolved_account_id {
+        sqlx::query(
+            "UPDATE import_rows SET account_id = ?2 WHERE import_id = ?1 AND account_id IS NULL",
+        )
+        .bind(import_id)
+        .bind(account_id)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn create_account_card(
+    pool: &SqlitePool,
+    input: CreateAccountCardInput,
+) -> anyhow::Result<AccountItem> {
+    let connection_id = "manual-connection";
+    sqlx::query(
+        "INSERT OR IGNORE INTO connections (id, provider, status, external_ref) VALUES (?1, 'manual', 'active', 'manual-local')",
+    )
+    .bind(connection_id)
+    .execute(pool)
+    .await?;
+
+    let account_id = new_idempotency_key();
+    sqlx::query(
+        "INSERT INTO accounts (id, connection_id, name, currency_code, account_type, account_number_ending, customer_name, metadata_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)",
+    )
+    .bind(&account_id)
+    .bind(connection_id)
+    .bind(input.name.trim())
+    .bind(if input.currency_code.trim().is_empty() {
+        "CAD".to_string()
+    } else {
+        input.currency_code.trim().to_string()
+    })
+    .bind(input.account_type.and_then(trim_optional))
+    .bind(input.account_number_ending.and_then(trim_optional))
+    .bind(input.customer_name.and_then(trim_optional))
+    .bind(
+        input
+            .metadata_json
+            .unwrap_or_else(|| serde_json::json!({}))
+            .to_string(),
+    )
+    .execute(pool)
+    .await?;
+
+    let row = sqlx::query(
+        "SELECT id, name, currency_code, account_type, account_number_ending, customer_name, metadata_json FROM accounts WHERE id = ?1",
+    )
+    .bind(&account_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(AccountItem {
+        id: row.get("id"),
+        name: row.get("name"),
+        currency_code: row.get("currency_code"),
+        account_type: row.get("account_type"),
+        account_number_ending: row.get("account_number_ending"),
+        customer_name: row.get("customer_name"),
+        metadata_json: serde_json::from_str(row.get::<String, _>("metadata_json").as_str())
+            .unwrap_or_else(|_| serde_json::json!({})),
+    })
+}
+
+fn trim_optional(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 pub async fn get_extraction_settings(pool: &SqlitePool) -> anyhow::Result<ExtractionSettings> {
@@ -515,9 +747,7 @@ pub async fn upsert_extraction_settings(
     Ok(settings)
 }
 
-pub async fn get_llama_agent_cache(
-    pool: &SqlitePool,
-) -> anyhow::Result<Option<LlamaAgentCache>> {
+pub async fn get_llama_agent_cache(pool: &SqlitePool) -> anyhow::Result<Option<LlamaAgentCache>> {
     let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'llama_agent_cache'")
         .fetch_optional(pool)
         .await?;
@@ -554,9 +784,10 @@ pub async fn upsert_llama_agent_cache(
 pub async fn get_llama_agent_readiness(
     pool: &SqlitePool,
 ) -> anyhow::Result<Option<LlamaAgentReadiness>> {
-    let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'llama_agent_readiness'")
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT value_json FROM app_settings WHERE key = 'llama_agent_readiness'")
+            .fetch_optional(pool)
+            .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -587,7 +818,7 @@ pub async fn get_statement_by_account_period(
     period_end: &str,
 ) -> anyhow::Result<Option<StatementRecord>> {
     let row = sqlx::query(
-        "SELECT id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3",
+        "SELECT id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, statement_period_start, statement_period_end, statement_date, account_number_ending, customer_name, payment_due_date, total_minimum_payment, interest_charged, account_balance, credit_limit, available_credit, estimated_payoff_years, estimated_payoff_months, credits_total, debits_total, statement_payload_json, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3",
     )
     .bind(account_id)
     .bind(period_start)
@@ -598,6 +829,7 @@ pub async fn get_statement_by_account_period(
         return Ok(None);
     };
     let metadata_raw: String = row.get("provider_metadata_json");
+    let payload_raw: String = row.get("statement_payload_json");
     Ok(Some(StatementRecord {
         id: row.get("id"),
         account_id: row.get("account_id"),
@@ -610,6 +842,23 @@ pub async fn get_statement_by_account_period(
         provider_metadata_json: serde_json::from_str(metadata_raw.as_str())
             .unwrap_or_else(|_| serde_json::json!({})),
         schema_version: row.get("schema_version"),
+        statement_period_start: row.get("statement_period_start"),
+        statement_period_end: row.get("statement_period_end"),
+        statement_date: row.get("statement_date"),
+        account_number_ending: row.get("account_number_ending"),
+        customer_name: row.get("customer_name"),
+        payment_due_date: row.get("payment_due_date"),
+        total_minimum_payment: row.get("total_minimum_payment"),
+        interest_charged: row.get("interest_charged"),
+        account_balance: row.get("account_balance"),
+        credit_limit: row.get("credit_limit"),
+        available_credit: row.get("available_credit"),
+        estimated_payoff_years: row.get("estimated_payoff_years"),
+        estimated_payoff_months: row.get("estimated_payoff_months"),
+        credits_total: row.get("credits_total"),
+        debits_total: row.get("debits_total"),
+        statement_payload_json: serde_json::from_str(payload_raw.as_str())
+            .unwrap_or_else(|_| serde_json::json!({})),
         opening_balance_cents: row.get("opening_balance_cents"),
         opening_balance_date: row.get("opening_balance_date"),
         closing_balance_cents: row.get("closing_balance_cents"),
@@ -643,7 +892,7 @@ pub async fn upsert_or_get_statement(
 
     let statement_id = new_idempotency_key();
     sqlx::query(
-        "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, CURRENT_TIMESTAMP)",
+        "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, statement_period_start, statement_period_end, statement_date, account_number_ending, customer_name, payment_due_date, total_minimum_payment, interest_charged, account_balance, credit_limit, available_credit, estimated_payoff_years, estimated_payoff_months, credits_total, debits_total, statement_payload_json, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, CURRENT_TIMESTAMP)",
     )
     .bind(&statement_id)
     .bind(account_id)
@@ -655,6 +904,27 @@ pub async fn upsert_or_get_statement(
     .bind(provider_run_id)
     .bind(provider_metadata_json.to_string())
     .bind(schema_version)
+    .bind(summary.statement_period_start)
+    .bind(summary.statement_period_end)
+    .bind(summary.statement_date)
+    .bind(summary.account_number_ending)
+    .bind(summary.customer_name)
+    .bind(summary.payment_due_date)
+    .bind(summary.total_minimum_payment)
+    .bind(summary.interest_charged)
+    .bind(summary.account_balance)
+    .bind(summary.credit_limit)
+    .bind(summary.available_credit)
+    .bind(summary.estimated_payoff_years)
+    .bind(summary.estimated_payoff_months)
+    .bind(summary.credits_total)
+    .bind(summary.debits_total)
+    .bind(
+        summary
+            .statement_payload_json
+            .unwrap_or_else(|| serde_json::json!({}))
+            .to_string(),
+    )
     .bind(summary.opening_balance_cents)
     .bind(summary.opening_balance_date)
     .bind(summary.closing_balance_cents)
@@ -681,20 +951,16 @@ pub async fn list_statements_for_account(
     date_to: Option<&str>,
 ) -> anyhow::Result<Vec<StatementListItem>> {
     let mut sql = String::from(
-        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
+        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.statement_period_start, s.statement_period_end, s.statement_date, s.account_number_ending, s.customer_name, s.payment_due_date, s.total_minimum_payment, s.interest_charged, s.account_balance, s.credit_limit, s.available_credit, s.estimated_payoff_years, s.estimated_payoff_months, s.credits_total, s.debits_total, s.statement_payload_json, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
     );
     let mut binds: Vec<String> = vec![account_id.to_string()];
 
     if let Some(y) = year {
-        sql.push_str(
-            " AND substr(COALESCE(s.statement_month, s.period_start), 1, 4) = ?",
-        );
+        sql.push_str(" AND substr(COALESCE(s.statement_month, s.period_start), 1, 4) = ?");
         binds.push(format!("{y:04}"));
     }
     if let Some(m) = month {
-        sql.push_str(
-            " AND substr(COALESCE(s.statement_month, s.period_start), 6, 2) = ?",
-        );
+        sql.push_str(" AND substr(COALESCE(s.statement_month, s.period_start), 6, 2) = ?");
         binds.push(format!("{m:02}"));
     }
     if let Some(from) = date_from {
@@ -707,7 +973,7 @@ pub async fn list_statements_for_account(
     }
 
     sql.push_str(
-        " GROUP BY s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code ORDER BY s.period_start DESC, s.period_end DESC",
+        " GROUP BY s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.statement_period_start, s.statement_period_end, s.statement_date, s.account_number_ending, s.customer_name, s.payment_due_date, s.total_minimum_payment, s.interest_charged, s.account_balance, s.credit_limit, s.available_credit, s.estimated_payoff_years, s.estimated_payoff_months, s.credits_total, s.debits_total, s.statement_payload_json, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code ORDER BY s.period_start DESC, s.period_end DESC",
     );
 
     let mut query = sqlx::query(&sql);
@@ -729,6 +995,25 @@ pub async fn list_statements_for_account(
             provider_run_id: row.get("provider_run_id"),
             schema_version: row.get("schema_version"),
             linked_txn_count: row.get("linked_txn_count"),
+            statement_period_start: row.get("statement_period_start"),
+            statement_period_end: row.get("statement_period_end"),
+            statement_date: row.get("statement_date"),
+            account_number_ending: row.get("account_number_ending"),
+            customer_name: row.get("customer_name"),
+            payment_due_date: row.get("payment_due_date"),
+            total_minimum_payment: row.get("total_minimum_payment"),
+            interest_charged: row.get("interest_charged"),
+            account_balance: row.get("account_balance"),
+            credit_limit: row.get("credit_limit"),
+            available_credit: row.get("available_credit"),
+            estimated_payoff_years: row.get("estimated_payoff_years"),
+            estimated_payoff_months: row.get("estimated_payoff_months"),
+            credits_total: row.get("credits_total"),
+            debits_total: row.get("debits_total"),
+            statement_payload_json: serde_json::from_str(
+                row.get::<String, _>("statement_payload_json").as_str(),
+            )
+            .unwrap_or_else(|_| serde_json::json!({})),
             opening_balance_cents: row.get("opening_balance_cents"),
             opening_balance_date: row.get("opening_balance_date"),
             closing_balance_cents: row.get("closing_balance_cents"),
@@ -753,36 +1038,53 @@ pub async fn get_statement_coverage(
         std::collections::BTreeMap::new();
 
     for statement in statements {
-        let month_token = statement
-            .statement_month
-            .clone()
-            .or_else(|| statement.period_start.get(..7).map(|value| value.to_string()));
-        let Some((y, m)) = month_token
-            .as_deref()
-            .and_then(parse_year_month_safe)
-        else {
+        let month_token = statement.statement_month.clone().or_else(|| {
+            statement
+                .period_start
+                .get(..7)
+                .map(|value| value.to_string())
+        });
+        let Some((y, m)) = month_token.as_deref().and_then(parse_year_month_safe) else {
             continue;
         };
-        let entry = by_month.entry((y, m)).or_insert_with(|| StatementCoverageMonth {
-            year: y,
-            month: m,
-            statement_exists: true,
-            statement_id: Some(statement.id.clone()),
-            statement_month: statement.statement_month.clone(),
-            period_start: Some(statement.period_start.clone()),
-            period_end: Some(statement.period_end.clone()),
-            linked_txn_count: 0,
-            manual_added_txn_count: 0,
-            opening_balance_cents: statement.opening_balance_cents,
-            opening_balance_date: statement.opening_balance_date.clone(),
-            closing_balance_cents: statement.closing_balance_cents,
-            closing_balance_date: statement.closing_balance_date.clone(),
-            total_debits_cents: statement.total_debits_cents,
-            total_credits_cents: statement.total_credits_cents,
-            account_type: statement.account_type.clone(),
-            account_number_masked: statement.account_number_masked.clone(),
-            currency_code: statement.currency_code.clone(),
-        });
+        let entry = by_month
+            .entry((y, m))
+            .or_insert_with(|| StatementCoverageMonth {
+                year: y,
+                month: m,
+                statement_exists: true,
+                statement_id: Some(statement.id.clone()),
+                statement_month: statement.statement_month.clone(),
+                period_start: Some(statement.period_start.clone()),
+                period_end: Some(statement.period_end.clone()),
+                linked_txn_count: 0,
+                manual_added_txn_count: 0,
+                statement_period_start: statement.statement_period_start.clone(),
+                statement_period_end: statement.statement_period_end.clone(),
+                statement_date: statement.statement_date.clone(),
+                account_number_ending: statement.account_number_ending.clone(),
+                customer_name: statement.customer_name.clone(),
+                payment_due_date: statement.payment_due_date.clone(),
+                total_minimum_payment: statement.total_minimum_payment,
+                interest_charged: statement.interest_charged,
+                account_balance: statement.account_balance,
+                credit_limit: statement.credit_limit,
+                available_credit: statement.available_credit,
+                estimated_payoff_years: statement.estimated_payoff_years,
+                estimated_payoff_months: statement.estimated_payoff_months,
+                credits_total: statement.credits_total,
+                debits_total: statement.debits_total,
+                statement_payload_json: statement.statement_payload_json.clone(),
+                opening_balance_cents: statement.opening_balance_cents,
+                opening_balance_date: statement.opening_balance_date.clone(),
+                closing_balance_cents: statement.closing_balance_cents,
+                closing_balance_date: statement.closing_balance_date.clone(),
+                total_debits_cents: statement.total_debits_cents,
+                total_credits_cents: statement.total_credits_cents,
+                account_type: statement.account_type.clone(),
+                account_number_masked: statement.account_number_masked.clone(),
+                currency_code: statement.currency_code.clone(),
+            });
         entry.statement_exists = true;
         entry.linked_txn_count += statement.linked_txn_count;
         if entry.statement_id.is_none() {
@@ -822,6 +1124,51 @@ pub async fn get_statement_coverage(
         if entry.account_type.is_none() {
             entry.account_type = statement.account_type.clone();
         }
+        if entry.statement_period_start.is_none() {
+            entry.statement_period_start = statement.statement_period_start.clone();
+        }
+        if entry.statement_period_end.is_none() {
+            entry.statement_period_end = statement.statement_period_end.clone();
+        }
+        if entry.statement_date.is_none() {
+            entry.statement_date = statement.statement_date.clone();
+        }
+        if entry.account_number_ending.is_none() {
+            entry.account_number_ending = statement.account_number_ending.clone();
+        }
+        if entry.customer_name.is_none() {
+            entry.customer_name = statement.customer_name.clone();
+        }
+        if entry.payment_due_date.is_none() {
+            entry.payment_due_date = statement.payment_due_date.clone();
+        }
+        if entry.total_minimum_payment.is_none() {
+            entry.total_minimum_payment = statement.total_minimum_payment;
+        }
+        if entry.interest_charged.is_none() {
+            entry.interest_charged = statement.interest_charged;
+        }
+        if entry.account_balance.is_none() {
+            entry.account_balance = statement.account_balance;
+        }
+        if entry.credit_limit.is_none() {
+            entry.credit_limit = statement.credit_limit;
+        }
+        if entry.available_credit.is_none() {
+            entry.available_credit = statement.available_credit;
+        }
+        if entry.estimated_payoff_years.is_none() {
+            entry.estimated_payoff_years = statement.estimated_payoff_years;
+        }
+        if entry.estimated_payoff_months.is_none() {
+            entry.estimated_payoff_months = statement.estimated_payoff_months;
+        }
+        if entry.credits_total.is_none() {
+            entry.credits_total = statement.credits_total;
+        }
+        if entry.debits_total.is_none() {
+            entry.debits_total = statement.debits_total;
+        }
         if entry.account_number_masked.is_none() {
             entry.account_number_masked = statement.account_number_masked.clone();
         }
@@ -843,26 +1190,44 @@ pub async fn get_statement_coverage(
         let y: i32 = row.get("y");
         let m: i32 = row.get("m");
         let cnt: i64 = row.get("cnt");
-        let entry = by_month.entry((y, m)).or_insert_with(|| StatementCoverageMonth {
-            year: y,
-            month: m,
-            statement_exists: false,
-            statement_id: None,
-            statement_month: None,
-            period_start: None,
-            period_end: None,
-            linked_txn_count: 0,
-            manual_added_txn_count: 0,
-            opening_balance_cents: None,
-            opening_balance_date: None,
-            closing_balance_cents: None,
-            closing_balance_date: None,
-            total_debits_cents: None,
-            total_credits_cents: None,
-            account_type: None,
-            account_number_masked: None,
-            currency_code: None,
-        });
+        let entry = by_month
+            .entry((y, m))
+            .or_insert_with(|| StatementCoverageMonth {
+                year: y,
+                month: m,
+                statement_exists: false,
+                statement_id: None,
+                statement_month: None,
+                period_start: None,
+                period_end: None,
+                linked_txn_count: 0,
+                manual_added_txn_count: 0,
+                statement_period_start: None,
+                statement_period_end: None,
+                statement_date: None,
+                account_number_ending: None,
+                customer_name: None,
+                payment_due_date: None,
+                total_minimum_payment: None,
+                interest_charged: None,
+                account_balance: None,
+                credit_limit: None,
+                available_credit: None,
+                estimated_payoff_years: None,
+                estimated_payoff_months: None,
+                credits_total: None,
+                debits_total: None,
+                statement_payload_json: serde_json::json!({}),
+                opening_balance_cents: None,
+                opening_balance_date: None,
+                closing_balance_cents: None,
+                closing_balance_date: None,
+                total_debits_cents: None,
+                total_credits_cents: None,
+                account_type: None,
+                account_number_masked: None,
+                currency_code: None,
+            });
         entry.manual_added_txn_count = cnt;
     }
 
@@ -878,7 +1243,7 @@ pub async fn list_transactions_for_statement(
     statement_id: &str,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let rows = sqlx::query(
-        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.direction, 'unknown') AS direction, t.direction_confidence, COALESCE(t.direction_source, 'legacy') AS direction_source FROM transactions t WHERE t.statement_id = ?1 ORDER BY t.booked_at DESC, t.created_at DESC",
+        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE t.statement_id = ?1 ORDER BY COALESCE(t.transaction_date, t.booked_at) DESC, t.created_at DESC",
     )
     .bind(statement_id)
     .fetch_all(pool)
@@ -889,9 +1254,9 @@ pub async fn list_transactions_for_statement(
         .map(|row| TransactionListItem {
             id: row.get("id"),
             account_id: row.get("account_id"),
-            description: row.get("description"),
-            amount_cents: row.get("amount_cents"),
-            booked_at: row.get("booked_at"),
+            details: row.get("details"),
+            amount: row.get("amount"),
+            transaction_date: row.get("transaction_date"),
             source: row.get("source"),
             classification_source: row.get("classification_source"),
             confidence: row.get("confidence"),
@@ -899,9 +1264,7 @@ pub async fn list_transactions_for_statement(
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
             statement_id: row.get("statement_id"),
-            direction: row.get("direction"),
-            direction_confidence: row.get("direction_confidence"),
-            direction_source: row.get("direction_source"),
+            tx_type: row.get("type"),
         })
         .collect())
 }
@@ -930,10 +1293,10 @@ pub async fn get_import_content(pool: &SqlitePool, import_id: &str) -> anyhow::R
     let row = sqlx::query(
         "SELECT parser_type, content_base64, extraction_mode, file_name FROM imports WHERE id = ?1",
     )
-        .bind(import_id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow!("import not found"))?;
+    .bind(import_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("import not found"))?;
 
     Ok(ImportBlob {
         parser_type: row.get("parser_type"),
@@ -982,7 +1345,7 @@ pub async fn get_import_status(
     import_id: &str,
 ) -> anyhow::Result<ImportStatusView> {
     let row = sqlx::query(
-        "SELECT id, file_name, parser_type, status, extraction_mode, effective_provider, provider_attempts_json, extraction_diagnostics_json, review_required_count, summary_json, errors_json, warnings_json FROM imports WHERE id = ?1",
+        "SELECT id, file_name, parser_type, status, extraction_mode, effective_provider, provider_attempts_json, extraction_diagnostics_json, review_required_count, summary_json, errors_json, warnings_json, resolved_account_id, card_resolution_status, card_resolution_reason, card_resolution_metadata_json FROM imports WHERE id = ?1",
     )
     .bind(import_id)
     .fetch_optional(pool)
@@ -1013,6 +1376,16 @@ pub async fn get_import_status(
             .unwrap_or_else(|_| Vec::new()),
         warnings: serde_json::from_str(row.get::<String, _>("warnings_json").as_str())
             .unwrap_or_else(|_| Vec::new()),
+        resolved_account_id: row.get("resolved_account_id"),
+        card_resolution_status: row
+            .get::<Option<String>, _>("card_resolution_status")
+            .unwrap_or_else(|| "pending".to_string()),
+        card_resolution_reason: row.get("card_resolution_reason"),
+        card_resolution_metadata: serde_json::from_str(
+            row.get::<String, _>("card_resolution_metadata_json")
+                .as_str(),
+        )
+        .unwrap_or_else(|_| serde_json::json!({})),
     })
 }
 
@@ -1037,17 +1410,23 @@ pub async fn list_import_rows_for_review(
                 row_id: row.get("id"),
                 row_index: row.get("row_index"),
                 direction: normalized_json
-                    .get("direction")
+                    .get("type")
                     .and_then(|v| v.as_str())
+                    .or_else(|| normalized_json.get("direction").and_then(|v| v.as_str()))
                     .unwrap_or("unknown")
                     .to_string(),
                 direction_confidence: normalized_json
-                    .get("direction_confidence")
+                    .get("type_confidence")
                     .and_then(|v| v.as_f64()),
                 direction_source: normalized_json
-                    .get("direction_source")
+                    .get("type_source")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("legacy")
+                    .or_else(|| {
+                        normalized_json
+                            .get("direction_source")
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("model")
                     .to_string(),
                 normalized_json,
                 confidence: row.get("confidence"),
@@ -1065,20 +1444,16 @@ pub async fn apply_review_decisions(
     decisions: &[ReviewDecision],
 ) -> anyhow::Result<()> {
     fn is_supported_direction(value: &str) -> bool {
-        matches!(
-            value,
-            "debit" | "credit" | "transfer" | "reversal" | "unknown"
-        )
+        matches!(value, "debit" | "credit" | "unknown")
     }
 
     for decision in decisions {
-        let row = sqlx::query(
-            "SELECT normalized_json FROM import_rows WHERE import_id = ?1 AND id = ?2",
-        )
-        .bind(import_id)
-        .bind(&decision.row_id)
-        .fetch_optional(pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT normalized_json FROM import_rows WHERE import_id = ?1 AND id = ?2")
+                .bind(import_id)
+                .bind(&decision.row_id)
+                .fetch_optional(pool)
+                .await?;
 
         let normalized_json = if let Some(existing) = row {
             let raw: String = existing.get("normalized_json");
@@ -1089,18 +1464,12 @@ pub async fn apply_review_decisions(
                     return Err(anyhow!("invalid direction value: {}", direction));
                 }
                 if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("direction".to_string(), serde_json::json!(direction));
-                    obj.insert(
-                        "direction_source".to_string(),
-                        serde_json::json!("manual"),
-                    );
+                    obj.insert("type".to_string(), serde_json::json!(direction));
+                    obj.insert("type_source".to_string(), serde_json::json!("manual"));
                     if let Some(confidence) = decision.direction_confidence {
-                        obj.insert(
-                            "direction_confidence".to_string(),
-                            serde_json::json!(confidence),
-                        );
+                        obj.insert("type_confidence".to_string(), serde_json::json!(confidence));
                     } else {
-                        obj.remove("direction_confidence");
+                        obj.remove("type_confidence");
                     }
                 }
             }
@@ -1127,8 +1496,26 @@ pub async fn commit_import_rows(
     pool: &SqlitePool,
     import_id: &str,
 ) -> anyhow::Result<CommitResult> {
-    let default_account_id = ensure_default_manual_account(pool).await?;
     let mut tx = pool.begin().await?;
+
+    let import_row = sqlx::query(
+        "SELECT resolved_account_id, card_resolution_status, extraction_diagnostics_json FROM imports WHERE id = ?1",
+    )
+    .bind(import_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| anyhow!("import not found"))?;
+
+    let mut resolved_account_id = import_row.get::<Option<String>, _>("resolved_account_id");
+    let card_resolution_status = import_row
+        .get::<Option<String>, _>("card_resolution_status")
+        .unwrap_or_else(|| "pending".to_string());
+    let diagnostics: serde_json::Value = serde_json::from_str(
+        import_row
+            .get::<String, _>("extraction_diagnostics_json")
+            .as_str(),
+    )
+    .unwrap_or_else(|_| serde_json::json!({}));
 
     let rows = sqlx::query(
         "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id, statement_id FROM import_rows WHERE import_id = ?1",
@@ -1136,26 +1523,31 @@ pub async fn commit_import_rows(
     .bind(import_id)
     .fetch_all(&mut *tx)
     .await?;
-
-    let unresolved_unknown_count = rows
-        .iter()
-        .filter(|row| {
-            let normalized_json: String = row.get("normalized_json");
-            let payload: serde_json::Value =
-                serde_json::from_str(&normalized_json).unwrap_or_else(|_| serde_json::json!({}));
-            payload
-                .get("direction")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                == "unknown"
-        })
-        .count();
-    if unresolved_unknown_count > 0 {
-        return Err(anyhow!(
-            "IMPORT_REVIEW_REQUIRED_UNKNOWN_DIRECTION: {} unresolved direction rows",
-            unresolved_unknown_count
-        ));
+    if resolved_account_id.is_none() {
+        let mut distinct = rows
+            .iter()
+            .filter_map(|row| row.get::<Option<String>, _>("account_id"))
+            .collect::<std::collections::BTreeSet<_>>();
+        if distinct.len() == 1 {
+            let single = distinct.pop_first().expect("len checked");
+            resolved_account_id = Some(single.clone());
+            sqlx::query(
+                "UPDATE imports SET resolved_account_id = ?2, card_resolution_status = 'resolved', card_resolution_reason = 'legacy_row_account', card_resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            )
+            .bind(import_id)
+            .bind(single)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
+    if card_resolution_status != "resolved" && resolved_account_id.is_none() {
+        return Err(anyhow!("IMPORT_CARD_RESOLUTION_REQUIRED"));
+    }
+    let resolved_account_id =
+        resolved_account_id.ok_or_else(|| anyhow!("IMPORT_CARD_RESOLUTION_REQUIRED"))?;
+
+    let import_statement_id =
+        resolve_statement_for_import(&mut tx, &resolved_account_id, &diagnostics).await?;
 
     let mut inserted_count = 0_i64;
     let mut duplicate_count = 0_i64;
@@ -1165,51 +1557,83 @@ pub async fn commit_import_rows(
         let payload: serde_json::Value = serde_json::from_str(&normalized_json)?;
         let account_id = row
             .get::<Option<String>, _>("account_id")
-            .unwrap_or_else(|| default_account_id.clone());
+            .unwrap_or_else(|| resolved_account_id.clone());
 
-        let description = payload
-            .get("description")
+        let details = payload
+            .get("details")
             .and_then(|v| v.as_str())
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or("Unknown transaction");
-        let amount_cents = payload
-            .get("amount_cents")
-            .and_then(|v| v.as_i64())
+            .or_else(|| payload.get("description").and_then(|v| v.as_str()))
+            .map(|v| v.to_string());
+        let amount = payload
+            .get("amount")
+            .and_then(|v| v.as_f64())
+            .map(|v| format!("{v:.2}"))
+            .or_else(|| {
+                payload
+                    .get("amount_cents")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| format!("{:.2}", v as f64 / 100.0))
+            });
+        let amount_cents = amount
+            .as_deref()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| (v * 100.0).round() as i64)
+            .or_else(|| payload.get("amount_cents").and_then(|v| v.as_i64()))
             .unwrap_or(0);
-        let booked_at = payload
-            .get("booked_at")
+        let transaction_date = payload
+            .get("transaction_date")
             .and_then(|v| v.as_str())
             .filter(|v| is_valid_iso_date(v))
-            .unwrap_or("1970-01-01");
-        let direction = payload
-            .get("direction")
+            .or_else(|| {
+                payload
+                    .get("booked_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| is_valid_iso_date(v))
+            })
+            .map(|v| v.to_string());
+        let tx_type = payload
+            .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let direction_confidence = payload
-            .get("direction_confidence")
-            .and_then(|v| v.as_f64());
-        let direction_source = payload
-            .get("direction_source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("legacy");
+            .or_else(|| payload.get("direction").and_then(|v| v.as_str()))
+            .map(|v| v.to_string());
+        let details_legacy = details
+            .clone()
+            .unwrap_or_else(|| "Unknown transaction".to_string());
+        let booked_at_legacy = transaction_date
+            .clone()
+            .unwrap_or_else(|| "1970-01-01".to_string());
+        let direction_legacy = tx_type.clone().unwrap_or_else(|| "unknown".to_string());
+        let normalized_txn_hash = if row.get::<Option<String>, _>("account_id").is_none() {
+            let hash_date = transaction_date.as_deref().unwrap_or("1970-01-01");
+            let hash_details = details.as_deref().unwrap_or("unknown transaction");
+            compute_row_hash(&account_id, hash_date, amount_cents, hash_details)
+        } else {
+            row.get::<String, _>("normalized_txn_hash")
+        };
+        let statement_id = row
+            .get::<Option<String>, _>("statement_id")
+            .or_else(|| import_statement_id.clone());
 
         let result = sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id, direction, direction_confidence, direction_source, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation, statement_id, direction, type, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
         )
         .bind(new_idempotency_key())
         .bind(&account_id)
-        .bind(row.get::<String, _>("normalized_txn_hash"))
+        .bind(normalized_txn_hash)
         .bind(amount_cents)
-        .bind(description)
-        .bind(booked_at)
+        .bind(details_legacy)
+        .bind(booked_at_legacy)
+        .bind(amount)
+        .bind(details)
+        .bind(transaction_date)
         .bind(TransactionSource::Manual.as_str())
         .bind(ClassificationSource::Manual.as_str())
         .bind(row.get::<f64, _>("confidence"))
         .bind("Imported from statement")
-        .bind(row.get::<Option<String>, _>("statement_id"))
-        .bind(direction)
-        .bind(direction_confidence)
-        .bind(direction_source)
+        .bind(statement_id)
+        .bind(direction_legacy)
+        .bind(tx_type)
         .execute(&mut *tx)
         .await?;
 
@@ -1236,6 +1660,157 @@ pub async fn commit_import_rows(
     })
 }
 
+async fn resolve_statement_for_import(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    account_id: &str,
+    diagnostics: &serde_json::Value,
+) -> anyhow::Result<Option<String>> {
+    let statement_context = diagnostics
+        .get("statement_context")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let statement_summary = diagnostics
+        .get("statement_summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let payload_snapshot = diagnostics
+        .get("provider_diagnostics")
+        .and_then(|v| v.get("payload_snapshot"))
+        .cloned()
+        .or_else(|| diagnostics.get("payload_snapshot").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let lineage = diagnostics
+        .get("provider_lineage")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let period_start = statement_context
+        .get("period_start")
+        .and_then(|v| v.as_str());
+    let period_end = statement_context.get("period_end").and_then(|v| v.as_str());
+    let (Some(period_start), Some(period_end)) = (period_start, period_end) else {
+        return Ok(None);
+    };
+    if period_start.trim().is_empty() || period_end.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let existing_statement_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM statements WHERE account_id = ?1 AND period_start = ?2 AND period_end = ?3 LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(period_start)
+    .bind(period_end)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let statement_id = if let Some(existing) = existing_statement_id {
+        existing
+    } else {
+        let new_id = new_idempotency_key();
+        sqlx::query(
+            "INSERT INTO statements (id, account_id, period_start, period_end, statement_month, provider_name, provider_job_id, provider_run_id, provider_metadata_json, schema_version, statement_period_start, statement_period_end, statement_date, account_number_ending, customer_name, payment_due_date, total_minimum_payment, interest_charged, account_balance, credit_limit, available_credit, estimated_payoff_years, estimated_payoff_months, credits_total, debits_total, statement_payload_json, opening_balance_cents, opening_balance_date, closing_balance_cents, closing_balance_date, total_debits_cents, total_credits_cents, account_type, account_number_masked, currency_code, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'llamaextract_jobs', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, CURRENT_TIMESTAMP)",
+        )
+        .bind(&new_id)
+        .bind(account_id)
+        .bind(period_start)
+        .bind(period_end)
+        .bind(statement_context.get("statement_month").and_then(|v| v.as_str()))
+        .bind(lineage.get("job_id").and_then(|v| v.as_str()))
+        .bind(lineage.get("run_id").and_then(|v| v.as_str()))
+        .bind(lineage.to_string())
+        .bind(
+            statement_context
+                .get("schema_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("statement_v2"),
+        )
+        .bind(statement_context.get("period_start").and_then(|v| v.as_str()))
+        .bind(statement_context.get("period_end").and_then(|v| v.as_str()))
+        .bind(payload_snapshot.get("statement_date").and_then(|v| v.as_str()))
+        .bind(
+            payload_snapshot
+                .get("account_details")
+                .and_then(|v| v.get("account_number_ending"))
+                .and_then(|v| v.as_str()),
+        )
+        .bind(
+            payload_snapshot
+                .get("account_details")
+                .and_then(|v| v.get("customer_name"))
+                .and_then(|v| v.as_str()),
+        )
+        .bind(
+            payload_snapshot
+                .get("due_this_statement")
+                .and_then(|v| v.get("payment_due_date"))
+                .and_then(|v| v.as_str()),
+        )
+        .bind(
+            payload_snapshot
+                .get("due_this_statement")
+                .and_then(|v| v.get("total_minimum_payment"))
+                .and_then(|v| v.as_f64()),
+        )
+        .bind(statement_summary.get("interest_charged").and_then(|v| v.as_f64()))
+        .bind(statement_summary.get("account_balance").and_then(|v| v.as_f64()))
+        .bind(statement_summary.get("credit_limit").and_then(|v| v.as_f64()))
+        .bind(statement_summary.get("available_credit").and_then(|v| v.as_f64()))
+        .bind(
+            payload_snapshot
+                .get("interest_information")
+                .and_then(|v| v.get("estimated_payoff_time"))
+                .and_then(|v| v.get("years"))
+                .and_then(|v| v.as_i64()),
+        )
+        .bind(
+            payload_snapshot
+                .get("interest_information")
+                .and_then(|v| v.get("estimated_payoff_time"))
+                .and_then(|v| v.get("months"))
+                .and_then(|v| v.as_i64()),
+        )
+        .bind(
+            payload_snapshot
+                .get("transaction_subtotals")
+                .and_then(|v| v.get("credits_total"))
+                .and_then(|v| v.as_f64()),
+        )
+        .bind(
+            payload_snapshot
+                .get("transaction_subtotals")
+                .and_then(|v| v.get("debits_total"))
+                .and_then(|v| v.as_f64()),
+        )
+        .bind(payload_snapshot.to_string())
+        .bind(statement_summary.get("opening_balance_cents").and_then(|v| v.as_i64()))
+        .bind(
+            statement_summary
+                .get("opening_balance_date")
+                .and_then(|v| v.as_str()),
+        )
+        .bind(statement_summary.get("closing_balance_cents").and_then(|v| v.as_i64()))
+        .bind(
+            statement_summary
+                .get("closing_balance_date")
+                .and_then(|v| v.as_str()),
+        )
+        .bind(statement_summary.get("total_debits_cents").and_then(|v| v.as_i64()))
+        .bind(statement_summary.get("total_credits_cents").and_then(|v| v.as_i64()))
+        .bind(
+            payload_snapshot
+                .get("account_details")
+                .and_then(|v| v.get("account_type"))
+                .and_then(|v| v.as_str()),
+        )
+        .bind(statement_summary.get("account_number_masked").and_then(|v| v.as_str()))
+        .bind(statement_summary.get("currency_code").and_then(|v| v.as_str()))
+        .execute(tx.as_mut())
+        .await?;
+        new_id
+    };
+    Ok(Some(statement_id))
+}
+
 fn is_valid_iso_date(value: &str) -> bool {
     chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
 }
@@ -1245,13 +1820,13 @@ pub async fn query_transactions(
     query: TransactionQuery,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let mut base = String::from(
-        "SELECT t.id, t.account_id, t.description, t.amount_cents, t.booked_at, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.direction, 'unknown') AS direction, t.direction_confidence, COALESCE(t.direction_source, 'legacy') AS direction_source FROM transactions t WHERE 1=1",
+        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE 1=1",
     );
 
     let mut binds: Vec<String> = Vec::new();
 
     if let Some(q) = query.q {
-        base.push_str(" AND lower(t.description) LIKE lower(?)");
+        base.push_str(" AND lower(COALESCE(t.details, t.description, '')) LIKE lower(?)");
         binds.push(format!("%{q}%"));
     }
     if let Some(account_id) = query.account_id {
@@ -1263,15 +1838,15 @@ pub async fn query_transactions(
         binds.push(source);
     }
     if let Some(date_from) = query.date_from {
-        base.push_str(" AND date(t.booked_at) >= date(?)");
+        base.push_str(" AND date(COALESCE(t.transaction_date, t.booked_at)) >= date(?)");
         binds.push(date_from);
     }
     if let Some(date_to) = query.date_to {
-        base.push_str(" AND date(t.booked_at) <= date(?)");
+        base.push_str(" AND date(COALESCE(t.transaction_date, t.booked_at)) <= date(?)");
         binds.push(date_to);
     }
 
-    base.push_str(" ORDER BY t.booked_at DESC, t.created_at DESC LIMIT ? OFFSET ?");
+    base.push_str(" ORDER BY COALESCE(t.transaction_date, t.booked_at) DESC, t.created_at DESC LIMIT ? OFFSET ?");
 
     let mut sql = sqlx::query(&base);
     for bind in binds {
@@ -1287,9 +1862,9 @@ pub async fn query_transactions(
         .map(|row| TransactionListItem {
             id: row.get("id"),
             account_id: row.get("account_id"),
-            description: row.get("description"),
-            amount_cents: row.get("amount_cents"),
-            booked_at: row.get("booked_at"),
+            details: row.get("details"),
+            amount: row.get("amount"),
+            transaction_date: row.get("transaction_date"),
             source: row.get("source"),
             classification_source: row.get("classification_source"),
             confidence: row.get("confidence"),
@@ -1297,15 +1872,15 @@ pub async fn query_transactions(
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
             statement_id: row.get("statement_id"),
-            direction: row.get("direction"),
-            direction_confidence: row.get("direction_confidence"),
-            direction_source: row.get("direction_source"),
+            tx_type: row.get("type"),
         })
         .collect())
 }
 
 pub async fn list_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AccountItem>> {
-    let rows = sqlx::query("SELECT id, name, currency_code FROM accounts ORDER BY name ASC")
+    let rows = sqlx::query(
+        "SELECT id, name, currency_code, account_type, account_number_ending, customer_name, COALESCE(metadata_json, '{}') AS metadata_json FROM accounts ORDER BY name ASC",
+    )
         .fetch_all(pool)
         .await?;
 
@@ -1315,6 +1890,11 @@ pub async fn list_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AccountItem>
             id: row.get("id"),
             name: row.get("name"),
             currency_code: row.get("currency_code"),
+            account_type: row.get("account_type"),
+            account_number_ending: row.get("account_number_ending"),
+            customer_name: row.get("customer_name"),
+            metadata_json: serde_json::from_str(row.get::<String, _>("metadata_json").as_str())
+                .unwrap_or_else(|_| serde_json::json!({})),
         })
         .collect())
 }
@@ -1437,6 +2017,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_direction_and_statement_summary",
         include_str!("../../../migrations/0006_direction_and_statement_summary.sql"),
     ),
+    (
+        "0007_statement_v2_schema_first",
+        include_str!("../../../migrations/0007_statement_v2_schema_first.sql"),
+    ),
+    (
+        "0008_import_card_resolution",
+        include_str!("../../../migrations/0008_import_card_resolution.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -1483,7 +2071,9 @@ mod tests {
     async fn run_migrations_recovers_when_schema_migrations_is_truncated() {
         let db_path = temp_db_path();
         let pool = connect(&db_path).await.expect("connect should succeed");
-        run_migrations(&pool).await.expect("initial migrations should pass");
+        run_migrations(&pool)
+            .await
+            .expect("initial migrations should pass");
 
         sqlx::query("DELETE FROM schema_migrations")
             .execute(&pool)
@@ -1520,6 +2110,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-1".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -1588,6 +2179,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-2".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -1729,7 +2321,7 @@ mod tests {
         .expect("query transactions");
 
         assert_eq!(only_coffee.len(), 1);
-        assert_eq!(only_coffee[0].description, "Coffee Shop");
+        assert_eq!(only_coffee[0].details.as_deref(), Some("Coffee Shop"));
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -1782,6 +2374,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-3".to_string(),
                 extraction_mode: Some("managed".to_string()),
+                resolved_account_id: None,
             },
         )
         .await
@@ -1902,9 +2495,7 @@ mod tests {
             .await
             .expect("migration should succeed");
 
-        let initial = get_llama_agent_cache(&pool)
-            .await
-            .expect("read cache");
+        let initial = get_llama_agent_cache(&pool).await.expect("read cache");
         assert!(initial.is_none());
 
         let saved = upsert_llama_agent_cache(&pool, "agent-123", "statement_v1")
@@ -2030,6 +2621,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-link".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -2074,9 +2666,7 @@ mod tests {
         .await
         .expect("insert import row");
 
-        let committed = commit_import_rows(&pool, &import_id)
-            .await
-            .expect("commit");
+        let committed = commit_import_rows(&pool, &import_id).await.expect("commit");
         assert_eq!(committed.inserted_count, 1);
 
         let saved = sqlx::query(
@@ -2095,7 +2685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_import_rows_blocks_unknown_direction() {
+    async fn commit_import_rows_allows_unknown_direction_rows() {
         let db_path = temp_db_path();
         let pool = connect(&db_path).await.expect("connect should succeed");
         run_migrations(&pool)
@@ -2110,6 +2700,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-direction".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -2156,12 +2747,10 @@ mod tests {
         .await
         .expect("insert import rows");
 
-        let err = commit_import_rows(&pool, &import_id)
+        let result = commit_import_rows(&pool, &import_id)
             .await
-            .expect_err("unknown direction should block commit");
-        assert!(err
-            .to_string()
-            .contains("IMPORT_REVIEW_REQUIRED_UNKNOWN_DIRECTION"));
+            .expect("unknown direction rows should commit");
+        assert_eq!(result.inserted_count, 2);
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -2183,6 +2772,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-defaults".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -2210,9 +2800,7 @@ mod tests {
         .await
         .expect("insert import row");
 
-        commit_import_rows(&pool, &import_id)
-            .await
-            .expect("commit");
+        commit_import_rows(&pool, &import_id).await.expect("commit");
 
         let row = sqlx::query(
             "SELECT booked_at, amount_cents, description, direction, direction_source FROM transactions WHERE account_id = ?1 AND external_txn_id = 'dir-hash-default'",
@@ -2230,7 +2818,7 @@ mod tests {
         assert_eq!(amount_cents, 0);
         assert_eq!(description, "Unknown transaction");
         assert_eq!(direction, "debit");
-        assert_eq!(direction_source, "manual");
+        assert_eq!(direction_source, "legacy");
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -2252,6 +2840,7 @@ mod tests {
                 content_base64: "".to_string(),
                 source_hash: "hash-review-direction".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -2339,6 +2928,7 @@ mod tests {
                 account_type: Some("chequing".to_string()),
                 account_number_masked: Some("****1234".to_string()),
                 currency_code: Some("CAD".to_string()),
+                ..StatementSummaryInput::default()
             },
         )
         .await
@@ -2485,7 +3075,7 @@ mod tests {
             .await
             .expect("list statement tx");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].description, "Linked 1");
+        assert_eq!(rows[0].details.as_deref(), Some("Linked 1"));
         assert_eq!(rows[0].statement_id.as_deref(), Some(statement.id.as_str()));
 
         drop(pool);

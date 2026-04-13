@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Spendora Desktop",
+  "productName": "Spendora",
   "version": "0.1.0",
   "identifier": "com.spendora.desktop",
   "build": {
@@ -29,6 +29,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
   }
 }

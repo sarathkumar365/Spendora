@@ -24,6 +24,10 @@ type AccountItem = {
   id: string;
   name: string;
   currency_code: string;
+  account_type?: string | null;
+  account_number_ending?: string | null;
+  customer_name?: string | null;
+  metadata_json?: Record<string, unknown>;
 };
 
 type StatementItem = {
@@ -32,6 +36,22 @@ type StatementItem = {
   period_start: string;
   period_end: string;
   linked_txn_count: number;
+  statement_period_start?: string | null;
+  statement_period_end?: string | null;
+  statement_date?: string | null;
+  account_number_ending?: string | null;
+  customer_name?: string | null;
+  payment_due_date?: string | null;
+  total_minimum_payment?: number | null;
+  interest_charged?: number | null;
+  account_balance?: number | null;
+  credit_limit?: number | null;
+  available_credit?: number | null;
+  estimated_payoff_years?: number | null;
+  estimated_payoff_months?: number | null;
+  credits_total?: number | null;
+  debits_total?: number | null;
+  statement_payload_json?: Record<string, unknown>;
   opening_balance_cents?: number | null;
   opening_balance_date?: string | null;
   closing_balance_cents?: number | null;
@@ -43,17 +63,21 @@ type StatementItem = {
   currency_code?: string | null;
 };
 
-type DirectionValue = "debit" | "credit" | "transfer" | "reversal" | "unknown";
+type DirectionValue = "debit" | "credit" | "unknown";
 
 type TransactionItem = {
   id: string;
-  description: string;
-  booked_at: string;
-  amount_cents: number;
+  details?: string | null;
+  transaction_date?: string | null;
+  amount?: string | null;
+  tx_type?: DirectionValue | null;
   source: string;
-  direction?: DirectionValue;
-  direction_source?: string;
-  direction_confidence?: number | null;
+  classification_source: string;
+  confidence: number;
+  explanation: string;
+  last_sync_at: string;
+  import_id?: string | null;
+  statement_id?: string | null;
 };
 
 type CoverageSelected = {
@@ -93,6 +117,7 @@ type CoverageResponse = {
 type ImportStatus =
   | "queued"
   | "parsing"
+  | "pending_card_resolution"
   | "review_required"
   | "ready_to_commit"
   | "committed"
@@ -109,6 +134,15 @@ type ImportStatusEnvelope = {
   errors: string[];
   warnings: string[];
   review_required_count: number;
+  resolved_account_id?: string | null;
+  card_resolution_status?: "pending" | "resolved";
+  card_resolution_reason?: string | null;
+  card_resolution_metadata?: {
+    account_type?: string | null;
+    account_number_ending?: string | null;
+    customer_name?: string | null;
+    [key: string]: unknown;
+  };
 };
 
 type ReviewRow = {
@@ -119,9 +153,9 @@ type ReviewRow = {
   direction_source: string;
   direction_confidence?: number | null;
   normalized_json: {
-    booked_at?: string;
-    description?: string;
-    amount_cents?: number;
+    transaction_date?: string;
+    details?: string;
+    amount?: number;
     [key: string]: unknown;
   };
   confidence: number;
@@ -140,6 +174,20 @@ type CreateImportResponse = {
 };
 
 type ImportStage = "idle" | "polling" | "results" | "failed";
+
+type ImportCardResolutionEnvelope = {
+  import_id: string;
+  card_resolution_status: "pending" | "resolved";
+  resolved_account_id?: string | null;
+  card_resolution_reason?: string | null;
+  card_resolution_metadata: {
+    account_type?: string | null;
+    account_number_ending?: string | null;
+    customer_name?: string | null;
+    [key: string]: unknown;
+  };
+  candidate_accounts: AccountItem[];
+};
 
 function resolveApiBaseUrl() {
   const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
@@ -200,6 +248,8 @@ function importStatusTitle(status: ImportStatus | null) {
       return "Extracting transactions";
     case "review_required":
       return "Review required";
+    case "pending_card_resolution":
+      return "Card selection required";
     case "ready_to_commit":
       return "Ready to commit";
     case "committed":
@@ -225,6 +275,9 @@ function importStatusMessage(status: ImportStatusEnvelope | null) {
   if (status.status === "review_required") {
     return "Extraction finished. Please review flagged rows before commit.";
   }
+  if (status.status === "pending_card_resolution") {
+    return "Extraction finished. Select an existing card or add a new card before commit.";
+  }
   if (status.status === "ready_to_commit") {
     return "Extraction finished. Ready to commit reviewed rows.";
   }
@@ -236,7 +289,13 @@ function importStatusMessage(status: ImportStatusEnvelope | null) {
 }
 
 function isTerminalImportStatus(status: ImportStatus) {
-  return status === "review_required" || status === "ready_to_commit" || status === "failed" || status === "committed";
+  return (
+    status === "review_required" ||
+    status === "pending_card_resolution" ||
+    status === "ready_to_commit" ||
+    status === "failed" ||
+    status === "committed"
+  );
 }
 
 function monthLabel(month: number) {
@@ -245,6 +304,21 @@ function monthLabel(month: number) {
 
 function formatMoney(cents: number) {
   return `$${(cents / 100).toFixed(2)}`;
+}
+
+function parseAmountToCents(value?: string | null) {
+  if (!value) {
+    return 0;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.round(parsed * 100);
+}
+
+function formatAmountFromText(value?: string | null) {
+  return formatMoney(parseAmountToCents(value));
 }
 
 function inferParserType(fileName: string) {
@@ -278,8 +352,6 @@ function toStringArray(value: unknown): string[] {
 const DIRECTION_OPTIONS: DirectionValue[] = [
   "debit",
   "credit",
-  "transfer",
-  "reversal",
   "unknown"
 ];
 
@@ -290,9 +362,7 @@ function normalizeDirection(value: unknown): DirectionValue {
   const normalized = value.trim().toLowerCase();
   if (
     normalized === "debit" ||
-    normalized === "credit" ||
-    normalized === "transfer" ||
-    normalized === "reversal"
+    normalized === "credit"
   ) {
     return normalized;
   }
@@ -339,6 +409,13 @@ export function App() {
   const [activeImportId, setActiveImportId] = React.useState<string | null>(null);
   const [activeImportStatus, setActiveImportStatus] = React.useState<ImportStatusEnvelope | null>(null);
   const [reviewRows, setReviewRows] = React.useState<ReviewRow[]>([]);
+  const [cardResolution, setCardResolution] = React.useState<ImportCardResolutionEnvelope | null>(null);
+  const [selectedResolutionAccountId, setSelectedResolutionAccountId] = React.useState<string>("");
+  const [newCardName, setNewCardName] = React.useState("");
+  const [newCardType, setNewCardType] = React.useState("");
+  const [newCardLast4, setNewCardLast4] = React.useState("");
+  const [newCardCustomerName, setNewCardCustomerName] = React.useState("");
+  const [isResolvingCard, setIsResolvingCard] = React.useState(false);
   const [commitResult, setCommitResult] = React.useState<CommitResult | null>(null);
   const [importError, setImportError] = React.useState<string | null>(null);
   const [isSubmittingImport, setIsSubmittingImport] = React.useState(false);
@@ -348,6 +425,11 @@ export function App() {
   const coverageExists = coverage?.statement_exists ?? false;
   const selectedMonthToken = importYear !== null && importMonth !== null ? `${importYear}-${String(importMonth).padStart(2, "0")}` : null;
   const unresolvedDirectionCount = reviewRows.filter((row) => row.direction === "unknown").length;
+  const cardResolved =
+    activeImportStatus?.card_resolution_status === undefined ||
+    activeImportStatus?.card_resolution_status === "resolved" ||
+    activeImportStatus?.status === "ready_to_commit" ||
+    activeImportStatus?.status === "committed";
   const activeQualityMetrics =
     (activeImportStatus?.summary?.quality_metrics as Record<string, unknown> | undefined) ??
     (activeImportStatus?.diagnostics?.quality_metrics as Record<string, unknown> | undefined) ??
@@ -361,18 +443,21 @@ export function App() {
   const qualityReconciliationFailCount = Number(activeQualityMetrics?.reconciliation_fail_count ?? 0);
   const qualityReconciliationFailRate = Number(activeQualityMetrics?.reconciliation_fail_rate ?? 0);
   const selectedStatement = statements.find((item) => item.id === selectedStatementId) ?? null;
-  const dataUnknownCount = statementTransactions.filter((item) => (item.direction || "unknown") === "unknown").length;
+  const dataUnknownCount = statementTransactions.filter((item) => (item.tx_type || "unknown") === "unknown").length;
   const dataConflictCount = statementTransactions.filter((item) => {
-    const direction = item.direction || "unknown";
+    const direction = item.tx_type || "unknown";
+    const amountCents = parseAmountToCents(item.amount);
     if (direction === "debit") {
-      return item.amount_cents >= 0;
+      return amountCents >= 0;
     }
     if (direction === "credit") {
-      return item.amount_cents <= 0;
+      return amountCents <= 0;
     }
     return false;
   }).length;
-  const dataManualOverrideCount = statementTransactions.filter((item) => item.direction_source === "manual").length;
+  const dataManualOverrideCount = statementTransactions.filter(
+    (item) => item.classification_source === "manual"
+  ).length;
   const dataRowsTotal = statementTransactions.length;
   const dataUnknownRate = ratio(dataUnknownCount, dataRowsTotal);
   const dataConflictRate = ratio(dataConflictCount, dataRowsTotal);
@@ -396,14 +481,17 @@ export function App() {
     ) {
       return { status: "skipped", failCount: 0, totalChecks: 0 };
     }
-    const netMovement = statementTransactions.reduce((sum, item) => sum + item.amount_cents, 0);
+    const netMovement = statementTransactions.reduce(
+      (sum, item) => sum + parseAmountToCents(item.amount),
+      0
+    );
     const actualClosing = opening + netMovement;
     const actualDebits = statementTransactions
-      .filter((item) => (item.direction || "unknown") === "debit")
-      .reduce((sum, item) => sum + Math.abs(item.amount_cents), 0);
+      .filter((item) => (item.tx_type || "unknown") === "debit")
+      .reduce((sum, item) => sum + Math.abs(parseAmountToCents(item.amount)), 0);
     const actualCredits = statementTransactions
-      .filter((item) => (item.direction || "unknown") === "credit")
-      .reduce((sum, item) => sum + Math.abs(item.amount_cents), 0);
+      .filter((item) => (item.tx_type || "unknown") === "credit")
+      .reduce((sum, item) => sum + Math.abs(parseAmountToCents(item.amount)), 0);
     const tolerance = 1;
     const checks = [
       Math.abs(actualClosing - closing) <= tolerance,
@@ -616,9 +704,9 @@ export function App() {
       row_id: string;
       row_index: number;
       normalized_json: {
-        booked_at?: string;
-        description?: string;
-        amount_cents?: number;
+        transaction_date?: string;
+        details?: string;
+        amount?: number;
         [key: string]: unknown;
       };
       confidence: number;
@@ -639,12 +727,33 @@ export function App() {
           parse_error: row.parse_error,
           direction,
           initial_direction: direction,
-          direction_source: typeof row.direction_source === "string" ? row.direction_source : "legacy",
+          direction_source: typeof row.direction_source === "string" ? row.direction_source : "model",
           direction_confidence: typeof row.direction_confidence === "number" ? row.direction_confidence : null
         };
       })
     );
   }, []);
+
+  const loadCardResolution = React.useCallback(async (importId: string) => {
+    const payload = await apiFetchJson<ImportCardResolutionEnvelope>(
+      `/api/v1/imports/${encodeURIComponent(importId)}/card-resolution`
+    );
+    setCardResolution(payload);
+    setSelectedResolutionAccountId(payload.resolved_account_id ?? payload.candidate_accounts[0]?.id ?? "");
+    if (payload.card_resolution_metadata) {
+      setNewCardType(String(payload.card_resolution_metadata.account_type ?? ""));
+      setNewCardLast4(String(payload.card_resolution_metadata.account_number_ending ?? ""));
+      setNewCardCustomerName(String(payload.card_resolution_metadata.customer_name ?? ""));
+      if (!newCardName.trim()) {
+        const fallbackName = [payload.card_resolution_metadata.account_type, payload.card_resolution_metadata.account_number_ending]
+          .filter((part) => typeof part === "string" && String(part).trim().length > 0)
+          .join(" • ");
+        if (fallbackName) {
+          setNewCardName(fallbackName);
+        }
+      }
+    }
+  }, [newCardName]);
 
   const refreshImportStatus = React.useCallback(
     async (importId: string) => {
@@ -655,17 +764,24 @@ export function App() {
 
       if (status.status === "review_required" || status.status === "ready_to_commit") {
         await loadReviewRows(importId);
+        setCardResolution(null);
+        setSelectedResolutionAccountId("");
+        setImportStage("results");
+      } else if (status.status === "pending_card_resolution") {
+        await loadReviewRows(importId);
+        await loadCardResolution(importId);
         setImportStage("results");
       } else if (status.status === "failed") {
         setImportStage("failed");
         setImportError(status.errors[0] ?? "Import failed.");
       } else if (status.status === "committed") {
         setImportStage("results");
+        setCardResolution(null);
       }
 
       return status;
     },
-    [loadReviewRows]
+    [loadCardResolution, loadReviewRows]
   );
 
   React.useEffect(() => {
@@ -704,6 +820,13 @@ export function App() {
     setActiveImportId(null);
     setActiveImportStatus(null);
     setReviewRows([]);
+    setCardResolution(null);
+    setSelectedResolutionAccountId("");
+    setNewCardName("");
+    setNewCardType("");
+    setNewCardLast4("");
+    setNewCardCustomerName("");
+    setIsResolvingCard(false);
     setCommitResult(null);
     setImportError(null);
     setSelectedFile(null);
@@ -803,6 +926,75 @@ export function App() {
       setIsSavingReview(false);
     }
   }, [activeImportId, refreshImportStatus, reviewRows]);
+
+  const resolveWithExistingCard = React.useCallback(async () => {
+    if (!activeImportId || !selectedResolutionAccountId) {
+      return;
+    }
+    setIsResolvingCard(true);
+    setImportError(null);
+    try {
+      await apiFetchJson<ImportCardResolutionEnvelope>(
+        `/api/v1/imports/${encodeURIComponent(activeImportId)}/card-resolution`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            account_id: selectedResolutionAccountId
+          })
+        }
+      );
+      await refreshImportStatus(activeImportId);
+    } catch (error) {
+      setImportError(String(error));
+    } finally {
+      setIsResolvingCard(false);
+    }
+  }, [activeImportId, refreshImportStatus, selectedResolutionAccountId]);
+
+  const createAndResolveCard = React.useCallback(async () => {
+    if (!activeImportId || !newCardName.trim()) {
+      setImportError("Card name is required to create a new card.");
+      return;
+    }
+    setIsResolvingCard(true);
+    setImportError(null);
+    try {
+      await apiFetchJson<ImportCardResolutionEnvelope>(
+        `/api/v1/imports/${encodeURIComponent(activeImportId)}/card-resolution`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            new_account: {
+              name: newCardName.trim(),
+              currency_code: "CAD",
+              account_type: newCardType.trim() || null,
+              account_number_ending: newCardLast4.trim() || null,
+              customer_name: newCardCustomerName.trim() || null,
+              metadata_json: { source: "ui_manual_resolution" }
+            }
+          })
+        }
+      );
+      await refreshImportStatus(activeImportId);
+    } catch (error) {
+      setImportError(String(error));
+    } finally {
+      setIsResolvingCard(false);
+    }
+  }, [
+    activeImportId,
+    newCardCustomerName,
+    newCardLast4,
+    newCardName,
+    newCardType,
+    refreshImportStatus
+  ]);
 
   const commitImport = React.useCallback(async () => {
     if (!activeImportId) {
@@ -1070,7 +1262,7 @@ export function App() {
                       <strong>{Number(activeImportStatus?.summary?.parsed_rows ?? 0)}</strong>
                     </div>
                     <div>
-                      <span>Review Required</span>
+                      <span>Unresolved Direction</span>
                       <strong>{unresolvedDirectionCount}</strong>
                     </div>
                     <div>
@@ -1089,6 +1281,28 @@ export function App() {
                       <span>Mode</span>
                       <strong>{activeImportStatus?.extraction_mode || "managed"}</strong>
                     </div>
+                  </div>
+                  <div className="quality-card">
+                    <strong>Card Resolution</strong>
+                    <small>
+                      Status: {activeImportStatus?.card_resolution_status || "pending"}
+                      {activeImportStatus?.resolved_account_id
+                        ? ` · Account ${activeImportStatus.resolved_account_id}`
+                        : ""}
+                    </small>
+                    {activeImportStatus?.card_resolution_metadata?.account_type ? (
+                      <small>
+                        Extracted: {String(activeImportStatus.card_resolution_metadata.account_type)}
+                        {activeImportStatus.card_resolution_metadata.account_number_ending
+                          ? ` • ****${String(activeImportStatus.card_resolution_metadata.account_number_ending)}`
+                          : ""}
+                        {activeImportStatus.card_resolution_metadata.customer_name
+                          ? ` • ${String(activeImportStatus.card_resolution_metadata.customer_name)}`
+                          : ""}
+                      </small>
+                    ) : (
+                      <small>No strong card metadata extracted from this statement.</small>
+                    )}
                   </div>
                   {activeQualityMetrics ? (
                     <div className="quality-card">
@@ -1134,6 +1348,90 @@ export function App() {
 
                   {importError ? <p className="error-text">{importError}</p> : null}
 
+                  {activeImportStatus?.status === "pending_card_resolution" && cardResolution ? (
+                    <section className="panel card-resolution-panel">
+                      <h4>Select Card For This Import</h4>
+                      <p className="muted">
+                        Choose an existing card or add a new one. Commit is locked until this is resolved.
+                      </p>
+                      <div className="card-resolution-grid">
+                        <div className="card-resolution-col">
+                          <label className="field compact">
+                            <span>Existing cards</span>
+                            <select
+                              className="input"
+                              value={selectedResolutionAccountId}
+                              onChange={(event) => setSelectedResolutionAccountId(event.target.value)}
+                            >
+                              <option value="">Select card</option>
+                              {cardResolution.candidate_accounts.map((account) => (
+                                <option key={account.id} value={account.id}>
+                                  {account.name}
+                                  {account.account_number_ending
+                                    ? ` • ****${account.account_number_ending}`
+                                    : ""}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            className="button"
+                            disabled={isResolvingCard || !selectedResolutionAccountId}
+                            onClick={() => void resolveWithExistingCard()}
+                          >
+                            {isResolvingCard ? "Resolving..." : "Use Selected Card"}
+                          </button>
+                        </div>
+                        <div className="card-resolution-col">
+                          <label className="field compact">
+                            <span>New card name</span>
+                            <input
+                              className="input"
+                              value={newCardName}
+                              onChange={(event) => setNewCardName(event.target.value)}
+                              placeholder="e.g. Scotia Scene Visa"
+                            />
+                          </label>
+                          <label className="field compact">
+                            <span>Card type</span>
+                            <input
+                              className="input"
+                              value={newCardType}
+                              onChange={(event) => setNewCardType(event.target.value)}
+                              placeholder="e.g. Scotiabank Scene+ Visa Card"
+                            />
+                          </label>
+                          <label className="field compact">
+                            <span>Last 4 digits</span>
+                            <input
+                              className="input"
+                              value={newCardLast4}
+                              onChange={(event) => setNewCardLast4(event.target.value)}
+                              placeholder="1234"
+                              maxLength={8}
+                            />
+                          </label>
+                          <label className="field compact">
+                            <span>Customer name</span>
+                            <input
+                              className="input"
+                              value={newCardCustomerName}
+                              onChange={(event) => setNewCardCustomerName(event.target.value)}
+                              placeholder="Primary card holder"
+                            />
+                          </label>
+                          <button
+                            className="button ghost"
+                            disabled={isResolvingCard || !newCardName.trim()}
+                            onClick={() => void createAndResolveCard()}
+                          >
+                            {isResolvingCard ? "Creating..." : "Create And Use New Card"}
+                          </button>
+                        </div>
+                      </div>
+                    </section>
+                  ) : null}
+
                   <div className="upload-actions">
                     <button className="button ghost" onClick={resetImportSession}>
                       Create New Import
@@ -1147,7 +1445,8 @@ export function App() {
                       disabled={
                         isCommittingImport ||
                         activeImportStatus?.status === "failed" ||
-                        unresolvedDirectionCount > 0
+                        unresolvedDirectionCount > 0 ||
+                        !cardResolved
                       }
                     >
                       {isCommittingImport ? "Committing..." : "Commit Import"}
@@ -1156,6 +1455,11 @@ export function App() {
                   {unresolvedDirectionCount > 0 ? (
                     <p className="error-text">
                       Resolve direction for all rows before commit. Unresolved rows: {unresolvedDirectionCount}
+                    </p>
+                  ) : null}
+                  {!cardResolved ? (
+                    <p className="error-text">
+                      Resolve card selection before commit.
                     </p>
                   ) : null}
                 </article>
@@ -1170,10 +1474,10 @@ export function App() {
                         <li key={row.row_id} className="review-row">
                           <div className="review-row-main">
                             <strong>
-                              #{row.row_index} · {row.normalized_json.description || "(no description)"}
+                              #{row.row_index} · {row.normalized_json.details || "(no details)"}
                             </strong>
                             <small>
-                              {row.normalized_json.booked_at || "(no date)"} · {formatMoney(Number(row.normalized_json.amount_cents || 0))} · confidence {row.confidence.toFixed(2)}
+                              {row.normalized_json.transaction_date || "(no date)"} · {formatMoney(Number((row.normalized_json.amount || 0) * 100))} · confidence {row.confidence.toFixed(2)}
                             </small>
                             <small>
                               Direction source: {row.direction_source}
@@ -1263,6 +1567,48 @@ export function App() {
 
               <div className="panel inset">
                 <h3>Transactions</h3>
+                {selectedStatement ? (
+                  <div className="quality-card">
+                    <strong>Statement details</strong>
+                    <small>
+                      Period: {selectedStatement.statement_period_start || selectedStatement.period_start} to{" "}
+                      {selectedStatement.statement_period_end || selectedStatement.period_end}
+                    </small>
+                    {selectedStatement.statement_date ? (
+                      <small>Statement date: {selectedStatement.statement_date}</small>
+                    ) : null}
+                    {selectedStatement.account_type || selectedStatement.account_number_ending ? (
+                      <small>
+                        Account: {selectedStatement.account_type || "Card"}
+                        {selectedStatement.account_number_ending
+                          ? ` • ****${selectedStatement.account_number_ending}`
+                          : ""}
+                      </small>
+                    ) : null}
+                    {selectedStatement.payment_due_date ||
+                    selectedStatement.total_minimum_payment !== null ? (
+                      <small>
+                        Due: {selectedStatement.payment_due_date || "n/a"} • Minimum:{" "}
+                        {typeof selectedStatement.total_minimum_payment === "number"
+                          ? `$${selectedStatement.total_minimum_payment.toFixed(2)}`
+                          : "n/a"}
+                      </small>
+                    ) : null}
+                    {typeof selectedStatement.account_balance === "number" ||
+                    typeof selectedStatement.available_credit === "number" ? (
+                      <small>
+                        Balance:{" "}
+                        {typeof selectedStatement.account_balance === "number"
+                          ? `$${selectedStatement.account_balance.toFixed(2)}`
+                          : "n/a"}{" "}
+                        • Available:{" "}
+                        {typeof selectedStatement.available_credit === "number"
+                          ? `$${selectedStatement.available_credit.toFixed(2)}`
+                          : "n/a"}
+                      </small>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className="quality-card">
                   <strong>Quality</strong>
                   <small>
@@ -1284,15 +1630,14 @@ export function App() {
                     {statementTransactions.map((transaction) => (
                       <li key={transaction.id} className="txn-row">
                         <div>
-                          <strong>{transaction.description}</strong>
+                          <strong>{transaction.details || "(no details)"}</strong>
                           <small>
-                            {transaction.booked_at} · {transaction.direction || "unknown"} · {transaction.direction_source || "legacy"}
-                            {typeof transaction.direction_confidence === "number"
-                              ? ` · ${transaction.direction_confidence.toFixed(2)}`
-                              : ""}
+                            {transaction.transaction_date || "(no date)"} ·{" "}
+                            {transaction.tx_type || "unknown"} ·{" "}
+                            {transaction.classification_source || "manual"}
                           </small>
                         </div>
-                        <div className="amount">{formatMoney(transaction.amount_cents)}</div>
+                        <div className="amount">{formatAmountFromText(transaction.amount)}</div>
                       </li>
                     ))}
                   </ul>

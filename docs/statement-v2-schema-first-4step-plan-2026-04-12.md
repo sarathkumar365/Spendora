@@ -22,28 +22,39 @@ Implement the migration in 4 phases so we can safely move from the current inter
 
 ### Step 3: Account/Card Tracking and Linking
 - Use `accounts` as card entities (no new cards table).
-- Add/normalize account metadata fields needed for card identity (`account_type`, `account_number_ending`, `customer_name`).
-- Update import flow to resolve-or-create account per card fingerprint, then link statement + transaction rows to that `account_id`.
-- Replace practical single-manual-account behavior for statement imports with account-per-card behavior.
+- Keep extracted account metadata on statements/imports (`account_type`, `account_number_ending`, `customer_name`) for matching context and audit.
+- Do not use `account_number_ending` (last4) as a standalone identity key for auto-linking.
+- Add explicit card-resolution workflow in import pipeline:
+  - if extraction metadata maps with high confidence to one existing account, auto-link;
+  - otherwise mark import as `pending_card_resolution` and require user action: `select existing card` or `add new card`.
+- Do not create fallback/unknown-card records when account metadata is missing.
+- Persist resolution decision (`resolved_account_id`, resolution source, timestamp) and then link statement + transaction rows to that account.
 
 ### Step 4: API, Review/Commit Behavior, and Hardening
 - Update statements APIs to expose all new optional schema fields immediately.
 - Update transactions APIs to schema-native fields (`transaction_date`, `details`, `amount`, `type`).
 - Allow commit with partial transaction rows (nullable transaction fields), preserving parse flags so users decide based on available details.
+- Add API support for card resolution flow:
+  - list existing cards/accounts for selection,
+  - create new card/account from user input,
+  - resolve a pending import to an account before commit/finalization,
+  - expose import resolution status and required action.
 - Add regression coverage for:
   - schema contract loading,
   - migration integrity,
   - partial-row extraction + commit,
-  - per-card account resolution and statement linkage,
+  - pending card-resolution state and account linkage after user decision,
   - API response shape changes.
 
 ### Test Scenarios
 - Full valid statement import persists all sections and links to correct account/card.
 - Partial statement import (missing transaction fields) still extracts and commits.
-- Re-import of same card reuses same `account_id`; different last4/type creates new account row.
+- Import with low-confidence/no account metadata is held in pending resolution until user selects/adds a card.
+- After user card resolution, statement + transactions link to selected/new `account_id`.
 - API responses include new statement fields and renamed transaction fields.
 
 ### Assumptions
 - `transactions.amount` is stored as exact decimal text.
 - `type` domain is `credit|debit` for Statement V2.
 - New fields are optional in DB/API even if extraction schema marks them required.
+- Desktop app is single-user; account/card identity is local to that user context.

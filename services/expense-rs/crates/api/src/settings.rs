@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use storage_sqlite::{
     get_extraction_settings, upsert_extraction_settings, ExtractionSettings,
-    DEFAULT_MAX_PROVIDER_RETRIES, MAX_PROVIDER_TIMEOUT_MS,
-    MIN_PROVIDER_TIMEOUT_MS,
+    DEFAULT_MAX_PROVIDER_RETRIES, MAX_PROVIDER_TIMEOUT_MS, MIN_PROVIDER_TIMEOUT_MS,
 };
 
 use crate::state::AppState;
@@ -43,12 +42,12 @@ pub async fn put_extraction_settings_handler(
             "default_extraction_mode must be managed or local_ocr".to_string(),
         ));
     }
-    if payload.max_provider_retries < 1 || payload.max_provider_retries > DEFAULT_MAX_PROVIDER_RETRIES {
+    if payload.max_provider_retries < 1
+        || payload.max_provider_retries > DEFAULT_MAX_PROVIDER_RETRIES
+    {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "max_provider_retries must be between 1 and {DEFAULT_MAX_PROVIDER_RETRIES}"
-            ),
+            format!("max_provider_retries must be between 1 and {DEFAULT_MAX_PROVIDER_RETRIES}"),
         ));
     }
     if payload.provider_timeout_ms < MIN_PROVIDER_TIMEOUT_MS

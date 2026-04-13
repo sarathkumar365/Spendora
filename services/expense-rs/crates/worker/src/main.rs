@@ -16,12 +16,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::{net::SocketAddr, path::PathBuf};
 use storage_sqlite::{
-    claim_pending_job, clear_import_rows, connect, ensure_default_manual_account,
-    get_extraction_settings, get_import_content, get_llama_agent_cache, get_llama_agent_readiness,
-    insert_import_rows, mark_job_completed, mark_job_failed, run_migrations, upsert_or_get_statement,
-    update_import_extraction_result, update_import_status, upsert_llama_agent_cache,
-    upsert_llama_agent_readiness, LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
-    StatementSummaryInput,
+    claim_pending_job, clear_import_rows, connect, find_high_confidence_account_match,
+    get_extraction_settings, get_import_content, get_import_status, get_llama_agent_cache,
+    get_llama_agent_readiness, insert_import_rows, mark_job_completed, mark_job_failed,
+    run_migrations, set_import_card_resolution, update_import_extraction_result,
+    update_import_status, upsert_llama_agent_cache, upsert_llama_agent_readiness,
+    LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
 };
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -67,10 +67,32 @@ fn managed_flow_mode_from_env() -> ManagedFlowMode {
         Some("legacy") => ManagedFlowMode::Legacy,
         Some("new") | None => ManagedFlowMode::New,
         Some(value) => {
-            warn!(mode = value, "invalid EXTRACTION_MANAGED_FLOW_MODE; defaulting to new");
+            warn!(
+                mode = value,
+                "invalid EXTRACTION_MANAGED_FLOW_MODE; defaulting to new"
+            );
             ManagedFlowMode::New
         }
     }
+}
+
+fn extract_card_resolution_metadata(diagnostics: &serde_json::Value) -> serde_json::Value {
+    let payload_snapshot = diagnostics
+        .get("provider_diagnostics")
+        .and_then(|v| v.get("payload_snapshot"))
+        .or_else(|| diagnostics.get("payload_snapshot"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let account_details = payload_snapshot
+        .get("account_details")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "account_type": account_details.get("account_type").and_then(|v| v.as_str()).map(|v| v.to_string()),
+        "account_number_ending": account_details.get("account_number_ending").and_then(|v| v.as_str()).map(|v| v.to_string()),
+        "customer_name": account_details.get("customer_name").and_then(|v| v.as_str()).map(|v| v.to_string()),
+        "source": "statement_payload",
+    })
 }
 
 #[tokio::main]
@@ -121,8 +143,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 fn validate_extraction_runtime_contract() -> anyhow::Result<()> {
-    let extraction_config = load_extraction_runtime_config_from_env()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let extraction_config =
+        load_extraction_runtime_config_from_env().map_err(|e| anyhow::anyhow!(e.to_string()))?;
     load_statement_blueprint_schema(&extraction_config.llama_schema_version)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(())
@@ -236,8 +258,12 @@ async fn ensure_llama_agent_ready(pool: &storage_sqlite::SqlitePool) -> anyhow::
 
     match ensure_llama_extraction_agent(&extraction_config, &schema).await {
         Ok(agent) => {
-            upsert_llama_agent_cache(pool, &agent.agent_id, &extraction_config.llama_schema_version)
-                .await?;
+            upsert_llama_agent_cache(
+                pool,
+                &agent.agent_id,
+                &extraction_config.llama_schema_version,
+            )
+            .await?;
             let readiness = new_readiness_record(
                 LlamaAgentReadinessState::Configured,
                 agent.agent_name,
@@ -304,21 +330,19 @@ async fn managed_readiness_snapshot(
         }
     };
 
-    let readiness = get_llama_agent_readiness(pool)
-        .await?
-        .unwrap_or_else(|| {
-            new_readiness_record(
-                LlamaAgentReadinessState::Missing,
-                connectors_ai::versioned_agent_name(
-                    &runtime.llama_agent_name,
-                    &runtime.llama_schema_version,
-                ),
-                runtime.llama_schema_version.clone(),
-                None,
-                Some("EXTRACTION_AGENT_NOT_READY".to_string()),
-                Some("llama agent readiness not initialized".to_string()),
-            )
-        });
+    let readiness = get_llama_agent_readiness(pool).await?.unwrap_or_else(|| {
+        new_readiness_record(
+            LlamaAgentReadinessState::Missing,
+            connectors_ai::versioned_agent_name(
+                &runtime.llama_agent_name,
+                &runtime.llama_schema_version,
+            ),
+            runtime.llama_schema_version.clone(),
+            None,
+            Some("EXTRACTION_AGENT_NOT_READY".to_string()),
+            Some("llama agent readiness not initialized".to_string()),
+        )
+    });
 
     let cache = get_llama_agent_cache(pool).await?;
     let cache_schema_matches = cache
@@ -399,7 +423,11 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         }));
 
         let blob = get_import_content(pool, &job_payload.import_id).await?;
-        let account_id = ensure_default_manual_account(pool).await?;
+        let import_status = get_import_status(pool, &job_payload.import_id).await?;
+        let resolved_account_id = import_status.resolved_account_id.clone();
+        let account_hash_seed = resolved_account_id
+            .clone()
+            .unwrap_or_else(|| format!("import-{}", job_payload.import_id));
         let decoded = STANDARD.decode(blob.content_base64.as_bytes())?;
         let settings = get_extraction_settings(pool).await?;
         info!(
@@ -421,11 +449,11 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             "managed_fallback_enabled": settings.managed_fallback_enabled,
         }));
 
-        let mut statement_id_for_rows: Option<String> = None;
         let mut extraction_quality_metrics = serde_json::json!({});
         let mut extraction_reconciliation = serde_json::json!({});
+        let mut card_resolution_metadata = serde_json::json!({});
         let parsed = if blob.parser_type == "csv" {
-            parse_csv(&decoded, &account_id)
+            parse_csv(&decoded, &account_hash_seed)
         } else if blob.parser_type == "pdf" {
             let extraction_mode = if blob.extraction_mode.trim().is_empty() {
                 settings.default_extraction_mode.clone()
@@ -436,7 +464,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             if extraction_mode == "local_ocr" {
                 let result = local_ocr_stub(&ExtractionRequest {
                     import_id: job_payload.import_id.clone(),
-                    account_id: account_id.clone(),
+                    account_id: account_hash_seed.clone(),
                     file_name: blob.file_name.clone(),
                     bytes: decoded,
                     max_provider_retries: settings.max_provider_retries,
@@ -531,7 +559,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             let extractor = ManagedExtractor::default();
             let request = ExtractionRequest {
                 import_id: job_payload.import_id.clone(),
-                account_id: account_id.clone(),
+                account_id: account_hash_seed.clone(),
                 file_name: blob.file_name.clone(),
                 bytes: decoded,
                 max_provider_retries: settings.max_provider_retries,
@@ -563,93 +591,6 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "errors_count": result.errors.len(),
             }));
 
-            if flow_mode == ManagedFlowMode::New {
-                let statement_context = result
-                    .diagnostics
-                    .get("statement_context")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let statement_summary = result
-                    .diagnostics
-                    .get("statement_summary")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let lineage = result
-                    .diagnostics
-                    .get("provider_lineage")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                if let (Some(period_start), Some(period_end)) = (
-                    statement_context.get("period_start").and_then(|v| v.as_str()),
-                    statement_context.get("period_end").and_then(|v| v.as_str()),
-                ) {
-                    if !period_start.is_empty() && !period_end.is_empty() {
-                        let statement = upsert_or_get_statement(
-                            pool,
-                            &account_id,
-                            period_start,
-                            period_end,
-                            statement_context
-                                .get("statement_month")
-                                .and_then(|v| v.as_str()),
-                            Some("llamaextract_jobs"),
-                            lineage.get("job_id").and_then(|v| v.as_str()),
-                            lineage.get("run_id").and_then(|v| v.as_str()),
-                            &lineage,
-                            statement_context
-                                .get("schema_version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("statement_v1"),
-                            StatementSummaryInput {
-                                opening_balance_cents: statement_summary
-                                    .get("opening_balance_cents")
-                                    .and_then(|v| v.as_i64()),
-                                opening_balance_date: statement_summary
-                                    .get("opening_balance_date")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string()),
-                                closing_balance_cents: statement_summary
-                                    .get("closing_balance_cents")
-                                    .and_then(|v| v.as_i64()),
-                                closing_balance_date: statement_summary
-                                    .get("closing_balance_date")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string()),
-                                total_debits_cents: statement_summary
-                                    .get("total_debits_cents")
-                                    .and_then(|v| v.as_i64()),
-                                total_credits_cents: statement_summary
-                                    .get("total_credits_cents")
-                                    .and_then(|v| v.as_i64()),
-                                account_type: statement_summary
-                                    .get("account_type")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string()),
-                                account_number_masked: statement_summary
-                                    .get("account_number_masked")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string()),
-                                currency_code: statement_summary
-                                    .get("currency_code")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.to_string()),
-                            },
-                        )
-                        .await?;
-                        statement_id_for_rows = Some(statement.id);
-                        log_bootstrap_event(serde_json::json!({
-                            "ts_utc": chrono::Utc::now().to_rfc3339(),
-                            "kind": "statement_upserted",
-                            "import_id": job_payload.import_id.clone(),
-                            "account_id": account_id.clone(),
-                            "statement_id": statement_id_for_rows.clone(),
-                            "period_start": period_start,
-                            "period_end": period_end,
-                        }));
-                    }
-                }
-            }
-
             let diagnostics = serde_json::json!({
                 "managed_flow_mode": flow_mode.as_str(),
                 "provider_lineage": result.diagnostics.get("provider_lineage").cloned().unwrap_or_else(|| serde_json::json!({})),
@@ -669,6 +610,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "provider_diagnostics": result.diagnostics.clone(),
                 "agent_readiness": readiness,
             });
+            card_resolution_metadata = extract_card_resolution_metadata(&diagnostics);
             extraction_quality_metrics = diagnostics
                 .get("quality_metrics")
                 .cloned()
@@ -724,7 +666,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 errors: result.errors,
             }
         } else {
-            parse_pdf(&decoded, &account_id)
+            parse_pdf(&decoded, &account_hash_seed)
         };
 
         clear_import_rows(pool, &job_payload.import_id).await?;
@@ -734,9 +676,9 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             .iter()
             .map(|row| {
                 let mut normalized_json = serde_json::json!({
-                    "booked_at": row.booked_at,
-                    "amount_cents": row.amount_cents,
-                    "description": row.description,
+                    "transaction_date": row.booked_at,
+                    "amount": row.amount_cents as f64 / 100.0,
+                    "details": row.description,
                 });
                 if let Some(metadata) = row.metadata.as_ref().and_then(|v| v.as_object()) {
                     if let Some(obj) = normalized_json.as_object_mut() {
@@ -752,8 +694,8 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                     confidence: row.confidence,
                     parse_error: row.parse_error.clone(),
                     normalized_txn_hash: row.normalized_txn_hash.clone(),
-                    account_id: Some(account_id.clone()),
-                    statement_id: statement_id_for_rows.clone(),
+                    account_id: resolved_account_id.clone(),
+                    statement_id: None,
                 }
             })
             .collect();
@@ -764,7 +706,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             "kind": "import_rows_inserted",
             "import_id": job_payload.import_id.clone(),
             "rows_total": parsed.rows.len(),
-            "statement_id": statement_id_for_rows.clone(),
+            "statement_id": serde_json::Value::Null,
         }));
 
         let review_required_count = parsed
@@ -782,14 +724,18 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
 
         let status = if review_required_count > 0 {
             ImportStatus::ReviewRequired
+        } else if resolved_account_id.is_none() {
+            ImportStatus::PendingCardResolution
         } else {
             ImportStatus::ReadyToCommit
         };
         let status_str = status.as_str().to_string();
 
         let parsed_rows_len = parsed.rows.len();
-        let parsed_errors_len = parsed.errors.len();
-        let parsed_warnings_len = parsed.warnings.len();
+        let parsed_errors = parsed.errors.clone();
+        let parsed_warnings = parsed.warnings.clone();
+        let parsed_errors_len = parsed_errors.len();
+        let parsed_warnings_len = parsed_warnings.len();
         update_import_status(
             pool,
             &job_payload.import_id,
@@ -800,11 +746,82 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "quality_metrics": extraction_quality_metrics,
                 "reconciliation": extraction_reconciliation
             }),
-            parsed.errors,
-            parsed.warnings,
+            parsed_errors.clone(),
+            parsed_warnings.clone(),
             review_required_count,
         )
         .await?;
+
+        if resolved_account_id.is_none() {
+            let matched_account_id = find_high_confidence_account_match(
+                pool,
+                card_resolution_metadata
+                    .get("account_type")
+                    .and_then(|v| v.as_str()),
+                card_resolution_metadata
+                    .get("account_number_ending")
+                    .and_then(|v| v.as_str()),
+                card_resolution_metadata
+                    .get("customer_name")
+                    .and_then(|v| v.as_str()),
+            )
+            .await?;
+            let reason = if matched_account_id.is_some() {
+                Some("auto_high_confidence_match")
+            } else {
+                Some("manual_selection_required")
+            };
+            set_import_card_resolution(
+                pool,
+                &job_payload.import_id,
+                matched_account_id.as_deref(),
+                reason,
+                &card_resolution_metadata,
+            )
+            .await?;
+            if matched_account_id.is_some() && review_required_count == 0 {
+                update_import_status(
+                    pool,
+                    &job_payload.import_id,
+                    ImportStatus::ReadyToCommit,
+                    serde_json::json!({
+                        "parsed_rows": parsed_rows_len,
+                        "unresolved_direction_count": review_required_count,
+                        "quality_metrics": extraction_quality_metrics,
+                        "reconciliation": extraction_reconciliation
+                    }),
+                    parsed_errors.clone(),
+                    parsed_warnings.clone(),
+                    review_required_count,
+                )
+                .await?;
+            } else if matched_account_id.is_none() {
+                update_import_status(
+                    pool,
+                    &job_payload.import_id,
+                    ImportStatus::PendingCardResolution,
+                    serde_json::json!({
+                        "parsed_rows": parsed_rows_len,
+                        "unresolved_direction_count": review_required_count,
+                        "quality_metrics": extraction_quality_metrics,
+                        "reconciliation": extraction_reconciliation
+                    }),
+                    parsed_errors.clone(),
+                    parsed_warnings.clone(),
+                    review_required_count,
+                )
+                .await?;
+            }
+        } else {
+            set_import_card_resolution(
+                pool,
+                &job_payload.import_id,
+                resolved_account_id.as_deref(),
+                Some("preselected"),
+                &card_resolution_metadata,
+            )
+            .await?;
+        }
         info!(
             import_id = %job_payload.import_id,
             status = %status_str,
@@ -962,6 +979,7 @@ mod tests {
                 content_base64: STANDARD.encode(source),
                 source_hash: "worker-hash".to_string(),
                 extraction_mode: None,
+                resolved_account_id: None,
             },
         )
         .await
@@ -974,7 +992,7 @@ mod tests {
         let status = get_import_status(&pool, &import_id)
             .await
             .expect("get status");
-        assert_eq!(status.status, ImportStatus::ReviewRequired.as_str());
+        assert_eq!(status.status, ImportStatus::PendingCardResolution.as_str());
         assert_eq!(status.review_required_count, 2);
         assert!(status.summary.to_string().contains("parsed_rows"));
 
@@ -1012,6 +1030,7 @@ mod tests {
                 content_base64: STANDARD.encode(source),
                 source_hash: "worker-local-ocr-hash".to_string(),
                 extraction_mode: Some("local_ocr".to_string()),
+                resolved_account_id: None,
             },
         )
         .await
@@ -1070,6 +1089,7 @@ mod tests {
                 content_base64: STANDARD.encode(source),
                 source_hash: "worker-managed-gate-hash".to_string(),
                 extraction_mode: Some("managed".to_string()),
+                resolved_account_id: None,
             },
         )
         .await

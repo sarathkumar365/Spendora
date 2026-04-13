@@ -16,6 +16,7 @@ pub struct HealthStatus {
 pub enum ImportStatus {
     Queued,
     Parsing,
+    PendingCardResolution,
     ReviewRequired,
     ReadyToCommit,
     Committed,
@@ -27,6 +28,7 @@ impl ImportStatus {
         match self {
             Self::Queued => "queued",
             Self::Parsing => "parsing",
+            Self::PendingCardResolution => "pending_card_resolution",
             Self::ReviewRequired => "review_required",
             Self::ReadyToCommit => "ready_to_commit",
             Self::Committed => "committed",
@@ -251,7 +253,10 @@ fn required_env(name: &'static str) -> Result<String, ExtractionRuntimeConfigErr
 }
 
 fn optional_env(name: &str) -> Option<String> {
-    env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn validate_statement_schema_contract(
@@ -261,7 +266,9 @@ fn validate_statement_schema_contract(
     let root_required = schema
         .get("required")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| BlueprintSchemaError::InvalidContract("root required[] missing".to_string()))?;
+        .ok_or_else(|| {
+            BlueprintSchemaError::InvalidContract("root required[] missing".to_string())
+        })?;
     let root_required_keys = if version == "statement_v2" {
         vec![
             "statement_period",
