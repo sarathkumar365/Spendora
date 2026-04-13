@@ -165,7 +165,7 @@ Agent behavior rules are defined in:
 - `agent.md`
 
 Core project implementation plan is documented in:
-- `docs/desktop-rust-plan.md`
+- `docs/plans/archive/desktop-rust-plan.md`
 
 Deep technical notes for Rust/Tauri/backend internals:
-- `docs/DEVELOPER_NOTES.md`
+- `docs/reference/DEVELOPER_NOTES.md`

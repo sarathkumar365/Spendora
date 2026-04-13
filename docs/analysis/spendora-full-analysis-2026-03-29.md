@@ -23,12 +23,12 @@ This analysis was done by reading source files directly and cross-checking contr
 
 Total doc lines reviewed: 2,103
 
-- `docs/DEVELOPER_NOTES.md` (419)
-- `docs/desktop-rust-plan.md` (329)
-- `docs/known-issues.md` (78)
-- `docs/lama-extraction-0.2.md` (285)
-- `docs/runtime-path-enforcement-plan.md` (73)
-- `docs/version-0.2-plan.md` (276)
+- `docs/reference/DEVELOPER_NOTES.md` (419)
+- `docs/plans/archive/desktop-rust-plan.md` (329)
+- `docs/issues/known-issues.md` (78)
+- `docs/plans/archive/lama-extraction-0.2.md` (285)
+- `docs/plans/archive/runtime-path-enforcement-plan.md` (73)
+- `docs/plans/archive/version-0.2-plan.md` (276)
 - `docs/expense/README.md` (9)
 - `docs/expense/ai-pdf-extraction-research.md` (301)
 - `docs/expense/api-contract.md` (63)
@@ -456,7 +456,7 @@ Strictness:
 
 ### 10.2 Planned but not fully applied
 
-`docs/runtime-path-enforcement-plan.md` defines prod-vs-dev path enforcement with production app-data path correction. Current Tauri spawn path code is still `.runtime`-oriented.
+`docs/plans/archive/runtime-path-enforcement-plan.md` defines prod-vs-dev path enforcement with production app-data path correction. Current Tauri spawn path code is still `.runtime`-oriented.
 
 ---
 
@@ -589,12 +589,12 @@ Managed `new` flow diagnostics include:
 
 ### Docs
 
-- `/Users/sarathkumar/Projects/spendora/docs/DEVELOPER_NOTES.md`
-- `/Users/sarathkumar/Projects/spendora/docs/desktop-rust-plan.md`
-- `/Users/sarathkumar/Projects/spendora/docs/known-issues.md`
-- `/Users/sarathkumar/Projects/spendora/docs/lama-extraction-0.2.md`
-- `/Users/sarathkumar/Projects/spendora/docs/runtime-path-enforcement-plan.md`
-- `/Users/sarathkumar/Projects/spendora/docs/version-0.2-plan.md`
+- `/Users/sarathkumar/Projects/spendora/docs/reference/DEVELOPER_NOTES.md`
+- `/Users/sarathkumar/Projects/spendora/docs/plans/archive/desktop-rust-plan.md`
+- `/Users/sarathkumar/Projects/spendora/docs/issues/known-issues.md`
+- `/Users/sarathkumar/Projects/spendora/docs/plans/archive/lama-extraction-0.2.md`
+- `/Users/sarathkumar/Projects/spendora/docs/plans/archive/runtime-path-enforcement-plan.md`
+- `/Users/sarathkumar/Projects/spendora/docs/plans/archive/version-0.2-plan.md`
 - `/Users/sarathkumar/Projects/spendora/docs/expense/README.md`
 - `/Users/sarathkumar/Projects/spendora/docs/expense/ai-pdf-extraction-research.md`
 - `/Users/sarathkumar/Projects/spendora/docs/expense/api-contract.md`
@@ -642,4 +642,3 @@ The current report/codebase is a functional desktop-local financial import pipel
 3. Full import/review/commit lifecycle
 4. Deferred Plaid and insight/assistant surfaces
 5. Clear next hardening needs around production CORS, direction semantics, runtime-path mode enforcement, and OpenAPI contract completeness
-
