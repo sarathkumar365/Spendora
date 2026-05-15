@@ -2594,6 +2594,46 @@ pub async fn load_assignments_for_category(
         .collect())
 }
 
+/// Resolve a list of merchant_signature ids to their normalized keys (in input order;
+/// unknown ids drop out). Used by the data tools to translate the agent's IDs into the
+/// canonical strings they'll match against transaction descriptions.
+pub async fn resolve_merchant_signature_keys(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // SQLite bound-param limit comfortably handles our scale; use a simple IN list.
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, normalized_key FROM merchant_signatures WHERE id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await?;
+    // Preserve input order, deduplicate keys.
+    let map: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("id"), r.get::<String, _>("normalized_key")))
+        .collect();
+    let mut out = Vec::with_capacity(ids.len());
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        if let Some(key) = map.get(id) {
+            if seen.insert(key.clone()) {
+                out.push(key.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub async fn upsert_merchant_category_assignment(
     pool: &SqlitePool,
     merchant_signature_id: &str,

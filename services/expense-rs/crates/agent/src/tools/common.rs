@@ -2,8 +2,37 @@
 
 use anyhow::{anyhow, Result};
 use sqlx::{QueryBuilder, Sqlite};
+use std::collections::HashSet;
+use storage_sqlite::{normalize_merchant_key, resolve_merchant_signature_keys, SqlitePool};
 
 pub use storage_sqlite::normalize_merchant_key as normalize_merchant;
+
+/// Resolve `merchant_signature_ids` to a set of normalized keys for in-memory matching.
+/// Returns `None` if the input was empty (meaning "no filter"); otherwise a set of keys
+/// the caller should compare against `normalize_merchant_key(description)`.
+pub async fn resolve_merchant_ids_to_key_set(
+    db: &SqlitePool,
+    ids: &[String],
+) -> Result<Option<HashSet<String>>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let keys = resolve_merchant_signature_keys(db, ids).await?;
+    if keys.is_empty() {
+        // The IDs were all unknown — return an empty set so callers match nothing rather
+        // than silently dropping the filter.
+        return Ok(Some(HashSet::new()));
+    }
+    Ok(Some(keys.into_iter().collect()))
+}
+
+/// Returns true if a transaction `description` normalises to one of the allowed keys.
+pub fn description_matches_keys(description: &str, allowed: &HashSet<String>) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    allowed.contains(&normalize_merchant_key(description))
+}
 
 /// Append an OR'd `LIKE` filter for each substring. Caller must wrap in an `AND (...)` block.
 /// Returns true if any clauses were appended.

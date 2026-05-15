@@ -117,9 +117,16 @@ impl AgentContext {
              - Step 3: When the user confirms (their next message will list which merchants to \
                include/exclude), call `confirm_category_assignments` to persist their choices.\n\
              - Step 4: Call `aggregate_transactions` (or `query_transactions`) with \
-               `merchant_substrings` set to the confirmed merchants' normalized_key values.\n\
+               `merchant_signature_ids` set to the `merchant_signature_id` values from \
+               `resolve_category_intent`'s confirmed + suggested lists. DO NOT use \
+               `merchant_substrings` for category questions — the server resolves IDs to \
+               canonical normalized keys and matches exactly. Passing substrings (or worse, \
+               the IDs as substrings) returns wrong results.\n\
              - Step 5: Name the included merchants in your final answer (e.g. \"You spent \
-               $581 on groceries — Loblaws, Metro, Walmart\").\n\n\
+               $581 on groceries — Loblaws, Metro, Walmart\").\n\
+             - Step 6: If aggregate_transactions returns `window_has_any_data: false`, the \
+               user's date window has no transactions at all (not just no matching ones). \
+               Say so explicitly and offer the actual data range from the context block above.\n\n\
              ## Tool-calling discipline\n\
              - For 'how much / total / average / count / top N by X' → `aggregate_transactions` \
                (group_by handles top-N rankings).\n\

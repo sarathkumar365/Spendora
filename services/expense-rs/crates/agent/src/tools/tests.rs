@@ -753,5 +753,189 @@ async fn query_rejects_both_merchant_filter_forms_together() {
         )
         .await
         .expect_err("should fail");
-    assert!(err.to_string().contains("not both"));
+    assert!(err.to_string().contains("only one of"));
+}
+
+// --------- merchant_signature_ids filter tests (Phase 7a) ---------
+
+#[tokio::test]
+async fn aggregate_by_signature_ids_uses_exact_normalized_match() {
+    let pool = setup_db_with_fixture().await;
+    // Seed two transactions with descriptions that share a substring but normalize differently.
+    sqlx::query(
+        "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, direction, direction_source) \
+         VALUES ('mi1', 'acct-a', 'mi1', 5000, 'CAD', 'LOBLAWS GREAT FOOD', '2026-04-05', 'manual', 'debit', 'seed'), \
+                ('mi2', 'acct-a', 'mi2', 3200, 'CAD', 'METRO #455', '2026-04-12', 'manual', 'debit', 'seed'), \
+                ('mi3', 'acct-a', 'mi3', 9000, 'CAD', 'COSTCO WHOLESALE', '2026-04-15', 'manual', 'debit', 'seed')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    // Populate merchant_signatures by listing the window once.
+    let _ = storage_sqlite::list_merchants_in_window(
+        &pool, "2026-04-01", "2026-04-30", None, Some("debit"), 100,
+    )
+    .await
+    .expect("populate");
+
+    // Resolve the Loblaws + Metro signature IDs.
+    let row_loblaws: (String,) =
+        sqlx::query_as("SELECT id FROM merchant_signatures WHERE normalized_key='loblaws great food'")
+            .fetch_one(&pool)
+            .await
+            .expect("loblaws sig");
+    let row_metro: (String,) =
+        sqlx::query_as("SELECT id FROM merchant_signatures WHERE normalized_key='metro'")
+            .fetch_one(&pool)
+            .await
+            .expect("metro sig");
+
+    let out = AggregateTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "group_by": "merchant",
+                "metric": "sum",
+                "direction": "debit",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30",
+                "merchant_signature_ids": [row_loblaws.0, row_metro.0],
+            }),
+        )
+        .await
+        .expect("ok");
+
+    // Should include loblaws + metro, NOT costco.
+    let grand_total = out.data.get("grand_total").unwrap().as_f64().unwrap();
+    assert_eq!(grand_total, (5000 + 3200) as f64);
+    assert_eq!(out.data.get("filter_used").unwrap().as_str(), Some("merchant_signature_ids"));
+    assert_eq!(out.data.get("window_has_any_data").unwrap().as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn aggregate_by_signature_ids_flags_empty_window() {
+    let pool = setup_db_with_fixture().await;
+    // No transactions in 2099 — the window itself is empty.
+    let out = AggregateTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "group_by": "merchant",
+                "metric": "sum",
+                "direction": "debit",
+                "date_from": "2099-01-01",
+                "date_to": "2099-01-31",
+                "merchant_signature_ids": ["any-id"],
+            }),
+        )
+        .await
+        .expect("ok");
+
+    assert_eq!(out.data.get("window_has_any_data").unwrap().as_bool(), Some(false));
+    let groups = out.data.get("groups").unwrap().as_array().unwrap();
+    assert!(groups.is_empty());
+    assert!(out.summary.contains("no transactions in window"));
+}
+
+#[tokio::test]
+async fn query_by_signature_ids_returns_only_matched_rows() {
+    let pool = setup_db_with_fixture().await;
+    sqlx::query(
+        "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, direction, direction_source) \
+         VALUES ('q1', 'acct-a', 'q1', 5000, 'CAD', 'LOBLAWS GREAT FOOD', '2026-04-05', 'manual', 'debit', 'seed'), \
+                ('q2', 'acct-a', 'q2', 9000, 'CAD', 'WALMART', '2026-04-10', 'manual', 'debit', 'seed')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let _ = storage_sqlite::list_merchants_in_window(
+        &pool, "2026-04-01", "2026-04-30", None, Some("debit"), 100,
+    )
+    .await
+    .expect("populate");
+    let (loblaws_id,): (String,) =
+        sqlx::query_as("SELECT id FROM merchant_signatures WHERE normalized_key='loblaws great food'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let out = QueryTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "merchant_signature_ids": [loblaws_id],
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30",
+            }),
+        )
+        .await
+        .expect("ok");
+    let count = out.data.get("count").unwrap().as_i64().unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(out.transaction_ids, vec!["q1".to_string()]);
+    assert_eq!(out.data.get("window_has_any_data").unwrap().as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn tools_reject_mixed_merchant_filters() {
+    let pool = setup_db_with_fixture().await;
+    let err = AggregateTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "group_by": "merchant",
+                "metric": "sum",
+                "merchant_substring": "loblaws",
+                "merchant_signature_ids": ["x"],
+            }),
+        )
+        .await
+        .expect_err("should fail");
+    assert!(err.to_string().contains("only one of"));
+}
+
+#[tokio::test]
+async fn compare_by_signature_ids_works_across_two_windows() {
+    let pool = setup_db_with_fixture().await;
+    sqlx::query(
+        "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, direction, direction_source) \
+         VALUES ('cmp1', 'acct-a', 'cmp1', 5000, 'CAD', 'LOBLAWS GREAT FOOD', '2026-03-05', 'manual', 'debit', 'seed'), \
+                ('cmp2', 'acct-a', 'cmp2', 7000, 'CAD', 'LOBLAWS GREAT FOOD', '2026-04-05', 'manual', 'debit', 'seed'), \
+                ('cmp3', 'acct-a', 'cmp3', 9999, 'CAD', 'WALMART',            '2026-04-12', 'manual', 'debit', 'seed')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let _ = storage_sqlite::list_merchants_in_window(
+        &pool, "2026-03-01", "2026-04-30", None, Some("debit"), 100,
+    )
+    .await
+    .expect("populate");
+    let (loblaws_id,): (String,) =
+        sqlx::query_as("SELECT id FROM merchant_signatures WHERE normalized_key='loblaws great food'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let out = ComparePeriodsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "window_a": { "date_from": "2026-03-01", "date_to": "2026-03-31" },
+                "window_b": { "date_from": "2026-04-01", "date_to": "2026-04-30" },
+                "metric": "sum",
+                "direction": "debit",
+                "merchant_signature_ids": [loblaws_id]
+            }),
+        )
+        .await
+        .expect("ok");
+
+    let a = out.data.get("window_a").unwrap().get("value").unwrap().as_f64().unwrap();
+    let b = out.data.get("window_b").unwrap().get("value").unwrap().as_f64().unwrap();
+    assert_eq!(a, 5000.0);
+    assert_eq!(b, 7000.0);
+    // Walmart in April should NOT be counted.
+    assert_eq!(out.data.get("absolute_diff").unwrap().as_f64().unwrap(), 2000.0);
 }

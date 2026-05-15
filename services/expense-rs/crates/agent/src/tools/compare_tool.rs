@@ -3,10 +3,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use storage_sqlite::SqlitePool;
 
-use super::common::{validate_date, validate_direction};
+use super::common::{
+    description_matches_keys, resolve_merchant_ids_to_key_set, validate_date, validate_direction,
+};
 use super::{AgentDeps, Tool, ToolOutput};
 
 const MAX_LIMIT: i64 = 200;
@@ -26,6 +28,10 @@ struct CompareArgs {
     account_id: Option<String>,
     #[serde(default)]
     merchant_substring: Option<String>,
+    /// Preferred for category questions — UUIDs from resolve_category_intent. Mutually
+    /// exclusive with `merchant_substring`.
+    #[serde(default)]
+    merchant_signature_ids: Vec<String>,
     #[serde(default)]
     limit: Option<i64>,
     #[serde(default)]
@@ -92,6 +98,11 @@ impl Tool for ComparePeriodsTool {
                 },
                 "account_id": { "type": "string" },
                 "merchant_substring": { "type": "string" },
+                "merchant_signature_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "PREFERRED for category questions. UUIDs from resolve_category_intent. Mutually exclusive with merchant_substring."
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Cap on per-group rows when group_by is set (default 50, max 200)."
@@ -114,6 +125,13 @@ impl Tool for ComparePeriodsTool {
         validate_date(&args.window_b.date_from, "window_b.date_from")?;
         validate_date(&args.window_b.date_to, "window_b.date_to")?;
         validate_direction(args.direction.as_deref())?;
+        if args.merchant_substring.is_some() && !args.merchant_signature_ids.is_empty() {
+            return Err(anyhow!(
+                "pass only one of merchant_substring or merchant_signature_ids"
+            ));
+        }
+        let allowed_keys = resolve_merchant_ids_to_key_set(db, &args.merchant_signature_ids)
+            .await?;
 
         let metric_sql = match args.metric.as_str() {
             "sum" => "SUM(ABS(t.amount_cents))",
@@ -153,8 +171,17 @@ impl Tool for ComparePeriodsTool {
         };
 
         // Grand totals for both windows
-        let total_a = run_total(db, metric_sql, &filters_a).await?;
-        let total_b = run_total(db, metric_sql, &filters_b).await?;
+        let (total_a, total_b) = if let Some(keys) = &allowed_keys {
+            (
+                total_by_ids(db, &args.metric, &filters_a, keys).await?,
+                total_by_ids(db, &args.metric, &filters_b, keys).await?,
+            )
+        } else {
+            (
+                run_total(db, metric_sql, &filters_a).await?,
+                run_total(db, metric_sql, &filters_b).await?,
+            )
+        };
         let (abs_diff, pct_diff) = diff(total_a, total_b);
 
         let mut data = json!({
@@ -169,8 +196,17 @@ impl Tool for ComparePeriodsTool {
         let mut summary_extra = String::new();
 
         if let Some((group_sql, alias)) = group_sql_opt {
-            let map_a = run_grouped(db, metric_sql, group_sql, &filters_a, limit).await?;
-            let map_b = run_grouped(db, metric_sql, group_sql, &filters_b, limit).await?;
+            let (map_a, map_b) = if let Some(keys) = &allowed_keys {
+                (
+                    grouped_by_ids(db, &args.metric, alias, &filters_a, keys, limit).await?,
+                    grouped_by_ids(db, &args.metric, alias, &filters_b, keys, limit).await?,
+                )
+            } else {
+                (
+                    run_grouped(db, metric_sql, group_sql, &filters_a, limit).await?,
+                    run_grouped(db, metric_sql, group_sql, &filters_b, limit).await?,
+                )
+            };
 
             let mut all_keys: Vec<String> = map_a
                 .keys()
@@ -299,6 +335,134 @@ async fn run_grouped(
             key.map(|k| (k, value))
         })
         .collect())
+}
+
+/// Total for one window using the merchant_signature_ids path: fetch raw rows, post-filter
+/// by exact normalized-key match, aggregate in Rust.
+async fn total_by_ids(
+    db: &SqlitePool,
+    metric: &str,
+    filters: &CompareFilters<'_>,
+    allowed_keys: &HashSet<String>,
+) -> Result<f64> {
+    let rows = fetch_raw_rows(db, filters).await?;
+    let mut sum: f64 = 0.0;
+    let mut count: i64 = 0;
+    let mut min: Option<f64> = None;
+    let mut max: Option<f64> = None;
+    for r in &rows {
+        let description: String = r.get("description");
+        if !description_matches_keys(&description, allowed_keys) {
+            continue;
+        }
+        let amount: i64 = r.get("amount_cents");
+        let v = amount.abs() as f64;
+        sum += v;
+        count += 1;
+        min = Some(min.map_or(v, |m| m.min(v)));
+        max = Some(max.map_or(v, |m| m.max(v)));
+    }
+    Ok(match metric {
+        "sum" => sum,
+        "count" => count as f64,
+        "avg" => {
+            if count > 0 {
+                sum / count as f64
+            } else {
+                0.0
+            }
+        }
+        "min" => min.unwrap_or(0.0),
+        "max" => max.unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
+
+async fn grouped_by_ids(
+    db: &SqlitePool,
+    metric: &str,
+    alias: &str,
+    filters: &CompareFilters<'_>,
+    allowed_keys: &HashSet<String>,
+    limit: i64,
+) -> Result<HashMap<String, f64>> {
+    let rows = fetch_raw_rows(db, filters).await?;
+    #[derive(Default)]
+    struct Bucket {
+        sum: f64,
+        count: i64,
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+    let mut buckets: HashMap<String, Bucket> = HashMap::new();
+    for r in &rows {
+        let description: String = r.get("description");
+        if !description_matches_keys(&description, allowed_keys) {
+            continue;
+        }
+        let amount: i64 = r.get("amount_cents");
+        let v = amount.abs() as f64;
+        let direction: String = r.get("direction");
+        let account_name: String = r.get("account_name");
+        let key = match alias {
+            "merchant" => description.to_lowercase().trim().to_string(),
+            "account" => account_name,
+            "direction" => direction,
+            _ => description.to_lowercase().trim().to_string(),
+        };
+        let entry = buckets.entry(key).or_default();
+        entry.count += 1;
+        entry.sum += v;
+        entry.min = Some(entry.min.map_or(v, |m| m.min(v)));
+        entry.max = Some(entry.max.map_or(v, |m| m.max(v)));
+    }
+    let mut out: Vec<(String, f64)> = buckets
+        .into_iter()
+        .map(|(k, b)| {
+            let metric_value = match metric {
+                "sum" => b.sum,
+                "count" => b.count as f64,
+                "avg" => {
+                    if b.count > 0 {
+                        b.sum / b.count as f64
+                    } else {
+                        0.0
+                    }
+                }
+                "min" => b.min.unwrap_or(0.0),
+                "max" => b.max.unwrap_or(0.0),
+                _ => 0.0,
+            };
+            (k, metric_value)
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(limit as usize);
+    Ok(out.into_iter().collect())
+}
+
+async fn fetch_raw_rows(
+    db: &SqlitePool,
+    f: &CompareFilters<'_>,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        "SELECT t.amount_cents, t.description, t.direction, \
+         COALESCE(a.name, t.account_id) AS account_name \
+         FROM transactions t \
+         LEFT JOIN accounts a ON a.id = t.account_id \
+         WHERE 1=1",
+    );
+    qb.push(" AND t.booked_at >= ").push_bind(f.win.date_from.clone());
+    qb.push(" AND t.booked_at <= ").push_bind(f.win.date_to.clone());
+    if let Some(v) = f.direction {
+        qb.push(" AND t.direction = ").push_bind(v.to_string());
+    }
+    if let Some(v) = f.account_id {
+        qb.push(" AND t.account_id = ").push_bind(v.to_string());
+    }
+    // Note: merchant_substring intentionally ignored here — when merchant_signature_ids
+    // is used we apply the key-set filter in Rust afterwards.
+    Ok(qb.build().fetch_all(db).await?)
 }
 
 fn diff(a: f64, b: f64) -> (f64, f64) {

@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
 // SqlitePool now reached via AgentDeps::db
 
-use super::common::{push_merchant_substrings_or, validate_date_opt, validate_direction};
+use super::common::{
+    description_matches_keys, push_merchant_substrings_or, resolve_merchant_ids_to_key_set,
+    validate_date_opt, validate_direction,
+};
 use super::{AgentDeps, Tool, ToolOutput};
 
 const DEFAULT_LIMIT: i64 = 100;
@@ -23,10 +26,15 @@ struct QueryArgs {
     account_id: Option<String>,
     #[serde(default)]
     merchant_substring: Option<String>,
-    /// OR-combined list of merchant substrings. Mutually exclusive with `merchant_substring`.
-    /// Used to scope a query to a category's confirmed merchants in the intelligence flow.
+    /// OR-combined list of merchant substrings. Legacy LIKE-match.
+    /// Mutually exclusive with `merchant_substring` and `merchant_signature_ids`.
     #[serde(default)]
     merchant_substrings: Vec<String>,
+    /// **Preferred for category questions.** UUIDs from resolve_category_intent. Resolves
+    /// to canonical normalized keys and matches exactly. Mutually exclusive with the
+    /// substring filters above.
+    #[serde(default)]
+    merchant_signature_ids: Vec<String>,
     #[serde(default)]
     amount_min_cents: Option<i64>,
     #[serde(default)]
@@ -76,7 +84,12 @@ impl Tool for QueryTransactionsTool {
                 "merchant_substrings": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "OR'd list of substrings (e.g. ['loblaws', 'metro', 'walmart']). Use this when filtering by a set of merchants confirmed for a category. Mutually exclusive with `merchant_substring`."
+                    "description": "Legacy OR'd list of substrings (LIKE-matched). Prefer `merchant_signature_ids` for category questions."
+                },
+                "merchant_signature_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "PREFERRED for category questions. UUIDs from resolve_category_intent / confirm_category_assignments. Server resolves them to canonical normalized keys and matches exactly."
                 },
                 "amount_min_cents": {
                     "type": "integer",
@@ -113,11 +126,24 @@ impl Tool for QueryTransactionsTool {
         validate_date_opt(args.date_from.as_deref(), "date_from")?;
         validate_date_opt(args.date_to.as_deref(), "date_to")?;
         validate_direction(args.direction.as_deref())?;
-        if args.merchant_substring.is_some() && !args.merchant_substrings.is_empty() {
+        let filters_in_use = [
+            args.merchant_substring.is_some(),
+            !args.merchant_substrings.is_empty(),
+            !args.merchant_signature_ids.is_empty(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
+        if filters_in_use > 1 {
             return Err(anyhow!(
-                "pass either merchant_substring (single) or merchant_substrings (array), not both"
+                "pass only one of merchant_substring / merchant_substrings / merchant_signature_ids"
             ));
         }
+
+        // Resolve the new merchant_signature_ids filter, if any, into the allowed key set
+        // we'll post-filter rows against in Rust.
+        let allowed_keys = resolve_merchant_ids_to_key_set(db, &args.merchant_signature_ids)
+            .await?;
 
         let limit = args
             .limit
@@ -163,42 +189,66 @@ impl Tool for QueryTransactionsTool {
             qb.push(" AND t.direction = ").push_bind(v);
         }
 
-        qb.push(format!(" ORDER BY {order_sql} LIMIT "));
-        qb.push_bind(limit);
+        // When the new ID filter is active, drop the SQL LIMIT and apply it in Rust *after*
+        // the merchant-key post-filter; otherwise we'd potentially truncate rows that would
+        // have matched. Bound raw rows with a safety cap.
+        const POST_FILTER_RAW_CAP: i64 = 5000;
+        if allowed_keys.is_some() {
+            qb.push(format!(" ORDER BY {order_sql} LIMIT "));
+            qb.push_bind(POST_FILTER_RAW_CAP);
+        } else {
+            qb.push(format!(" ORDER BY {order_sql} LIMIT "));
+            qb.push_bind(limit);
+        }
 
         let rows = qb.build().fetch_all(db).await?;
+        let window_row_count = rows.len() as i64;
 
         let mut txn_ids: Vec<String> = Vec::with_capacity(rows.len());
         let mut total_outflow_cents: i64 = 0;
         let mut total_inflow_cents: i64 = 0;
 
-        let items: Vec<Value> = rows
-            .iter()
-            .map(|row| {
-                let id: String = row.get("id");
-                let amount: i64 = row.get("amount_cents");
-                let direction: String = row.get("direction");
-                if direction == "debit" {
-                    total_outflow_cents += amount.abs();
-                } else if direction == "credit" {
-                    total_inflow_cents += amount.abs();
+        let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let description: String = row.get("description");
+            if let Some(keys) = &allowed_keys {
+                if !description_matches_keys(&description, keys) {
+                    continue;
                 }
-                txn_ids.push(id.clone());
-                json!({
-                    "id": id,
-                    "account_id": row.get::<String, _>("account_id"),
-                    "account_name": row.get::<Option<String>, _>("account_name"),
-                    "amount_cents": amount,
-                    "currency": row.get::<String, _>("currency_code"),
-                    "description": row.get::<String, _>("description"),
-                    "booked_at": row.get::<String, _>("booked_at"),
-                    "direction": direction,
-                })
-            })
-            .collect();
+            }
+            let id: String = row.get("id");
+            let amount: i64 = row.get("amount_cents");
+            let direction: String = row.get("direction");
+            if direction == "debit" {
+                total_outflow_cents += amount.abs();
+            } else if direction == "credit" {
+                total_inflow_cents += amount.abs();
+            }
+            txn_ids.push(id.clone());
+            items.push(json!({
+                "id": id,
+                "account_id": row.get::<String, _>("account_id"),
+                "account_name": row.get::<Option<String>, _>("account_name"),
+                "amount_cents": amount,
+                "currency": row.get::<String, _>("currency_code"),
+                "description": description,
+                "booked_at": row.get::<String, _>("booked_at"),
+                "direction": direction,
+            }));
+            if items.len() as i64 >= limit {
+                break;
+            }
+        }
+        let matched_row_count = items.len() as i64;
 
-        let summary = if items.is_empty() {
-            "0 transactions".to_string()
+        let window_has_any_data = window_row_count > 0;
+        let summary = if items.is_empty() && !window_has_any_data {
+            "no transactions in window".to_string()
+        } else if items.is_empty() {
+            format!(
+                "{} txn(s) in window, but none matched the merchant filter",
+                window_row_count
+            )
         } else {
             format!(
                 "{} txns · outflow ${:.2} · inflow ${:.2}",
@@ -215,6 +265,9 @@ impl Tool for QueryTransactionsTool {
                 "limit_hit": items.len() as i64 == limit,
                 "total_outflow_cents": total_outflow_cents,
                 "total_inflow_cents": total_inflow_cents,
+                "window_has_any_data": window_has_any_data,
+                "window_row_count": window_row_count,
+                "matched_row_count": matched_row_count,
                 "transactions": items,
             }),
             transaction_ids: txn_ids,
