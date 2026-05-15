@@ -1,10 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use agent::{
+    audit::{AuditSink, NoopSink},
     context::{AccountSummary, AgentContext, DataRange},
     llm::ChatMessage as AgentChatMessage,
-    runtime::{build_initial_messages, AgentEvent, AgentRunner},
+    runtime::{build_initial_messages, AgentEvent, AgentRunner, RunContext},
 };
+use expense_core::new_idempotency_key;
 use async_stream::stream;
 use axum::{
     extract::State,
@@ -28,6 +30,11 @@ pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
     pub history: Vec<HistoryMessage>,
+    /// Optional client-supplied conversation id. Lets the UI keep all runs from one chat
+    /// session under a single id for cost rollups + the Activity tab. If omitted, the server
+    /// allocates a new id per request (each turn becomes its own conversation).
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,16 +191,29 @@ pub async fn post_agent_chat_handler(
         })
         .collect();
 
+    let user_message_excerpt = body.message.clone();
     let initial = build_initial_messages(system_prompt, history, body.message)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
+    let run_ctx = RunContext {
+        conversation_id: body
+            .conversation_id
+            .unwrap_or_else(new_idempotency_key),
+        run_id: new_idempotency_key(),
+        user_message_excerpt,
+    };
+
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
-    let runner = AgentRunner::new(provider, registry);
+    let audit_sink: Arc<dyn AuditSink> = state
+        .agent_audit
+        .clone()
+        .unwrap_or_else(|| Arc::new(NoopSink));
+    let runner = AgentRunner::with_audit(provider, registry, audit_sink);
     let db = state.db.clone();
 
     tokio::spawn(async move {
-        info!("agent chat run starting");
-        runner.run(&db, initial, tx).await;
+        info!(run_id = %run_ctx.run_id, conversation_id = %run_ctx.conversation_id, "agent chat run starting");
+        runner.run(&db, run_ctx, initial, tx).await;
         info!("agent chat run finished");
     });
 

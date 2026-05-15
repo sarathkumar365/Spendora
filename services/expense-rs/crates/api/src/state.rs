@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent::{llm::LlmProvider, tools::ToolRegistry};
+use agent::{audit::AuditSink, llm::LlmProvider, tools::ToolRegistry};
 use storage_sqlite::SqlitePool;
 
 #[derive(Clone)]
@@ -10,17 +10,20 @@ pub struct AppState {
     /// the agent endpoints will return a clear error in that case.
     pub agent_provider: Option<Arc<dyn LlmProvider>>,
     pub agent_registry: Arc<ToolRegistry>,
+    /// Audit sink for the agent. `Some(DbAuditSink)` in production; `None` for tests that
+    /// don't care about persistence (the agent_chat handler defaults to NoopSink in that case).
+    pub agent_audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl AppState {
-    /// Test helper: build state with no agent provider and an empty registry. Tests for
-    /// non-agent endpoints don't need either.
+    /// Test helper: state with no agent provider, an empty registry, and no audit sink.
     #[cfg(test)]
     pub fn new_for_tests(db: SqlitePool) -> Self {
         Self {
             db,
             agent_provider: None,
             agent_registry: Arc::new(ToolRegistry::new()),
+            agent_audit: None,
         }
     }
 }

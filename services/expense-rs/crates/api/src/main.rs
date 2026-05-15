@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use agent::{llm::build_provider_from_env, tools::build_default_registry};
+use agent::{audit::DbAuditSink, llm::build_provider_from_env, tools::build_default_registry};
 use clap::Parser;
 use expense_core::{
     default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
@@ -83,11 +83,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let agent_registry = Arc::new(build_default_registry());
+    let agent_audit: Option<Arc<dyn agent::audit::AuditSink>> =
+        Some(DbAuditSink::spawn(pool.clone()));
+    info!("agent audit sink ready (DbAuditSink, background writer)");
 
     let state = Arc::new(AppState {
         db: pool,
         agent_provider,
         agent_registry,
+        agent_audit,
     });
     let app = Router::new()
         .route("/health", get(health))

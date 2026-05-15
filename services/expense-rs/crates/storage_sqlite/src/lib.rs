@@ -2696,7 +2696,7 @@ pub struct AgentEventRecord {
 
 pub async fn insert_agent_event(pool: &SqlitePool, row: AgentEventRow) -> anyhow::Result<String> {
     let id = row.id.unwrap_or_else(new_idempotency_key);
-    let mut q = sqlx::query(
+    let q = sqlx::query(
         "INSERT INTO agent_events ( \
             id, conversation_id, run_id, sequence, event_kind, \
             duration_ms, payload_json, status, model, prompt_tokens, \

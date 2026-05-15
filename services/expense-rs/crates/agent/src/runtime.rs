@@ -1,12 +1,24 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Instant;
 use storage_sqlite::SqlitePool;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::audit::{AuditEvent, AuditSink, NoopSink};
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmProvider, ToolCall};
+use crate::pricing::cost_micros_for;
 use crate::tools::{AgentDeps, ToolRegistry};
+
+/// Caller-provided identifiers + metadata for a single run. Threaded into every audit event.
+#[derive(Debug, Clone)]
+pub struct RunContext {
+    pub conversation_id: String,
+    pub run_id: String,
+    pub user_message_excerpt: String,
+}
 
 pub const DEFAULT_MAX_ITERATIONS: usize = 6;
 
@@ -72,63 +84,115 @@ pub enum AgentEvent {
 }
 
 pub struct AgentRunner {
-    pub provider: std::sync::Arc<dyn LlmProvider>,
-    pub registry: std::sync::Arc<ToolRegistry>,
+    pub provider: Arc<dyn LlmProvider>,
+    pub registry: Arc<ToolRegistry>,
+    pub audit: Arc<dyn AuditSink>,
     pub max_iterations: usize,
     pub temperature: f32,
 }
 
 impl AgentRunner {
-    pub fn new(
-        provider: std::sync::Arc<dyn LlmProvider>,
-        registry: std::sync::Arc<ToolRegistry>,
+    /// Build a runner with the default `NoopSink` (tests + callers that don't want auditing).
+    pub fn new(provider: Arc<dyn LlmProvider>, registry: Arc<ToolRegistry>) -> Self {
+        Self::with_audit(provider, registry, Arc::new(NoopSink))
+    }
+
+    pub fn with_audit(
+        provider: Arc<dyn LlmProvider>,
+        registry: Arc<ToolRegistry>,
+        audit: Arc<dyn AuditSink>,
     ) -> Self {
         Self {
             provider,
             registry,
+            audit,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             temperature: 0.2,
         }
     }
 
-    /// Run the multi-turn loop. Each AgentEvent is pushed into `events`.
-    /// `messages` should already include any system + prior conversation turns
-    /// plus the latest user message.
+    /// Run the multi-turn loop. Each AgentEvent is pushed into `events`. `ctx` carries
+    /// audit identifiers so every event recorded via the sink is grouped under the right run.
     pub async fn run(
         &self,
         db: &SqlitePool,
+        ctx: RunContext,
         mut messages: Vec<ChatMessage>,
         events: mpsc::Sender<AgentEvent>,
     ) {
+        let model_label = self.provider.model_label();
+        let provider_label = self.provider.kind().as_str().to_string();
         let _ = events
             .send(AgentEvent::Started {
-                model: self.provider.model_label(),
-                provider: self.provider.kind().as_str().to_string(),
+                model: model_label.clone(),
+                provider: provider_label.clone(),
             })
             .await;
 
+        // ---------- audit: run_started ----------
+        let mut seq: i64 = 0;
+        let mut total_prompt_tokens: i64 = 0;
+        let mut total_completion_tokens: i64 = 0;
+        let mut total_cost_micros: i64 = 0;
+        self.audit
+            .record({
+                let mut e = AuditEvent::new(
+                    &ctx.conversation_id,
+                    &ctx.run_id,
+                    seq,
+                    "run_started",
+                );
+                e.status = Some("running".to_string());
+                e.model = Some(model_label.clone());
+                e.user_message_excerpt = Some(truncate_excerpt(&ctx.user_message_excerpt));
+                e.payload = serde_json::json!({
+                    "provider": provider_label,
+                    "message_count_in": messages.len(),
+                });
+                e
+            })
+            .await;
+        seq += 1;
+
         let mut iterations = 0usize;
         let mut cited: Vec<String> = Vec::new();
-        // The latest payload from a `resolve_category_intent` tool call in this run, used to
-        // hydrate the CategoryConfirmationNeeded event if the agent ends with the sentinel.
         let mut latest_category_resolution: Option<Value> = None;
         let tools = self.registry.definitions();
+        // Status determined at exit; defaults to done.
+        let mut final_status = "done".to_string();
+        let mut final_error: Option<String> = None;
 
         loop {
             if events.is_closed() {
                 info!("agent run cancelled (client disconnected)");
-                return;
+                final_status = "cancelled".to_string();
+                break;
             }
             iterations += 1;
             if iterations > self.max_iterations {
+                let reason = format!(
+                    "iteration cap of {} reached without a final answer",
+                    self.max_iterations
+                );
                 let _ = events
                     .send(AgentEvent::Truncated {
-                        reason: format!(
-                            "iteration cap of {} reached without a final answer",
-                            self.max_iterations
-                        ),
+                        reason: reason.clone(),
                     })
                     .await;
+                self.audit
+                    .record({
+                        let mut e = AuditEvent::new(
+                            &ctx.conversation_id,
+                            &ctx.run_id,
+                            seq,
+                            "truncated",
+                        );
+                        e.payload = serde_json::json!({ "reason": reason });
+                        e
+                    })
+                    .await;
+                seq += 1;
+                final_status = "truncated".to_string();
                 break;
             }
 
@@ -137,26 +201,80 @@ impl AgentRunner {
                 tools: tools.clone(),
                 temperature: self.temperature,
             };
+            let messages_snapshot = req.messages.clone();
+            let llm_started = Instant::now();
 
             let response = tokio::select! {
                 biased;
                 _ = events.closed() => {
                     info!("agent run cancelled mid-LLM call (client disconnected)");
-                    return;
+                    final_status = "cancelled".to_string();
+                    return self.finalize(&ctx, seq, final_status, None,
+                        iterations, total_prompt_tokens, total_completion_tokens,
+                        total_cost_micros, &model_label).await;
                 }
                 result = self.provider.complete(req) => match result {
                     Ok(r) => r,
                     Err(err) => {
                         error!(error = %err, "llm provider call failed");
+                        let err_msg = format!("llm provider error: {err}");
                         let _ = events
                             .send(AgentEvent::Error {
-                                message: format!("llm provider error: {err}"),
+                                message: err_msg.clone(),
                             })
                             .await;
+                        self.audit
+                            .record({
+                                let mut e = AuditEvent::new(
+                                    &ctx.conversation_id, &ctx.run_id, seq, "error",
+                                );
+                                e.error_message = Some(err_msg.clone());
+                                e.payload = serde_json::json!({ "phase": "llm_call" });
+                                e
+                            })
+                            .await;
+                        seq += 1;
+                        final_status = "error".to_string();
+                        final_error = Some(err_msg);
                         break;
                     }
                 }
             };
+
+            let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
+            let usage = response.usage;
+            let cost_micros = usage.as_ref().and_then(|u| cost_micros_for(&model_label, u));
+            if let Some(u) = usage.as_ref() {
+                total_prompt_tokens += u.prompt_tokens;
+                total_completion_tokens += u.completion_tokens;
+            }
+            if let Some(c) = cost_micros {
+                total_cost_micros += c;
+            }
+
+            // ---------- audit: llm_call ----------
+            self.audit
+                .record({
+                    let mut e = AuditEvent::new(
+                        &ctx.conversation_id,
+                        &ctx.run_id,
+                        seq,
+                        "llm_call",
+                    );
+                    e.duration_ms = Some(llm_duration_ms);
+                    e.model = Some(model_label.clone());
+                    e.prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens);
+                    e.completion_tokens = usage.as_ref().map(|u| u.completion_tokens);
+                    e.cost_micros = cost_micros;
+                    e.payload = serde_json::json!({
+                        "request_messages": messages_snapshot,
+                        "response_message": response.message,
+                        "finish_reason": response.finish_reason,
+                    });
+                    e
+                })
+                .await;
+            seq += 1;
 
             let (assistant_content, assistant_tool_calls) = match &response.message {
                 ChatMessage::Assistant {
@@ -164,16 +282,28 @@ impl AgentRunner {
                     tool_calls,
                 } => (content.clone(), tool_calls.clone()),
                 _ => {
+                    let err_msg = "llm returned non-assistant message".to_string();
                     let _ = events
                         .send(AgentEvent::Error {
-                            message: "llm returned non-assistant message".to_string(),
+                            message: err_msg.clone(),
                         })
                         .await;
+                    self.audit
+                        .record({
+                            let mut e = AuditEvent::new(
+                                &ctx.conversation_id, &ctx.run_id, seq, "error",
+                            );
+                            e.error_message = Some(err_msg.clone());
+                            e
+                        })
+                        .await;
+                    seq += 1;
+                    final_status = "error".to_string();
+                    final_error = Some(err_msg);
                     break;
                 }
             };
 
-            // Persist assistant turn in conversation history for the next iteration.
             messages.push(response.message.clone());
 
             if assistant_tool_calls.is_empty() {
@@ -192,27 +322,71 @@ impl AgentRunner {
                     });
                     let _ = events
                         .send(AgentEvent::CategoryConfirmationNeeded {
-                            category_slug: slug,
-                            payload,
+                            category_slug: slug.clone(),
+                            payload: payload.clone(),
                         })
                         .await;
+                    self.audit
+                        .record({
+                            let mut e = AuditEvent::new(
+                                &ctx.conversation_id,
+                                &ctx.run_id,
+                                seq,
+                                "category_confirmation_needed",
+                            );
+                            e.payload = serde_json::json!({
+                                "category_slug": slug,
+                                "payload": payload,
+                            });
+                            e
+                        })
+                        .await;
+                    seq += 1;
                     break;
                 }
 
                 let _ = events
-                    .send(AgentEvent::AssistantMessage { content: cleaned })
+                    .send(AgentEvent::AssistantMessage {
+                        content: cleaned.clone(),
+                    })
                     .await;
+                self.audit
+                    .record({
+                        let mut e = AuditEvent::new(
+                            &ctx.conversation_id,
+                            &ctx.run_id,
+                            seq,
+                            "assistant_message",
+                        );
+                        e.payload = serde_json::json!({ "content": cleaned });
+                        e
+                    })
+                    .await;
+                seq += 1;
+
                 if !followups.is_empty() {
                     let _ = events
                         .send(AgentEvent::Followups {
-                            suggestions: followups,
+                            suggestions: followups.clone(),
                         })
                         .await;
+                    self.audit
+                        .record({
+                            let mut e = AuditEvent::new(
+                                &ctx.conversation_id,
+                                &ctx.run_id,
+                                seq,
+                                "followups",
+                            );
+                            e.payload = serde_json::json!({ "suggestions": followups });
+                            e
+                        })
+                        .await;
+                    seq += 1;
                 }
                 break;
             }
 
-            // Execute each tool call sequentially, append a Tool message per call.
             for call in assistant_tool_calls {
                 let parsed_args: Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
@@ -226,9 +400,46 @@ impl AgentRunner {
                     .await;
 
                 let tool_name = call.function.name.clone();
+                let tool_started = Instant::now();
                 let (tool_msg, tool_data) = self
-                    .execute_tool(db, &call, parsed_args, &events, &mut cited)
+                    .execute_tool(db, &call, parsed_args.clone(), &events, &mut cited)
                     .await;
+                let tool_duration_ms = tool_started.elapsed().as_millis() as i64;
+
+                // Decide ok/error from the tool result payload we just got.
+                let ok = tool_data.is_some();
+                let tool_error_msg = if !ok {
+                    Some(match &tool_msg {
+                        ChatMessage::Tool { content, .. } => content.clone(),
+                        _ => "tool failed".to_string(),
+                    })
+                } else {
+                    None
+                };
+
+                // ---------- audit: tool_call ----------
+                self.audit
+                    .record({
+                        let mut e = AuditEvent::new(
+                            &ctx.conversation_id,
+                            &ctx.run_id,
+                            seq,
+                            "tool_call",
+                        );
+                        e.duration_ms = Some(tool_duration_ms);
+                        e.tool_name = Some(tool_name.clone());
+                        e.ok = Some(ok);
+                        e.error_message = tool_error_msg.clone();
+                        e.payload = serde_json::json!({
+                            "tool_call_id": call.id,
+                            "arguments": parsed_args,
+                            "result_data": tool_data,
+                        });
+                        e
+                    })
+                    .await;
+                seq += 1;
+
                 if tool_name == "resolve_category_intent" {
                     if let Some(data) = tool_data {
                         latest_category_resolution = Some(data);
@@ -241,9 +452,69 @@ impl AgentRunner {
         let _ = events
             .send(AgentEvent::Done {
                 iterations,
-                cited_transaction_ids: cited,
+                cited_transaction_ids: cited.clone(),
             })
             .await;
+
+        // ---------- audit: run_ended ----------
+        self.audit
+            .record({
+                let mut e = AuditEvent::new(
+                    &ctx.conversation_id,
+                    &ctx.run_id,
+                    seq,
+                    "run_ended",
+                );
+                e.status = Some(final_status.clone());
+                e.model = Some(model_label.clone());
+                e.prompt_tokens = Some(total_prompt_tokens);
+                e.completion_tokens = Some(total_completion_tokens);
+                e.cost_micros = Some(total_cost_micros);
+                e.error_message = final_error.clone();
+                e.payload = serde_json::json!({
+                    "iterations": iterations,
+                    "cited_transaction_ids": cited,
+                });
+                e
+            })
+            .await;
+        self.audit.flush().await;
+    }
+
+    /// Finalize after a mid-LLM-call cancellation. Splits out from `run` because the
+    /// `tokio::select!` arm that detects cancellation needs to return early but still
+    /// emit the audit `run_ended`. Lives here so the run() body stays linear.
+    async fn finalize(
+        &self,
+        ctx: &RunContext,
+        seq: i64,
+        status: String,
+        error: Option<String>,
+        iterations: usize,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cost_micros: i64,
+        model_label: &str,
+    ) {
+        self.audit
+            .record({
+                let mut e = AuditEvent::new(
+                    &ctx.conversation_id,
+                    &ctx.run_id,
+                    seq,
+                    "run_ended",
+                );
+                e.status = Some(status);
+                e.model = Some(model_label.to_string());
+                e.prompt_tokens = Some(prompt_tokens);
+                e.completion_tokens = Some(completion_tokens);
+                e.cost_micros = Some(cost_micros);
+                e.error_message = error;
+                e.payload = serde_json::json!({ "iterations": iterations });
+                e
+            })
+            .await;
+        self.audit.flush().await;
     }
 
     async fn execute_tool(
@@ -390,6 +661,19 @@ fn extract_followups(content: &str) -> (String, Vec<String>) {
     let after = &content[end..];
     cleaned.push_str(after.strip_prefix('\n').unwrap_or(after));
     (cleaned.trim_end().to_string(), parsed)
+}
+
+/// Truncate a user-message excerpt to a fixed byte budget on a UTF-8 boundary.
+fn truncate_excerpt(s: &str) -> String {
+    const MAX: usize = 200;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Bound the size of a tool payload before it goes back to the LLM. If the JSON serialises to

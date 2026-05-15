@@ -4,7 +4,6 @@
 //! Sinks are pluggable via the `AuditSink` trait. Production wiring uses `DbAuditSink`.
 //! Tests get `NoopSink` (the default for `AgentRunner`).
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
