@@ -1,5 +1,6 @@
 mod accounts;
 mod agent_chat;
+mod audit_routes;
 mod imports;
 mod plaid;
 mod settings;
@@ -144,6 +145,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/agent/chat",
             post(agent_chat::post_agent_chat_handler),
+        )
+        .route(
+            "/api/v1/audit/conversations",
+            get(audit_routes::list_audit_conversations),
+        )
+        .route("/api/v1/audit/runs", get(audit_routes::list_audit_runs))
+        .route(
+            "/api/v1/audit/runs/:run_id/events",
+            get(audit_routes::get_audit_run_events),
+        )
+        .route(
+            "/api/v1/audit/summary",
+            get(audit_routes::get_audit_summary),
         )
         .route(
             "/api/v1/connections/plaid/link-token",
