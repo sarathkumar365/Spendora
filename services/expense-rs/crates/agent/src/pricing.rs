@@ -119,6 +119,14 @@ fn lookup_env_override(model_label: &str) -> Option<ModelPricing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises tests that mutate the AGENT_PRICING_OVERRIDE env var so they don't race
+    /// against tests reading the built-in price table.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn usage(p: i64, c: i64) -> TokenUsage {
         TokenUsage {
@@ -129,6 +137,10 @@ mod tests {
 
     #[test]
     fn cost_for_known_model_matches_published_rates() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("AGENT_PRICING_OVERRIDE");
+        }
         // gpt-4o-mini: $0.15/M input, $0.60/M output → 100 input + 50 output =
         //   100*150_000/1M + 50*600_000/1M = 15 + 30 = 45 micros.
         let cost = cost_micros_for("openai:gpt-4o-mini", &usage(100, 50)).expect("ok");
@@ -137,17 +149,23 @@ mod tests {
 
     #[test]
     fn cost_for_unknown_model_returns_none() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::remove_var("AGENT_PRICING_OVERRIDE"); }
         assert!(cost_micros_for("openai:unknown-model-xyz", &usage(100, 50)).is_none());
     }
 
     #[test]
     fn cost_handles_zero_tokens() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::remove_var("AGENT_PRICING_OVERRIDE"); }
         let cost = cost_micros_for("openai:gpt-4o-mini", &usage(0, 0)).expect("ok");
         assert_eq!(cost, 0);
     }
 
     #[test]
     fn cost_handles_large_token_counts() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::remove_var("AGENT_PRICING_OVERRIDE"); }
         // 1M tokens at $0.15/M = $0.15 = 150_000 micros.
         let cost = cost_micros_for("openai:gpt-4o-mini", &usage(1_000_000, 0)).expect("ok");
         assert_eq!(cost, 150_000);
@@ -155,11 +173,9 @@ mod tests {
 
     #[test]
     fn env_override_takes_precedence() {
+        let _guard = env_lock().lock().expect("env lock");
         let key = "AGENT_PRICING_OVERRIDE";
         let prev = std::env::var(key).ok();
-        // SAFETY: only one test mutates this env at a time. Guarded by a mutex for portability.
-        // Using set/remove is fine here because we restore after; cargo test runs in parallel but
-        // each test inside this single mod runs in its own thread space.
         unsafe {
             std::env::set_var(key, "openai:gpt-4o-mini=999,888;openai:custom-x=10,20");
         }

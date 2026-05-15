@@ -6,13 +6,14 @@ All processing happens locally (your SQLite DB) except for the LLM call, which g
 
 ## Status
 
-Phases 1–5 shipped. Plan + diagrams in this folder:
+Phases 1–6 shipped. Plan + diagrams in this folder:
 - [plan.md](plan.md) — features, non-goals, risks
 - [phases.md](phases.md) — phase-level status
 - [phase-5-implementation.md](phase-5-implementation.md) — Category Intelligence subsystem
+- [phase-6-audit-trail-plan.md](phase-6-audit-trail-plan.md) — Audit Trail subsystem
 - [architecture-diagram.md](architecture-diagram.md) — system shape
 - [flow-first-time.md](flow-first-time.md) / [flow-learned.md](flow-learned.md) — user flows
-- [data-model.md](data-model.md) — new tables (migration 0012)
+- [data-model.md](data-model.md) — category tables (migration 0012)
 - [learning-over-time.md](learning-over-time.md) — how the system stabilises
 
 ## Configuration
@@ -84,6 +85,52 @@ When the user asks a category question (groceries, dining, transit, …):
 4. Agent calls `confirm_category_assignments` (user_confirmed / user_overridden rows persist forever) → calls `aggregate_transactions` with `merchant_substrings: [<confirmed merchants>]` → final answer.
 
 Next time the user asks about the same category, all merchants are already classified → no LLM classification call, no confirmation card.
+
+## Audit trail (Phase 6)
+
+Every chat run records its full lifecycle to `agent_events` (migration 0013):
+
+- `run_started` — model, provider, user message excerpt
+- `llm_call` — full request + response, tokens, latency, **cost in micro-dollars**
+- `tool_call` — name, args, result, duration, ok/fail
+- `assistant_message` / `followups` / `category_confirmation_needed` — UI events
+- `error` / `truncated` (when applicable)
+- `run_ended` — totals (status, iterations, tokens, cost)
+
+Writes flow through a buffered tokio background task so the SSE stream never blocks on DB I/O. Audit failures log via `tracing::warn` but never break a run.
+
+### Cost tracking
+
+`agent::pricing` has a hardcoded price table for OpenAI models. `AGENT_PRICING_OVERRIDE` env var lets you add models or override rates:
+```
+AGENT_PRICING_OVERRIDE="openai:gpt-5=3000000,12000000;openai:custom=100,500"
+```
+Values are micro-dollars per 1M tokens (so `150_000` means $0.15/M).
+
+### Inspecting the audit
+
+**UI:** click the **Activity** tab. See cost rollups (7d / 30d / all-time), conversation summaries, recent runs, and full event replays.
+
+**API:**
+- `GET /api/v1/audit/conversations?limit=50` — per-session rollups (incl. per-session $)
+- `GET /api/v1/audit/runs?limit=100` — recent completed runs
+- `GET /api/v1/audit/runs/:run_id/events` — full event sequence for one run
+- `GET /api/v1/audit/summary?days=7` — window totals; omit `days` for all-time
+
+**SQL examples:**
+```sql
+-- Total cost in the last 7 days
+SELECT printf('$%.4f', SUM(cost_micros) / 1000000.0) FROM agent_events
+WHERE event_kind='llm_call' AND occurred_at >= date('now','-7 days');
+
+-- Most expensive runs
+SELECT run_id, cost_micros / 1000000.0 AS dollars FROM agent_events
+WHERE event_kind='run_ended' ORDER BY cost_micros DESC LIMIT 10;
+
+-- Tool call frequency
+SELECT tool_name, COUNT(*) FROM agent_events
+WHERE event_kind='tool_call' GROUP BY tool_name ORDER BY COUNT(*) DESC;
+```
 
 ## Testing
 

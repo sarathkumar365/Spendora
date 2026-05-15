@@ -1,7 +1,7 @@
 # Phase 6 — Audit Trail Subsystem
 
-Date: 2026-05-15
-Status: Approved scope, ready to build
+Date: 2026-05-15 (shipped 2026-05-15)
+Status: ✅ Shipped (6a–6g)
 Estimate: ~7 hours across 7 sub-phases
 
 A persistent, queryable record of everything the agent system does — every chat run, every LLM call (with full prompts + responses), every tool call, every mutation, every error. Local-only, written to the same SQLite DB.
@@ -149,15 +149,15 @@ Env override: `AGENT_PRICING_OVERRIDE=model=in,out;…` for unknown models.
 
 ## Sub-phases
 
-| | Sub-phase | Time |
-|---|---|---|
-| 6a | Migration 0013, storage helpers, `AuditSink` trait, `NoopSink`, `DbAuditSink` with background writer | 90 min |
-| 6b | `LlmProvider`: extract `usage` from OpenAI response; cost calculator with model price table | 45 min |
-| 6c | Wire `AgentRunner` to call `sink.record_event(...)` at every event; capture full LLM payloads | 90 min |
-| 6d | API endpoints: `GET /audit/conversations` (rollups + per-session cost), `GET /audit/runs` (recent run list), `GET /audit/runs/:run_id/events` (replay), `GET /audit/summary` (totals — 7d, 30d, all-time) | 45 min |
-| 6e | UI "Details" expander per assistant turn (model, latency, tokens, cost, tool breakdown, optional raw LLM JSON) | 60 min |
-| 6f | UI Activity tab — two views: Conversations (with per-session $ cost, run count, last active) and Runs (chronological, filters by date/status/min cost). Click a row → full-run drawer (all events in sequence) | 90 min |
-| 6g | Tests, smoke script extension, README updates | 60 min |
+| | Sub-phase | Status | Commit |
+|---|---|---|---|
+| 6a | Migration 0013, storage helpers, `AuditSink` trait, `NoopSink`, `DbAuditSink` with background writer | ✅ | `1cf9f24` |
+| 6b | `LlmProvider`: extract `usage` from OpenAI response; cost calculator with model price table | ✅ | `67271f2` |
+| 6c | Wire `AgentRunner` to call `sink.record(...)` at every event; capture full LLM payloads | ✅ | `c49c128` |
+| 6d | API endpoints: conversations, runs, run events, summary | ✅ | `b1107dc` |
+| 6e | UI "Details" expander per assistant turn + stable conversation_id | ✅ | `cd0e73d` |
+| 6f | UI Activity tab — Conversations / Runs views + run drawer | ✅ | `c8f201a` |
+| 6g | Smoke script extension + README update | ✅ | (this commit) |
 
 ## Build order
 

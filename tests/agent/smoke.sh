@@ -55,4 +55,24 @@ grep -q '^event: assistant_message' "$tmpfile" || fail "stream missing 'assistan
 grep -q '^event: done'              "$tmpfile" || fail "stream missing 'done' event"
 green "✓ SSE stream emitted started/tool_*/assistant_message/done"
 
+# --- Audit endpoints (Phase 6) ---
+
+info "GET /api/v1/audit/summary"
+summary=$(curl -sf --max-time 5 "${BASE}/api/v1/audit/summary") || fail "/audit/summary failed"
+echo "$summary" | grep -q '"total_cost_micros"'   || fail "summary missing 'total_cost_micros'"
+echo "$summary" | grep -q '"total_cost_dollars"'  || fail "summary missing 'total_cost_dollars'"
+echo "$summary" | grep -q '"llm_call_count"'      || fail "summary missing 'llm_call_count'"
+green "✓ audit summary endpoint responding"
+
+info "GET /api/v1/audit/conversations"
+conv=$(curl -sf --max-time 5 "${BASE}/api/v1/audit/conversations?limit=5") || fail "/audit/conversations failed"
+# After running the chat above, at least one conversation row should exist.
+echo "$conv" | grep -q '"conversation_id"' || fail "no conversations recorded — runtime instrumentation may be broken"
+green "✓ audit conversations endpoint shows recent runs"
+
+info "GET /api/v1/audit/runs"
+runs=$(curl -sf --max-time 5 "${BASE}/api/v1/audit/runs?limit=5") || fail "/audit/runs failed"
+echo "$runs" | grep -q '"run_id"' || fail "no completed runs — run_ended audit event may be missing"
+green "✓ audit runs endpoint shows recent run_ended rows"
+
 green "All agent smoke checks passed."
