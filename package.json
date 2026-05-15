@@ -15,6 +15,7 @@
     "test:step1:smoke": "bash tests/step1/smoke.sh",
     "test:step1:stress": "bash tests/step1/stress-lite.sh",
     "test:step1": "bash tests/step1/run-all.sh",
+    "test:agent": "bash tests/agent/smoke.sh",
     "dev:ps": "bash scripts/dev-clean.sh list",
     "dev:clean": "bash scripts/dev-clean.sh clean",
     "dev-clean:list": "npm run dev:ps",

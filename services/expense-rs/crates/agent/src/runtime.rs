@@ -10,6 +10,12 @@ use crate::tools::{AgentDeps, ToolRegistry};
 
 pub const DEFAULT_MAX_ITERATIONS: usize = 6;
 
+/// Hard cap on the JSON size we feed back to the LLM as a tool result. SQLite tools can
+/// occasionally return very large payloads (e.g. 500-row query_transactions); the UI still
+/// gets the full data via the SSE event, but the LLM-bound copy is summarised to keep prompts
+/// fast and cheap.
+const MAX_TOOL_PAYLOAD_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -299,10 +305,11 @@ impl AgentRunner {
                         error: None,
                     })
                     .await;
+                let llm_content = truncate_tool_payload(&out.data, MAX_TOOL_PAYLOAD_BYTES);
                 (
                     ChatMessage::Tool {
                         tool_call_id: call.id.clone(),
-                        content: out.data.to_string(),
+                        content: llm_content,
                     },
                     Some(data),
                 )
@@ -383,6 +390,54 @@ fn extract_followups(content: &str) -> (String, Vec<String>) {
     let after = &content[end..];
     cleaned.push_str(after.strip_prefix('\n').unwrap_or(after));
     (cleaned.trim_end().to_string(), parsed)
+}
+
+/// Bound the size of a tool payload before it goes back to the LLM. If the JSON serialises to
+/// more than `max_bytes`, we trim large arrays — preserving the top-level summary fields
+/// (count, totals) — and append a truncation note so the model knows it didn't see everything.
+fn truncate_tool_payload(data: &Value, max_bytes: usize) -> String {
+    let full = data.to_string();
+    if full.len() <= max_bytes {
+        return full;
+    }
+
+    // For objects, replace any large array with a head sample + a note.
+    if let Value::Object(map) = data {
+        let mut trimmed = serde_json::Map::with_capacity(map.len());
+        for (k, v) in map {
+            match v {
+                Value::Array(arr) if arr.len() > 20 => {
+                    let head: Vec<Value> = arr.iter().take(20).cloned().collect();
+                    trimmed.insert(k.clone(), Value::Array(head));
+                    trimmed.insert(
+                        format!("_{k}_truncated_note"),
+                        Value::String(format!(
+                            "truncated to first 20 of {} entries to fit context",
+                            arr.len()
+                        )),
+                    );
+                }
+                _ => {
+                    trimmed.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let s = Value::Object(trimmed).to_string();
+        if s.len() <= max_bytes {
+            return s;
+        }
+        // Still too big: fall through to byte-level truncation.
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n…[truncated; original payload was {} bytes]",
+        &full[..end],
+        full.len()
+    )
 }
 
 /// Detect the `CATEGORY_CONFIRMATION_NEEDED: <slug>` sentinel in the assistant message.
@@ -533,5 +588,29 @@ mod tests {
     #[test]
     fn extract_confirmation_slug_returns_none_when_absent() {
         assert_eq!(extract_confirmation_slug("just an answer"), None);
+    }
+
+    #[test]
+    fn truncate_tool_payload_passes_through_small_payloads() {
+        let data = serde_json::json!({ "count": 3, "transactions": [1, 2, 3] });
+        let out = truncate_tool_payload(&data, 1024);
+        assert!(out.contains("\"count\":3"));
+        assert!(out.contains("[1,2,3]"));
+        assert!(!out.contains("_truncated_note"));
+    }
+
+    #[test]
+    fn truncate_tool_payload_trims_large_arrays_and_keeps_metadata() {
+        let big: Vec<i64> = (0..200).collect();
+        let data = serde_json::json!({
+            "count": 200,
+            "total_outflow_cents": 1234567,
+            "transactions": big,
+        });
+        // Force trimming by using a tight budget.
+        let out = truncate_tool_payload(&data, 256);
+        assert!(out.contains("\"count\":200"));
+        assert!(out.contains("\"total_outflow_cents\":1234567"));
+        assert!(out.contains("_transactions_truncated_note"));
     }
 }

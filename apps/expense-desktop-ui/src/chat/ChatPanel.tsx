@@ -270,7 +270,7 @@ export function ChatPanel({ apiBaseUrl }: Props) {
       const res = await fetch(`${apiBaseUrl}/api/v1/agent/context`);
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(text || `request failed (${res.status})`);
+        throw new Error(friendlyHttpError(res.status, text));
       }
       const json = (await res.json()) as AgentContextResponse;
       setCtx(json);
@@ -330,7 +330,7 @@ export function ChatPanel({ apiBaseUrl }: Props) {
 
       if (!res.ok || !res.body) {
         const text = await res.text();
-        throw new Error(text || `request failed (${res.status})`);
+        throw new Error(friendlyHttpError(res.status, text));
       }
 
       const reader = res.body.getReader();
@@ -353,6 +353,12 @@ export function ChatPanel({ apiBaseUrl }: Props) {
     } catch (err) {
       if ((err as { name?: string })?.name === "AbortError") {
         applyError(assistantTurn.id, "Cancelled.");
+      } else if (err instanceof TypeError) {
+        // `fetch` throws TypeError for network/DNS errors with no HTTP response.
+        applyError(
+          assistantTurn.id,
+          "Couldn't reach the local agent service. Make sure Spendora's API process is running."
+        );
       } else {
         applyError(assistantTurn.id, err instanceof Error ? err.message : String(err));
       }
@@ -882,6 +888,25 @@ function CitationDrawer({
       </aside>
     </div>
   );
+}
+
+function friendlyHttpError(status: number, body: string): string {
+  const snippet = body.trim().slice(0, 200);
+  switch (status) {
+    case 429:
+      return "Hit a rate limit on the LLM provider. Wait a moment and try again.";
+    case 401:
+    case 403:
+      return "The LLM provider rejected the API key. Check OPENAI_API_KEY in your .env.";
+    case 503:
+      return snippet || "The agent service is unavailable — provider may not be configured.";
+    case 500:
+    case 502:
+    case 504:
+      return `Local API error (HTTP ${status})${snippet ? `: ${snippet}` : ""}`;
+    default:
+      return snippet || `Request failed (HTTP ${status})`;
+  }
 }
 
 function parseSse(raw: string): AgentEvent | null {
