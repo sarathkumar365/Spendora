@@ -87,7 +87,7 @@ mod tests {
             .await
             .expect("insert tx2");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let resp = get_transactions_handler(
             State(state),
             Query(TransactionsQueryParams {

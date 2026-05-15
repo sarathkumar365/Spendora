@@ -370,7 +370,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = get_statement_coverage_handler(
             State(state),
@@ -422,7 +422,7 @@ mod tests {
             .await
             .expect("insert tx");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let rows = list_statement_transactions_handler(State(state), Path(statement.id))
             .await
             .expect("statement tx response")
@@ -451,7 +451,7 @@ mod tests {
             .await
             .expect("insert manual tx");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let payload = get_statement_coverage_handler(
             State(state),
             Query(CoverageQueryParams {
@@ -507,7 +507,7 @@ mod tests {
             .await
             .expect("insert linked tx");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let coverage = get_statement_coverage_handler(
             State(state.clone()),
             Query(CoverageQueryParams {

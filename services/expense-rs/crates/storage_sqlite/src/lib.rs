@@ -2276,6 +2276,378 @@ pub async fn list_card_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<Account
         .collect())
 }
 
+// =============================================================================
+// Category Intelligence (migration 0012)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryRow {
+    pub id: String,
+    pub name: String,
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerchantSignatureRow {
+    pub id: String,
+    pub normalized_key: String,
+    pub display_label: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub txn_count: i64,
+    pub total_cents: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerchantInWindow {
+    pub merchant_signature_id: String,
+    pub normalized_key: String,
+    pub display_label: String,
+    pub txn_count: i64,
+    pub total_cents: i64,
+    pub sample_descriptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerchantAssignmentRow {
+    pub id: String,
+    pub merchant_signature_id: String,
+    pub category_id: String,
+    pub source: String,
+    pub included: bool,
+    pub confidence: Option<f64>,
+    pub confirmed_by_user_at: Option<String>,
+    pub display_label: String,
+    pub normalized_key: String,
+}
+
+pub async fn list_categories(pool: &SqlitePool) -> anyhow::Result<Vec<CategoryRow>> {
+    let rows = sqlx::query(
+        "SELECT id, name, slug FROM categories ORDER BY slug IS NULL, slug ASC, name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| CategoryRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            slug: r.try_get::<Option<String>, _>("slug").unwrap_or(None),
+        })
+        .collect())
+}
+
+pub async fn find_category_by_slug_or_name(
+    pool: &SqlitePool,
+    needle: &str,
+) -> anyhow::Result<Option<CategoryRow>> {
+    let normalized = needle.trim().to_lowercase();
+    let row = sqlx::query(
+        "SELECT id, name, slug FROM categories \
+         WHERE LOWER(COALESCE(slug, '')) = ?1 OR LOWER(name) = ?1 \
+         LIMIT 1",
+    )
+    .bind(&normalized)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| CategoryRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        slug: r.try_get::<Option<String>, _>("slug").unwrap_or(None),
+    }))
+}
+
+/// Normalize a raw merchant description string into a stable key for grouping.
+/// Lowercases, strips digits/punctuation, collapses whitespace.
+pub fn normalize_merchant_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphabetic() {
+            out.push(c);
+            prev_space = false;
+        } else if c.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else if !prev_space && !out.is_empty() {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Lazily populate `merchant_signatures` for every distinct merchant appearing in the given
+/// transaction window, and return them with sample descriptions. Idempotent — re-running on
+/// the same window updates stats but never duplicates rows.
+pub async fn list_merchants_in_window(
+    pool: &SqlitePool,
+    date_from: &str,
+    date_to: &str,
+    account_id: Option<&str>,
+    direction: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Vec<MerchantInWindow>> {
+    let mut sql = String::from(
+        "SELECT description, account_id, amount_cents, booked_at \
+         FROM transactions \
+         WHERE booked_at >= ?1 AND booked_at <= ?2",
+    );
+    let mut bind_idx = 3;
+    let mut acc_bind = None;
+    let mut dir_bind = None;
+    if let Some(a) = account_id {
+        sql.push_str(&format!(" AND account_id = ?{bind_idx}"));
+        bind_idx += 1;
+        acc_bind = Some(a.to_string());
+    }
+    if let Some(d) = direction {
+        sql.push_str(&format!(" AND direction = ?{bind_idx}"));
+        dir_bind = Some(d.to_string());
+    }
+
+    let mut q = sqlx::query(&sql).bind(date_from).bind(date_to);
+    if let Some(v) = &acc_bind {
+        q = q.bind(v);
+    }
+    if let Some(v) = &dir_bind {
+        q = q.bind(v);
+    }
+
+    let raw_rows = q.fetch_all(pool).await?;
+
+    // Group in-memory by normalized key.
+    let mut buckets: std::collections::HashMap<String, MerchantBucket> =
+        std::collections::HashMap::new();
+    for row in raw_rows {
+        let description: String = row.get("description");
+        let key = normalize_merchant_key(&description);
+        if key.is_empty() {
+            continue;
+        }
+        let amount: i64 = row.get("amount_cents");
+        let booked: String = row.get("booked_at");
+        let entry = buckets.entry(key.clone()).or_insert_with(|| MerchantBucket {
+            normalized_key: key,
+            display_label: description.clone(),
+            sample_descriptions: vec![],
+            txn_count: 0,
+            total_cents: 0,
+            first_seen: booked.clone(),
+            last_seen: booked.clone(),
+        });
+        entry.txn_count += 1;
+        entry.total_cents += amount.abs();
+        if booked < entry.first_seen {
+            entry.first_seen = booked.clone();
+        }
+        if booked > entry.last_seen {
+            entry.last_seen = booked.clone();
+        }
+        if entry.sample_descriptions.len() < 3
+            && !entry.sample_descriptions.contains(&description)
+        {
+            entry.sample_descriptions.push(description);
+        }
+    }
+
+    // Sort by txn_count desc and cap.
+    let mut bucket_list: Vec<MerchantBucket> = buckets.into_values().collect();
+    bucket_list.sort_by(|a, b| b.txn_count.cmp(&a.txn_count));
+    bucket_list.truncate(limit as usize);
+
+    // Upsert each into merchant_signatures and resolve its id.
+    let mut out = Vec::with_capacity(bucket_list.len());
+    for bucket in bucket_list {
+        let id = upsert_merchant_signature(
+            pool,
+            &bucket.normalized_key,
+            &bucket.display_label,
+            bucket.txn_count,
+            bucket.total_cents,
+            &bucket.first_seen,
+            &bucket.last_seen,
+        )
+        .await?;
+        out.push(MerchantInWindow {
+            merchant_signature_id: id,
+            normalized_key: bucket.normalized_key,
+            display_label: bucket.display_label,
+            txn_count: bucket.txn_count,
+            total_cents: bucket.total_cents,
+            sample_descriptions: bucket.sample_descriptions,
+        });
+    }
+    Ok(out)
+}
+
+struct MerchantBucket {
+    normalized_key: String,
+    display_label: String,
+    sample_descriptions: Vec<String>,
+    txn_count: i64,
+    total_cents: i64,
+    first_seen: String,
+    last_seen: String,
+}
+
+pub async fn upsert_merchant_signature(
+    pool: &SqlitePool,
+    normalized_key: &str,
+    display_label: &str,
+    txn_count_delta: i64,
+    total_cents_delta: i64,
+    first_seen_at: &str,
+    last_seen_at: &str,
+) -> anyhow::Result<String> {
+    // Try insert; on conflict, update counts + last_seen.
+    let existing: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT id, first_seen_at, last_seen_at FROM merchant_signatures WHERE normalized_key = ?1",
+    )
+    .bind(normalized_key)
+    .fetch_optional(pool)
+    .await?;
+
+    match existing {
+        Some((id, current_first, current_last)) => {
+            let new_first = if first_seen_at < current_first.as_str() {
+                first_seen_at
+            } else {
+                current_first.as_str()
+            };
+            let new_last = if last_seen_at > current_last.as_str() {
+                last_seen_at
+            } else {
+                current_last.as_str()
+            };
+            sqlx::query(
+                "UPDATE merchant_signatures SET \
+                 txn_count = ?1, total_cents = ?2, first_seen_at = ?3, last_seen_at = ?4, \
+                 display_label = ?5, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = ?6",
+            )
+            .bind(txn_count_delta)
+            .bind(total_cents_delta)
+            .bind(new_first)
+            .bind(new_last)
+            .bind(display_label)
+            .bind(&id)
+            .execute(pool)
+            .await?;
+            Ok(id)
+        }
+        None => {
+            let id = new_idempotency_key();
+            sqlx::query(
+                "INSERT INTO merchant_signatures \
+                 (id, normalized_key, display_label, first_seen_at, last_seen_at, txn_count, total_cents) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&id)
+            .bind(normalized_key)
+            .bind(display_label)
+            .bind(first_seen_at)
+            .bind(last_seen_at)
+            .bind(txn_count_delta)
+            .bind(total_cents_delta)
+            .execute(pool)
+            .await?;
+            Ok(id)
+        }
+    }
+}
+
+pub async fn load_assignments_for_category(
+    pool: &SqlitePool,
+    category_id: &str,
+) -> anyhow::Result<Vec<MerchantAssignmentRow>> {
+    let rows = sqlx::query(
+        "SELECT mca.id, mca.merchant_signature_id, mca.category_id, mca.source, \
+         mca.included, mca.confidence, mca.confirmed_by_user_at, \
+         ms.display_label, ms.normalized_key \
+         FROM merchant_category_assignments mca \
+         JOIN merchant_signatures ms ON ms.id = mca.merchant_signature_id \
+         WHERE mca.category_id = ?1",
+    )
+    .bind(category_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| MerchantAssignmentRow {
+            id: r.get("id"),
+            merchant_signature_id: r.get("merchant_signature_id"),
+            category_id: r.get("category_id"),
+            source: r.get("source"),
+            included: r.get::<i64, _>("included") != 0,
+            confidence: r.try_get::<Option<f64>, _>("confidence").unwrap_or(None),
+            confirmed_by_user_at: r
+                .try_get::<Option<String>, _>("confirmed_by_user_at")
+                .unwrap_or(None),
+            display_label: r.get("display_label"),
+            normalized_key: r.get("normalized_key"),
+        })
+        .collect())
+}
+
+pub async fn upsert_merchant_category_assignment(
+    pool: &SqlitePool,
+    merchant_signature_id: &str,
+    category_id: &str,
+    source: &str,
+    included: bool,
+    confidence: Option<f64>,
+    confirmed_by_user_at: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO merchant_category_assignments \
+         (id, merchant_signature_id, category_id, source, included, confidence, confirmed_by_user_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(merchant_signature_id, category_id) DO UPDATE SET \
+         source = excluded.source, \
+         included = excluded.included, \
+         confidence = excluded.confidence, \
+         confirmed_by_user_at = excluded.confirmed_by_user_at, \
+         updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(new_idempotency_key())
+    .bind(merchant_signature_id)
+    .bind(category_id)
+    .bind(source)
+    .bind(if included { 1_i64 } else { 0_i64 })
+    .bind(confidence)
+    .bind(confirmed_by_user_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn append_category_history(
+    pool: &SqlitePool,
+    merchant_signature_id: &str,
+    category_id: &str,
+    source: &str,
+    user_action: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO category_resolution_history \
+         (id, merchant_signature_id, category_id, source, user_action) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(new_idempotency_key())
+    .bind(merchant_signature_id)
+    .bind(category_id)
+    .bind(source)
+    .bind(user_action)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn enqueue_job(
     pool: &SqlitePool,
     job_type: &str,
@@ -2413,6 +2785,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0011_card_identity_canonical_fields",
         include_str!("../../../migrations/0011_card_identity_canonical_fields.sql"),
+    ),
+    (
+        "0012_category_intelligence",
+        include_str!("../../../migrations/0012_category_intelligence.sql"),
     ),
 ];
 
@@ -3586,6 +3962,235 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].details.as_deref(), Some("Linked 1"));
         assert_eq!(rows[0].statement_id.as_deref(), Some(statement.id.as_str()));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    // ---------- Category Intelligence helpers (migration 0012) ----------
+
+    async fn fresh_migrated_pool() -> (SqlitePool, PathBuf) {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect");
+        run_migrations(&pool).await.expect("migrate");
+        (pool, db_path)
+    }
+
+    async fn seed_txns(pool: &SqlitePool, rows: &[(&str, &str, &str, i64, &str)]) {
+        // Ensure a connection + account exist
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO connections (id, provider, status) VALUES ('conn-1', 'manual', 'active')",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO accounts (id, connection_id, name, currency_code, account_type, account_number_ending, customer_name) \
+             VALUES ('acct-cat', 'conn-1', 'Test Acct', 'CAD', 'chequing', '0001', 'TEST USER')",
+        )
+        .execute(pool)
+        .await;
+        for (id, descr, booked, cents, direction) in rows {
+            sqlx::query(
+                "INSERT OR REPLACE INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, direction, direction_source) \
+                 VALUES (?1, 'acct-cat', ?1, ?2, 'CAD', ?3, ?4, 'manual', ?5, 'seed')",
+            )
+            .bind(id)
+            .bind(*cents)
+            .bind(*descr)
+            .bind(*booked)
+            .bind(*direction)
+            .execute(pool)
+            .await
+            .expect("seed txn");
+        }
+    }
+
+    #[test]
+    fn normalize_merchant_key_collapses_variants() {
+        assert_eq!(normalize_merchant_key("LOBLAWS GREAT FOOD #1234"), "loblaws great food");
+        assert_eq!(normalize_merchant_key("LOBLAWS WESTON CASH"), "loblaws weston cash");
+        assert_eq!(normalize_merchant_key("TIM HORTONS  #5589"), "tim hortons");
+        assert_eq!(normalize_merchant_key("  WALMART SUPERCENTRE!! "), "walmart supercentre");
+        assert_eq!(normalize_merchant_key(""), "");
+        assert_eq!(normalize_merchant_key("12345"), "");
+    }
+
+    #[tokio::test]
+    async fn list_categories_returns_seeded_set() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        let cats = list_categories(&pool).await.expect("list");
+        assert!(cats.iter().any(|c| c.slug.as_deref() == Some("groceries")));
+        assert!(cats.iter().any(|c| c.slug.as_deref() == Some("entertainment")));
+        assert!(cats.len() >= 13);
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn find_category_by_slug_or_name_matches_both() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        let by_slug = find_category_by_slug_or_name(&pool, "groceries").await.expect("ok");
+        assert!(by_slug.is_some());
+        let by_name = find_category_by_slug_or_name(&pool, "Dining & Restaurants")
+            .await
+            .expect("ok");
+        assert!(by_name.is_some());
+        let none = find_category_by_slug_or_name(&pool, "nope").await.expect("ok");
+        assert!(none.is_none());
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn list_merchants_in_window_dedups_and_populates_signatures() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        // Two identical-after-normalization rows + two distinct merchants.
+        seed_txns(
+            &pool,
+            &[
+                ("t1", "METRO #455 TORONTO", "2026-04-05", 5000, "debit"),
+                ("t2", "METRO #455 TORONTO", "2026-04-12", 3200, "debit"),
+                ("t3", "LOBLAWS GREAT FOOD", "2026-04-15", 2400, "debit"),
+                ("t4", "NETFLIX.COM", "2026-04-20", 1599, "debit"),
+            ],
+        )
+        .await;
+
+        let merchants = list_merchants_in_window(
+            &pool,
+            "2026-04-01",
+            "2026-04-30",
+            None,
+            Some("debit"),
+            100,
+        )
+        .await
+        .expect("list");
+
+        // The two identical Metro rows collapse into one signature.
+        let metro = merchants
+            .iter()
+            .find(|m| m.normalized_key.starts_with("metro"))
+            .expect("metro present");
+        assert_eq!(metro.txn_count, 2);
+        assert_eq!(metro.total_cents, 5000 + 3200);
+        assert!(!metro.sample_descriptions.is_empty());
+
+        // 3 distinct merchant signatures total
+        let unique_keys: std::collections::HashSet<_> =
+            merchants.iter().map(|m| &m.normalized_key).collect();
+        assert_eq!(unique_keys.len(), 3);
+
+        let sig_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM merchant_signatures")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(sig_count, 3);
+
+        // Re-running on the same window must not duplicate signatures
+        let _ = list_merchants_in_window(
+            &pool, "2026-04-01", "2026-04-30", None, Some("debit"), 100,
+        )
+        .await
+        .expect("list 2");
+        let sig_count2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM merchant_signatures")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(sig_count2, 3, "re-run should be idempotent");
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn upsert_assignment_and_history_roundtrip() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        seed_txns(
+            &pool,
+            &[("t1", "LOBLAWS", "2026-04-05", 5000, "debit")],
+        )
+        .await;
+        let merchants = list_merchants_in_window(
+            &pool, "2026-04-01", "2026-04-30", None, Some("debit"), 10,
+        )
+        .await
+        .expect("list");
+        let mid = merchants[0].merchant_signature_id.clone();
+
+        let cat = find_category_by_slug_or_name(&pool, "groceries")
+            .await
+            .expect("ok")
+            .expect("present");
+
+        // First write: llm_suggested
+        upsert_merchant_category_assignment(
+            &pool, &mid, &cat.id, "llm_suggested", true, Some(0.95), None,
+        )
+        .await
+        .expect("upsert 1");
+        append_category_history(&pool, &mid, &cat.id, "llm_suggested", None)
+            .await
+            .expect("history 1");
+
+        // Second write: user_confirmed should REPLACE the row
+        upsert_merchant_category_assignment(
+            &pool, &mid, &cat.id, "user_confirmed", true, Some(0.95), Some("2026-04-30T12:00:00Z"),
+        )
+        .await
+        .expect("upsert 2");
+        append_category_history(&pool, &mid, &cat.id, "user_confirmed", Some("included"))
+            .await
+            .expect("history 2");
+
+        let assignments = load_assignments_for_category(&pool, &cat.id).await.expect("load");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].source, "user_confirmed");
+        assert!(assignments[0].confirmed_by_user_at.is_some());
+
+        // History has both rows
+        let h_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM category_resolution_history")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(h_count, 2);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn user_overridden_excluded_assignment_persists() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        seed_txns(
+            &pool,
+            &[("t1", "COSTCO WHOLESALE", "2026-04-05", 14200, "debit")],
+        )
+        .await;
+        let merchants = list_merchants_in_window(
+            &pool, "2026-04-01", "2026-04-30", None, Some("debit"), 10,
+        )
+        .await
+        .expect("list");
+        let mid = merchants[0].merchant_signature_id.clone();
+        let cat = find_category_by_slug_or_name(&pool, "groceries")
+            .await
+            .expect("ok")
+            .unwrap();
+
+        upsert_merchant_category_assignment(
+            &pool, &mid, &cat.id, "user_overridden", false, Some(0.55), Some("2026-04-30T12:00:00Z"),
+        )
+        .await
+        .expect("upsert");
+
+        let assignments = load_assignments_for_category(&pool, &cat.id).await.expect("load");
+        assert_eq!(assignments.len(), 1);
+        assert!(!assignments[0].included);
+        assert_eq!(assignments[0].source, "user_overridden");
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;

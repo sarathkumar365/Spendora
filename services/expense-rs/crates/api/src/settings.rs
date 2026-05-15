@@ -111,7 +111,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = get_extraction_settings_handler(State(state))
             .await
@@ -133,7 +133,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = put_extraction_settings_handler(
             State(state),
@@ -159,7 +159,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = put_extraction_settings_handler(
             State(state),
@@ -185,7 +185,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = put_extraction_settings_handler(
             State(state),

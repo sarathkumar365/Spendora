@@ -4,7 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+expense_core = { path = "../core" }
+reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+storage_sqlite = { path = "../storage_sqlite" }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

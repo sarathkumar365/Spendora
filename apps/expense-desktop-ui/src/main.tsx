@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowDownLeft, ArrowUpRight, Circle, Settings2 } from "lucide-react";
 import appIcon from "./assets/app-icon.png";
+import { ChatPanel } from "./chat/ChatPanel";
 import "./styles.css";
 
 type ServiceStartupState = "starting" | "healthy" | "failed";
@@ -990,16 +991,7 @@ export function App() {
           </nav>
         </header>
 
-        {section === "ai" ? (
-          <section className="panel page">
-            <p className="eyebrow">AI-First Home</p>
-            <h2>Copilot workspace (stub)</h2>
-            <p className="muted">
-              This will become the default intelligence workspace for insights and guidance from
-              your saved financial data.
-            </p>
-          </section>
-        ) : null}
+        {section === "ai" ? <ChatPanel apiBaseUrl={API_BASE_URL || ""} /> : null}
 
         {section === "import" ? (
           <section className="panel page import-page" data-testid="import-page">

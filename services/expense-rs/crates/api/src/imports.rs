@@ -548,7 +548,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = create_import_handler(
             State(state),
@@ -580,7 +580,7 @@ mod tests {
         storage_sqlite::ensure_default_manual_account(&pool)
             .await
             .expect("default account");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let raw = b"2026-03-01|Coffee|12.40\n03/01/2026|Broken Date|5.10";
         let encoded = STANDARD.encode(raw);
@@ -692,7 +692,7 @@ mod tests {
             .0;
 
         let status_after_commit = get_import_status_handler(
-            State(Arc::new(AppState { db: pool.clone() })),
+            State(Arc::new(AppState::new_for_tests(pool.clone()))),
             Path(import_id),
         )
         .await
@@ -712,7 +712,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let result = create_import_handler(
             State(state),
@@ -760,7 +760,7 @@ mod tests {
         .await
         .expect("upsert statement");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let created = create_import_handler(
             State(state),
             Json(CreateImportRequest {
@@ -816,7 +816,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let created = create_import_handler(
             State(state.clone()),
@@ -900,7 +900,7 @@ mod tests {
         storage_sqlite::ensure_default_manual_account(&pool)
             .await
             .expect("default account");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let import_id = create_import_handler(
             State(state.clone()),
@@ -960,7 +960,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let import_id = create_import_handler(
             State(state.clone()),
@@ -1031,7 +1031,7 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
 
         let import_id = create_import_handler(
             State(state.clone()),

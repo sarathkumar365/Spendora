@@ -1,4 +1,5 @@
 mod accounts;
+mod agent_chat;
 mod imports;
 mod plaid;
 mod settings;
@@ -13,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use agent::{llm::build_provider_from_env, tools::build_default_registry};
 use clap::Parser;
 use expense_core::{
     default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
@@ -23,6 +25,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use storage_sqlite::{
     connect, get_llama_agent_readiness, run_migrations, LlamaAgentReadiness, SqlitePool,
 };
+use tracing::warn;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing::info;
 
@@ -66,7 +69,26 @@ async fn main() -> anyhow::Result<()> {
         info!("api migrations applied");
     }
 
-    let state = Arc::new(AppState { db: pool });
+    // Build the agent provider + registry once at startup so chat requests don't pay TLS/handshake
+    // setup per call. If the LLM provider env isn't configured, leave provider=None and let the
+    // agent endpoints return a clear error.
+    let agent_provider = match build_provider_from_env() {
+        Ok(p) => {
+            info!(model = %p.model_label(), provider = %p.kind().as_str(), "agent llm provider ready");
+            Some(p)
+        }
+        Err(err) => {
+            warn!(error = %err, "agent llm provider not configured; /api/v1/agent/* will return 503");
+            None
+        }
+    };
+    let agent_registry = Arc::new(build_default_registry());
+
+    let state = Arc::new(AppState {
+        db: pool,
+        agent_provider,
+        agent_registry,
+    });
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/health", get(health))
@@ -110,6 +132,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/settings/extraction",
             get(settings::get_extraction_settings_handler)
                 .put(settings::put_extraction_settings_handler),
+        )
+        .route(
+            "/api/v1/agent/context",
+            get(agent_chat::get_agent_context_handler),
+        )
+        .route(
+            "/api/v1/agent/chat",
+            post(agent_chat::post_agent_chat_handler),
         )
         .route(
             "/api/v1/connections/plaid/link-token",
@@ -307,7 +337,7 @@ mod tests {
         .await
         .expect("save readiness");
 
-        let state = Arc::new(AppState { db: pool.clone() });
+        let state = Arc::new(AppState::new_for_tests(pool.clone()));
         let response = diagnostics(State(state)).await.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
