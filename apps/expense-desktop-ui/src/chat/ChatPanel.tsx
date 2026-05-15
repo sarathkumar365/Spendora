@@ -26,6 +26,28 @@ type ToolEvent = {
   };
 };
 
+type CategoryMerchant = {
+  merchant_signature_id: string;
+  label: string;
+  normalized_key: string;
+  txn_count: number;
+  total_cents: number;
+  sample_descriptions: string[];
+  confidence: number | null;
+};
+
+type CategoryConfirmation = {
+  categorySlug: string;
+  categoryName: string;
+  confirmed: CategoryMerchant[];
+  suggested: CategoryMerchant[];
+  excluded: CategoryMerchant[];
+  /// Set of merchant_signature_ids the user has chosen to include from the suggested list.
+  selectedIds: Set<string>;
+  /// Once Apply is clicked, the card disables itself.
+  applied: boolean;
+};
+
 type ChatTurn = {
   id: string;
   role: ChatRole;
@@ -35,6 +57,7 @@ type ChatTurn = {
   citedIds?: string[];
   truncated?: string | null;
   error?: string | null;
+  categoryConfirmation?: CategoryConfirmation;
 };
 
 type AgentEventBase = { kind: string };
@@ -74,6 +97,16 @@ type DoneEvent = AgentEventBase & {
   iterations: number;
   cited_transaction_ids: string[];
 };
+type CategoryConfirmationNeededEvent = AgentEventBase & {
+  kind: "category_confirmation_needed";
+  category_slug: string;
+  payload: {
+    category: { id?: string; name?: string; slug?: string };
+    confirmed: CategoryMerchant[];
+    suggested: CategoryMerchant[];
+    excluded: CategoryMerchant[];
+  };
+};
 
 type AgentEvent =
   | StartedEvent
@@ -83,7 +116,8 @@ type AgentEvent =
   | FollowupsEvent
   | TruncatedEvent
   | ErrorEvent
-  | DoneEvent;
+  | DoneEvent
+  | CategoryConfirmationNeededEvent;
 
 type AccountSummary = {
   id: string;
@@ -378,6 +412,28 @@ export function ChatPanel({ apiBaseUrl }: Props) {
           }
           case "assistant_message":
             return { ...t, content: event.content };
+          case "category_confirmation_needed": {
+            const p = event.payload ?? { confirmed: [], suggested: [], excluded: [] };
+            const categoryName =
+              p.category?.name ?? event.category_slug.charAt(0).toUpperCase() + event.category_slug.slice(1);
+            return {
+              ...t,
+              categoryConfirmation: {
+                categorySlug: event.category_slug,
+                categoryName,
+                confirmed: p.confirmed ?? [],
+                suggested: p.suggested ?? [],
+                excluded: p.excluded ?? [],
+                // Pre-select high-confidence suggestions (>=0.7) so the user just clicks Apply.
+                selectedIds: new Set(
+                  (p.suggested ?? [])
+                    .filter((m) => (m.confidence ?? 0) >= 0.7)
+                    .map((m) => m.merchant_signature_id)
+                ),
+                applied: false
+              }
+            };
+          }
           case "followups":
             return { ...t, followups: event.suggestions ?? [] };
           case "done":
@@ -401,6 +457,73 @@ export function ChatPanel({ apiBaseUrl }: Props) {
     setTurns((prev) =>
       prev.map((t) => (t.id === turnId ? { ...t, error: message } : t))
     );
+  }
+
+  function toggleCategoryMerchant(turnId: string, merchantId: string) {
+    setTurns((prev) =>
+      prev.map((t) => {
+        if (t.id !== turnId || !t.categoryConfirmation || t.categoryConfirmation.applied) {
+          return t;
+        }
+        const next = new Set(t.categoryConfirmation.selectedIds);
+        if (next.has(merchantId)) {
+          next.delete(merchantId);
+        } else {
+          next.add(merchantId);
+        }
+        return {
+          ...t,
+          categoryConfirmation: { ...t.categoryConfirmation, selectedIds: next }
+        };
+      })
+    );
+  }
+
+  async function applyCategoryConfirmation(turnId: string) {
+    const turn = turns.find((t) => t.id === turnId);
+    const card = turn?.categoryConfirmation;
+    if (!card || card.applied) return;
+
+    // Always include user-confirmed merchants. For suggested ones, the selectedIds set decides.
+    const include: string[] = [];
+    const exclude: string[] = [];
+    for (const m of card.confirmed) include.push(m.merchant_signature_id);
+    for (const m of card.suggested) {
+      if (card.selectedIds.has(m.merchant_signature_id)) {
+        include.push(m.merchant_signature_id);
+      } else {
+        exclude.push(m.merchant_signature_id);
+      }
+    }
+
+    const followup =
+      `[User confirmed category "${card.categorySlug}"]\n` +
+      `Call confirm_category_assignments now with this exact payload:\n` +
+      JSON.stringify(
+        {
+          category: card.categorySlug,
+          assignments: [
+            ...include.map((id) => ({ merchant_signature_id: id, included: true })),
+            ...exclude.map((id) => ({ merchant_signature_id: id, included: false }))
+          ]
+        },
+        null,
+        2
+      ) +
+      `\nThen compute the original spending question for the confirmed merchants ` +
+      `(use aggregate_transactions with merchant_substrings set to their normalized_key values) ` +
+      `and answer in the same format you would have used originally.`;
+
+    // Mark the card applied so it disables.
+    setTurns((prev) =>
+      prev.map((t) =>
+        t.id === turnId && t.categoryConfirmation
+          ? { ...t, categoryConfirmation: { ...t.categoryConfirmation, applied: true } }
+          : t
+      )
+    );
+
+    await sendMessage(followup);
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -484,6 +607,8 @@ export function ChatPanel({ apiBaseUrl }: Props) {
               turn={t}
               onCitationClick={(ids) => setDrawerCitedIds(ids)}
               onFollowupClick={(q) => void sendMessage(q)}
+              onCategoryToggle={(turnId, merchantId) => toggleCategoryMerchant(turnId, merchantId)}
+              onCategoryApply={(turnId) => void applyCategoryConfirmation(turnId)}
               runningLast={running && t.id === turns[turns.length - 1]?.id}
             />
           ))
@@ -530,11 +655,15 @@ function TurnView({
   turn,
   onCitationClick,
   onFollowupClick,
+  onCategoryToggle,
+  onCategoryApply,
   runningLast
 }: {
   turn: ChatTurn;
   onCitationClick: (ids: string[]) => void;
   onFollowupClick: (q: string) => void;
+  onCategoryToggle: (turnId: string, merchantId: string) => void;
+  onCategoryApply: (turnId: string) => void;
   runningLast: boolean;
 }) {
   if (turn.role === "user") {
@@ -574,8 +703,17 @@ function TurnView({
           <div className="chat-assistant-text">
             <ReactMarkdown>{turn.content}</ReactMarkdown>
           </div>
-        ) : !turn.error && !turn.truncated && runningLast ? (
+        ) : !turn.error && !turn.truncated && runningLast && !turn.categoryConfirmation ? (
           <div className="chat-assistant-text muted">…</div>
+        ) : null}
+
+        {turn.categoryConfirmation ? (
+          <CategoryConfirmationCard
+            turnId={turn.id}
+            card={turn.categoryConfirmation}
+            onToggle={onCategoryToggle}
+            onApply={onCategoryApply}
+          />
         ) : null}
 
         {citedIds.length > 0 ? (
@@ -605,6 +743,90 @@ function TurnView({
           <div className="chat-warning">Stopped early: {turn.truncated}</div>
         ) : null}
         {turn.error ? <div className="chat-error">Error: {turn.error}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function CategoryConfirmationCard({
+  turnId,
+  card,
+  onToggle,
+  onApply
+}: {
+  turnId: string;
+  card: CategoryConfirmation;
+  onToggle: (turnId: string, merchantId: string) => void;
+  onApply: (turnId: string) => void;
+}) {
+  const includedCount = card.confirmed.length + card.selectedIds.size;
+  return (
+    <div className={`chat-category-card${card.applied ? " applied" : ""}`}>
+      <header className="chat-category-card-header">
+        <strong>Quick check — which of these are {card.categoryName}?</strong>
+        <span className="muted small">
+          {includedCount} merchant{includedCount === 1 ? "" : "s"} selected
+        </span>
+      </header>
+
+      {card.confirmed.length > 0 ? (
+        <div className="chat-category-card-section">
+          <p className="muted small">Already confirmed — auto-included</p>
+          <ul>
+            {card.confirmed.map((m) => (
+              <li key={m.merchant_signature_id} className="chat-category-row confirmed">
+                <span className="chat-category-row-check">✓</span>
+                <span className="chat-category-row-label">{m.label}</span>
+                <span className="chat-category-row-meta muted small">
+                  {m.txn_count} txn{m.txn_count === 1 ? "" : "s"} · {formatAmount(m.total_cents, "CAD")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {card.suggested.length > 0 ? (
+        <div className="chat-category-card-section">
+          <p className="muted small">Maybe {card.categoryName.toLowerCase()} — toggle as needed</p>
+          <ul>
+            {card.suggested.map((m) => {
+              const checked = card.selectedIds.has(m.merchant_signature_id);
+              return (
+                <li
+                  key={m.merchant_signature_id}
+                  className={`chat-category-row suggested${checked ? " checked" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={card.applied}
+                    onChange={() => onToggle(turnId, m.merchant_signature_id)}
+                  />
+                  <span className="chat-category-row-label">{m.label}</span>
+                  <span className="chat-category-row-meta muted small">
+                    {m.txn_count} txn{m.txn_count === 1 ? "" : "s"} · {formatAmount(m.total_cents, "CAD")}
+                    {m.confidence != null ? ` · ${Math.round(m.confidence * 100)}% confident` : null}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+
+      {card.confirmed.length === 0 && card.suggested.length === 0 ? (
+        <p className="muted small">No matching merchants found in this window.</p>
+      ) : null}
+
+      <div className="chat-category-card-actions">
+        <button
+          className="button"
+          onClick={() => onApply(turnId)}
+          disabled={card.applied || (card.confirmed.length === 0 && card.selectedIds.size === 0)}
+        >
+          {card.applied ? "Applied" : "Apply"}
+        </button>
       </div>
     </div>
   );

@@ -43,6 +43,13 @@ pub enum AgentEvent {
     Followups {
         suggestions: Vec<String>,
     },
+    /// Emitted instead of `AssistantMessage` when the agent ends a run with the sentinel
+    /// `CATEGORY_CONFIRMATION_NEEDED: <slug>`. Carries the latest `resolve_category_intent`
+    /// payload so the UI can render an inline confirmation card.
+    CategoryConfirmationNeeded {
+        category_slug: String,
+        payload: Value,
+    },
     /// Iteration cap hit without a final answer.
     Truncated {
         reason: String,
@@ -96,6 +103,9 @@ impl AgentRunner {
 
         let mut iterations = 0usize;
         let mut cited: Vec<String> = Vec::new();
+        // The latest payload from a `resolve_category_intent` tool call in this run, used to
+        // hydrate the CategoryConfirmationNeeded event if the agent ends with the sentinel.
+        let mut latest_category_resolution: Option<Value> = None;
         let tools = self.registry.definitions();
 
         loop {
@@ -163,6 +173,26 @@ impl AgentRunner {
             if assistant_tool_calls.is_empty() {
                 let raw = assistant_content.unwrap_or_default();
                 let (cleaned, followups) = extract_followups(&raw);
+
+                if let Some(slug) = extract_confirmation_slug(&cleaned) {
+                    let payload = latest_category_resolution.clone().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "category": { "slug": slug.clone() },
+                            "warning": "agent emitted the confirmation sentinel without first calling resolve_category_intent",
+                            "confirmed": [],
+                            "suggested": [],
+                            "excluded": [],
+                        })
+                    });
+                    let _ = events
+                        .send(AgentEvent::CategoryConfirmationNeeded {
+                            category_slug: slug,
+                            payload,
+                        })
+                        .await;
+                    break;
+                }
+
                 let _ = events
                     .send(AgentEvent::AssistantMessage { content: cleaned })
                     .await;
@@ -189,9 +219,15 @@ impl AgentRunner {
                     })
                     .await;
 
-                let tool_msg = self
+                let tool_name = call.function.name.clone();
+                let (tool_msg, tool_data) = self
                     .execute_tool(db, &call, parsed_args, &events, &mut cited)
                     .await;
+                if tool_name == "resolve_category_intent" {
+                    if let Some(data) = tool_data {
+                        latest_category_resolution = Some(data);
+                    }
+                }
                 messages.push(tool_msg);
             }
         }
@@ -211,7 +247,7 @@ impl AgentRunner {
         args: Value,
         events: &mpsc::Sender<AgentEvent>,
         cited: &mut Vec<String>,
-    ) -> ChatMessage {
+    ) -> (ChatMessage, Option<Value>) {
         let tool = match self.registry.get(&call.function.name) {
             Some(t) => t,
             None => {
@@ -228,10 +264,13 @@ impl AgentRunner {
                         error: Some(err.clone()),
                     })
                     .await;
-                return ChatMessage::Tool {
-                    tool_call_id: call.id.clone(),
-                    content: serde_json::json!({ "error": err }).to_string(),
-                };
+                return (
+                    ChatMessage::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: serde_json::json!({ "error": err }).to_string(),
+                    },
+                    None,
+                );
             }
         };
 
@@ -256,14 +295,17 @@ impl AgentRunner {
                         ok: true,
                         summary: out.summary.clone(),
                         transaction_ids: out.transaction_ids.clone(),
-                        data,
+                        data: data.clone(),
                         error: None,
                     })
                     .await;
-                ChatMessage::Tool {
-                    tool_call_id: call.id.clone(),
-                    content: out.data.to_string(),
-                }
+                (
+                    ChatMessage::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: out.data.to_string(),
+                    },
+                    Some(data),
+                )
             }
             Err(err) => {
                 let msg = format!("{err:#}");
@@ -279,10 +321,13 @@ impl AgentRunner {
                         error: Some(msg.clone()),
                     })
                     .await;
-                ChatMessage::Tool {
-                    tool_call_id: call.id.clone(),
-                    content: serde_json::json!({ "error": msg }).to_string(),
-                }
+                (
+                    ChatMessage::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: serde_json::json!({ "error": msg }).to_string(),
+                    },
+                    None,
+                )
             }
         }
     }
@@ -338,6 +383,35 @@ fn extract_followups(content: &str) -> (String, Vec<String>) {
     let after = &content[end..];
     cleaned.push_str(after.strip_prefix('\n').unwrap_or(after));
     (cleaned.trim_end().to_string(), parsed)
+}
+
+/// Detect the `CATEGORY_CONFIRMATION_NEEDED: <slug>` sentinel in the assistant message.
+/// Returns the slug (e.g. "groceries") if present anywhere in the content; otherwise None.
+/// Robust to surrounding text, markdown bold, and trailing punctuation.
+fn extract_confirmation_slug(content: &str) -> Option<String> {
+    for (_, line) in line_offsets(content) {
+        let stripped = line
+            .trim_start_matches('>')
+            .trim_start_matches([' ', '\t'])
+            .trim_start_matches("**")
+            .trim_start();
+        let Some(after_label) = stripped
+            .strip_prefix("CATEGORY_CONFIRMATION_NEEDED:")
+            .or_else(|| stripped.strip_prefix("CATEGORY_CONFIRMATION_NEEDED :"))
+        else {
+            continue;
+        };
+        let slug_part = after_label.trim().trim_end_matches("**").trim();
+        let Some(token) = slug_part.split_whitespace().next() else {
+            continue;
+        };
+        let slug = token.trim_end_matches(['.', ',', ';', ':']);
+        if slug.is_empty() {
+            continue;
+        }
+        return Some(slug.to_string());
+    }
+    None
 }
 
 /// Iterate over (offset, line-without-newline) pairs of `s`.
@@ -428,5 +502,36 @@ mod tests {
         let (cleaned, follows) = extract_followups(input);
         assert_eq!(cleaned, "Answer.");
         assert_eq!(follows, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn extract_confirmation_slug_picks_up_basic_sentinel() {
+        let s = extract_confirmation_slug("CATEGORY_CONFIRMATION_NEEDED: groceries");
+        assert_eq!(s.as_deref(), Some("groceries"));
+    }
+
+    #[test]
+    fn extract_confirmation_slug_strips_trailing_punctuation() {
+        let s = extract_confirmation_slug("CATEGORY_CONFIRMATION_NEEDED: groceries.");
+        assert_eq!(s.as_deref(), Some("groceries"));
+    }
+
+    #[test]
+    fn extract_confirmation_slug_tolerates_markdown_bold() {
+        let s = extract_confirmation_slug("**CATEGORY_CONFIRMATION_NEEDED: dining**");
+        assert_eq!(s.as_deref(), Some("dining"));
+    }
+
+    #[test]
+    fn extract_confirmation_slug_finds_line_mid_message() {
+        let s = extract_confirmation_slug(
+            "Let me check.\nCATEGORY_CONFIRMATION_NEEDED: transit\nThat's the plan."
+        );
+        assert_eq!(s.as_deref(), Some("transit"));
+    }
+
+    #[test]
+    fn extract_confirmation_slug_returns_none_when_absent() {
+        assert_eq!(extract_confirmation_slug("just an answer"), None);
     }
 }

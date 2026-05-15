@@ -1045,3 +1045,78 @@ select.input::-ms-expand {
   margin-top: 2px;
   font-size: 11px;
 }
+
+/* ===== Category confirmation card (Phase 5e) ===== */
+.chat-category-card {
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  background: rgba(37, 99, 235, 0.04);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-category-card.applied {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.chat-category-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-category-card-section ul {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-category-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+
+.chat-category-row.suggested:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.chat-category-row.suggested.checked {
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.chat-category-row.confirmed {
+  background: rgba(16, 185, 129, 0.06);
+}
+
+.chat-category-row-check {
+  color: #047857;
+  font-weight: 700;
+  font-size: 14px;
+  width: 16px;
+  text-align: center;
+}
+
+.chat-category-row-label {
+  font-weight: 500;
+}
+
+.chat-category-row-meta {
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-category-card-actions {
+  display: flex;
+  justify-content: flex-end;
+}

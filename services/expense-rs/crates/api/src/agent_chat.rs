@@ -225,6 +225,7 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCallResult { .. } => "tool_call_result",
         AgentEvent::AssistantMessage { .. } => "assistant_message",
         AgentEvent::Followups { .. } => "followups",
+        AgentEvent::CategoryConfirmationNeeded { .. } => "category_confirmation_needed",
         AgentEvent::Truncated { .. } => "truncated",
         AgentEvent::Error { .. } => "error",
         AgentEvent::Done { .. } => "done",
