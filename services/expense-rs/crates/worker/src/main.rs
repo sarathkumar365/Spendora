@@ -16,12 +16,13 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::{net::SocketAddr, path::PathBuf};
 use storage_sqlite::{
-    claim_pending_job, clear_import_rows, connect, find_high_confidence_account_match,
-    get_extraction_settings, get_import_content, get_import_status, get_llama_agent_cache,
-    get_llama_agent_readiness, insert_import_rows, mark_job_completed, mark_job_failed,
-    run_migrations, set_import_card_resolution, update_import_extraction_result,
-    update_import_status, upsert_llama_agent_cache, upsert_llama_agent_readiness,
-    LlamaAgentReadiness, LlamaAgentReadinessState, ParsedRowInput,
+    canonicalize_account_descriptor, canonicalize_account_number_last4, canonicalize_customer_name,
+    claim_pending_job, clear_import_rows, connect, get_extraction_settings, get_import_content,
+    get_import_status, get_llama_agent_cache, get_llama_agent_readiness, insert_import_rows,
+    mark_job_completed, mark_job_failed, resolve_card_account_match, run_migrations,
+    set_import_card_resolution, update_import_extraction_result, update_import_status,
+    upsert_llama_agent_cache, upsert_llama_agent_readiness, LlamaAgentReadiness,
+    LlamaAgentReadinessState, ParsedRowInput,
 };
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -87,10 +88,25 @@ fn extract_card_resolution_metadata(diagnostics: &serde_json::Value) -> serde_js
         .get("account_details")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let account_type_raw = account_details
+        .get("account_type")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let account_number_ending_raw = account_details
+        .get("account_number_ending")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let customer_name_raw = account_details
+        .get("customer_name")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
     serde_json::json!({
-        "account_type": account_details.get("account_type").and_then(|v| v.as_str()).map(|v| v.to_string()),
-        "account_number_ending": account_details.get("account_number_ending").and_then(|v| v.as_str()).map(|v| v.to_string()),
-        "customer_name": account_details.get("customer_name").and_then(|v| v.as_str()).map(|v| v.to_string()),
+        "account_type": account_type_raw,
+        "account_number_ending": account_number_ending_raw,
+        "customer_name": customer_name_raw,
+        "account_type_canonical": canonicalize_account_descriptor(account_details.get("account_type").and_then(|v| v.as_str())),
+        "account_number_last4_canonical": canonicalize_account_number_last4(account_details.get("account_number_ending").and_then(|v| v.as_str())),
+        "customer_name_canonical": canonicalize_customer_name(account_details.get("customer_name").and_then(|v| v.as_str())),
         "source": "statement_payload",
     })
 }
@@ -449,8 +465,6 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             "managed_fallback_enabled": settings.managed_fallback_enabled,
         }));
 
-        let mut extraction_quality_metrics = serde_json::json!({});
-        let mut extraction_reconciliation = serde_json::json!({});
         let mut card_resolution_metadata = serde_json::json!({});
         let parsed = if blob.parser_type == "csv" {
             parse_csv(&decoded, &account_hash_seed)
@@ -597,28 +611,16 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 "poll_status_trail": result.diagnostics.get("poll_status_trail").cloned().unwrap_or_else(|| serde_json::json!([])),
                 "statement_context": result.diagnostics.get("statement_context").cloned().unwrap_or_else(|| serde_json::json!({})),
                 "statement_summary": result.diagnostics.get("statement_summary").cloned().unwrap_or_else(|| serde_json::json!({})),
-                "direction_quality": result.diagnostics.get("direction_quality").cloned().unwrap_or_else(|| serde_json::json!({
-                    "unknown_count": 0,
-                    "conflict_count": 0,
-                    "conflicts": []
-                })),
-                "reconciliation": result.diagnostics.get("reconciliation").cloned().unwrap_or_else(|| serde_json::json!({
-                    "skipped": true,
-                    "reason": "not_available"
-                })),
-                "quality_metrics": result.diagnostics.get("quality_metrics").cloned().unwrap_or_else(|| serde_json::json!({})),
-                "provider_diagnostics": result.diagnostics.clone(),
+                "payload_snapshot": result
+                    .diagnostics
+                    .get("provider_diagnostics")
+                    .and_then(|v| v.get("payload_snapshot"))
+                    .cloned()
+                    .or_else(|| result.diagnostics.get("payload_snapshot").cloned())
+                    .unwrap_or_else(|| serde_json::json!({})),
                 "agent_readiness": readiness,
             });
             card_resolution_metadata = extract_card_resolution_metadata(&diagnostics);
-            extraction_quality_metrics = diagnostics
-                .get("quality_metrics")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            extraction_reconciliation = diagnostics
-                .get("reconciliation")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
 
             update_import_extraction_result(
                 pool,
@@ -691,7 +693,6 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                 ParsedRowInput {
                     row_index: row.row_index,
                     normalized_json,
-                    confidence: row.confidence,
                     parse_error: row.parse_error.clone(),
                     normalized_txn_hash: row.normalized_txn_hash.clone(),
                     account_id: resolved_account_id.clone(),
@@ -742,9 +743,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             status,
             serde_json::json!({
                 "parsed_rows": parsed_rows_len,
-                "unresolved_direction_count": review_required_count,
-                "quality_metrics": extraction_quality_metrics,
-                "reconciliation": extraction_reconciliation
+                "unresolved_direction_count": review_required_count
             }),
             parsed_errors.clone(),
             parsed_warnings.clone(),
@@ -753,7 +752,7 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
         .await?;
 
         if resolved_account_id.is_none() {
-            let matched_account_id = find_high_confidence_account_match(
+            let match_result = resolve_card_account_match(
                 pool,
                 card_resolution_metadata
                     .get("account_type")
@@ -766,7 +765,8 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
                     .and_then(|v| v.as_str()),
             )
             .await?;
-            let reason = if matched_account_id.is_some() {
+            let resolved_account_id = match_result.resolved_account_id;
+            let reason = if resolved_account_id.is_some() {
                 Some("auto_high_confidence_match")
             } else {
                 Some("manual_selection_required")
@@ -774,37 +774,33 @@ async fn process_pending_import_jobs(pool: &storage_sqlite::SqlitePool) -> anyho
             set_import_card_resolution(
                 pool,
                 &job_payload.import_id,
-                matched_account_id.as_deref(),
+                resolved_account_id.as_deref(),
                 reason,
                 &card_resolution_metadata,
             )
             .await?;
-            if matched_account_id.is_some() && review_required_count == 0 {
+            if resolved_account_id.is_some() && review_required_count == 0 {
                 update_import_status(
                     pool,
                     &job_payload.import_id,
                     ImportStatus::ReadyToCommit,
                     serde_json::json!({
                         "parsed_rows": parsed_rows_len,
-                        "unresolved_direction_count": review_required_count,
-                        "quality_metrics": extraction_quality_metrics,
-                        "reconciliation": extraction_reconciliation
+                        "unresolved_direction_count": review_required_count
                     }),
                     parsed_errors.clone(),
                     parsed_warnings.clone(),
                     review_required_count,
                 )
                 .await?;
-            } else if matched_account_id.is_none() {
+            } else if resolved_account_id.is_none() {
                 update_import_status(
                     pool,
                     &job_payload.import_id,
                     ImportStatus::PendingCardResolution,
                     serde_json::json!({
                         "parsed_rows": parsed_rows_len,
-                        "unresolved_direction_count": review_required_count,
-                        "quality_metrics": extraction_quality_metrics,
-                        "reconciliation": extraction_reconciliation
+                        "unresolved_direction_count": review_required_count
                     }),
                     parsed_errors.clone(),
                     parsed_warnings.clone(),

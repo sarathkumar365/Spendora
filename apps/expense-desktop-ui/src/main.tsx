@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings2 } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Circle, Settings2 } from "lucide-react";
 import appIcon from "./assets/app-icon.png";
 import "./styles.css";
 
@@ -73,7 +73,6 @@ type TransactionItem = {
   tx_type?: DirectionValue | null;
   source: string;
   classification_source: string;
-  confidence: number;
   explanation: string;
   last_sync_at: string;
   import_id?: string | null;
@@ -135,6 +134,7 @@ type ImportStatusEnvelope = {
   warnings: string[];
   review_required_count: number;
   resolved_account_id?: string | null;
+  resolved_account_label?: string | null;
   card_resolution_status?: "pending" | "resolved";
   card_resolution_reason?: string | null;
   card_resolution_metadata?: {
@@ -151,14 +151,12 @@ type ReviewRow = {
   direction: DirectionValue;
   initial_direction: DirectionValue;
   direction_source: string;
-  direction_confidence?: number | null;
   normalized_json: {
     transaction_date?: string;
     details?: string;
     amount?: number;
     [key: string]: unknown;
   };
-  confidence: number;
   parse_error?: string | null;
 };
 
@@ -186,7 +184,12 @@ type ImportCardResolutionEnvelope = {
     customer_name?: string | null;
     [key: string]: unknown;
   };
-  candidate_accounts: AccountItem[];
+  candidate_accounts: Array<
+    AccountItem & {
+      match_score?: number | null;
+      match_reasons?: string[];
+    }
+  >;
 };
 
 function resolveApiBaseUrl() {
@@ -325,6 +328,17 @@ function inferParserType(fileName: string) {
   return fileName.toLowerCase().endsWith(".csv") ? "csv" : "pdf";
 }
 
+function candidateAccountLabel(account: AccountItem) {
+  const details = [
+    account.account_type?.trim(),
+    account.account_number_ending?.trim()
+      ? `****${account.account_number_ending.trim()}`
+      : null,
+    account.customer_name?.trim()
+  ].filter((value): value is string => Boolean(value));
+  return details.length > 0 ? `${account.name} · ${details.join(" · ")}` : account.name;
+}
+
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -369,11 +383,14 @@ function normalizeDirection(value: unknown): DirectionValue {
   return "unknown";
 }
 
-function ratio(numerator: number, denominator: number) {
-  if (denominator <= 0) {
-    return 0;
+function directionBadge(direction?: DirectionValue | null) {
+  if (direction === "debit") {
+    return { label: "Outflow", className: "is-debit", icon: ArrowDownLeft };
   }
-  return numerator / denominator;
+  if (direction === "credit") {
+    return { label: "Inflow", className: "is-credit", icon: ArrowUpRight };
+  }
+  return { label: "Unknown", className: "is-unknown", icon: Circle };
 }
 
 export function App() {
@@ -385,11 +402,6 @@ export function App() {
     attempt: 0,
     message: "Starting local services..."
   });
-
-  const [accountId, setAccountId] = React.useState<string>("");
-  const [accountsLoading, setAccountsLoading] = React.useState(false);
-  const [accountLoadError, setAccountLoadError] = React.useState<string | null>(null);
-  const [accountRetryKey, setAccountRetryKey] = React.useState(0);
 
   const [statements, setStatements] = React.useState<StatementItem[]>([]);
   const [selectedStatementId, setSelectedStatementId] = React.useState<string>("");
@@ -430,81 +442,7 @@ export function App() {
     activeImportStatus?.card_resolution_status === "resolved" ||
     activeImportStatus?.status === "ready_to_commit" ||
     activeImportStatus?.status === "committed";
-  const activeQualityMetrics =
-    (activeImportStatus?.summary?.quality_metrics as Record<string, unknown> | undefined) ??
-    (activeImportStatus?.diagnostics?.quality_metrics as Record<string, unknown> | undefined) ??
-    null;
-  const qualityUnknownCount = Number(activeQualityMetrics?.unknown_count ?? 0);
-  const qualityUnknownRate = Number(activeQualityMetrics?.unknown_rate ?? 0);
-  const qualityConflictCount = Number(activeQualityMetrics?.conflict_count ?? 0);
-  const qualityConflictRate = Number(activeQualityMetrics?.conflict_rate ?? 0);
-  const qualityManualOverrideCount = Number(activeQualityMetrics?.manual_override_count ?? 0);
-  const qualityManualOverrideRate = Number(activeQualityMetrics?.manual_override_rate ?? 0);
-  const qualityReconciliationFailCount = Number(activeQualityMetrics?.reconciliation_fail_count ?? 0);
-  const qualityReconciliationFailRate = Number(activeQualityMetrics?.reconciliation_fail_rate ?? 0);
   const selectedStatement = statements.find((item) => item.id === selectedStatementId) ?? null;
-  const dataUnknownCount = statementTransactions.filter((item) => (item.tx_type || "unknown") === "unknown").length;
-  const dataConflictCount = statementTransactions.filter((item) => {
-    const direction = item.tx_type || "unknown";
-    const amountCents = parseAmountToCents(item.amount);
-    if (direction === "debit") {
-      return amountCents >= 0;
-    }
-    if (direction === "credit") {
-      return amountCents <= 0;
-    }
-    return false;
-  }).length;
-  const dataManualOverrideCount = statementTransactions.filter(
-    (item) => item.classification_source === "manual"
-  ).length;
-  const dataRowsTotal = statementTransactions.length;
-  const dataUnknownRate = ratio(dataUnknownCount, dataRowsTotal);
-  const dataConflictRate = ratio(dataConflictCount, dataRowsTotal);
-  const dataManualOverrideRate = ratio(
-    dataManualOverrideCount,
-    Math.max(dataUnknownCount + dataConflictCount, 1)
-  );
-  const reconciliation = React.useMemo(() => {
-    if (!selectedStatement) {
-      return { status: "skipped", failCount: 0, totalChecks: 0 };
-    }
-    const opening = selectedStatement.opening_balance_cents;
-    const closing = selectedStatement.closing_balance_cents;
-    const expectedDebits = selectedStatement.total_debits_cents;
-    const expectedCredits = selectedStatement.total_credits_cents;
-    if (
-      opening === undefined || opening === null ||
-      closing === undefined || closing === null ||
-      expectedDebits === undefined || expectedDebits === null ||
-      expectedCredits === undefined || expectedCredits === null
-    ) {
-      return { status: "skipped", failCount: 0, totalChecks: 0 };
-    }
-    const netMovement = statementTransactions.reduce(
-      (sum, item) => sum + parseAmountToCents(item.amount),
-      0
-    );
-    const actualClosing = opening + netMovement;
-    const actualDebits = statementTransactions
-      .filter((item) => (item.tx_type || "unknown") === "debit")
-      .reduce((sum, item) => sum + Math.abs(parseAmountToCents(item.amount)), 0);
-    const actualCredits = statementTransactions
-      .filter((item) => (item.tx_type || "unknown") === "credit")
-      .reduce((sum, item) => sum + Math.abs(parseAmountToCents(item.amount)), 0);
-    const tolerance = 1;
-    const checks = [
-      Math.abs(actualClosing - closing) <= tolerance,
-      Math.abs(actualDebits - expectedDebits) <= tolerance,
-      Math.abs(actualCredits - expectedCredits) <= tolerance
-    ];
-    const failCount = checks.filter((pass) => !pass).length;
-    return {
-      status: failCount === 0 ? "pass" : "fail",
-      failCount,
-      totalChecks: checks.length
-    };
-  }, [selectedStatement, statementTransactions]);
 
   React.useEffect(() => {
     let mounted = true;
@@ -562,34 +500,8 @@ export function App() {
     }
   }, []);
 
-  const loadSingleAccount = React.useCallback(async () => {
-    setAccountsLoading(true);
-    setAccountLoadError(null);
-    try {
-      const payload = await apiFetchJson<AccountItem[]>("/api/v1/accounts");
-      if (payload.length === 0) {
-        setAccountId("");
-        setAccountLoadError("No account available. Retry after API bootstrap finishes.");
-        return;
-      }
-      setAccountId(payload[0].id);
-    } catch (error) {
-      setAccountId("");
-      setAccountLoadError(String(error));
-    } finally {
-      setAccountsLoading(false);
-    }
-  }, []);
-
   React.useEffect(() => {
     if (startup.state !== "healthy") {
-      return;
-    }
-    void loadSingleAccount();
-  }, [startup.state, accountRetryKey, loadSingleAccount]);
-
-  React.useEffect(() => {
-    if (startup.state !== "healthy" || !accountId) {
       return;
     }
     if (importYear === null || importMonth === null) {
@@ -603,11 +515,7 @@ export function App() {
       setCoverageLoading(true);
       setCoverageError(null);
       try {
-        const params = new URLSearchParams({
-          account_id: accountId,
-          year: String(importYear),
-          month: String(importMonth)
-        });
+        const params = new URLSearchParams({ year: String(importYear), month: String(importMonth) });
         const payload = await apiFetchJson<CoverageResponse>(`/api/v1/statements/coverage?${params.toString()}`);
         if (!mounted) {
           return;
@@ -629,14 +537,14 @@ export function App() {
     return () => {
       mounted = false;
     };
-  }, [startup.state, accountId, importYear, importMonth]);
+  }, [startup.state, importYear, importMonth]);
 
   const fetchStatements = React.useCallback(async () => {
-    if (startup.state !== "healthy" || !accountId) {
+    if (startup.state !== "healthy") {
       return;
     }
 
-    const params = new URLSearchParams({ account_id: accountId });
+    const params = new URLSearchParams();
     if (dataYearFilter !== null) {
       params.set("year", String(dataYearFilter));
     }
@@ -645,7 +553,9 @@ export function App() {
     }
 
     try {
-      const payload = await apiFetchJson<StatementItem[]>(`/api/v1/statements?${params.toString()}`);
+      const query = params.toString();
+      const endpoint = query ? `/api/v1/statements?${query}` : "/api/v1/statements";
+      const payload = await apiFetchJson<StatementItem[]>(endpoint);
       setStatements(payload);
       if (payload.length === 0) {
         setSelectedStatementId("");
@@ -663,7 +573,7 @@ export function App() {
       setSelectedStatementId("");
       setStatementTransactions([]);
     }
-  }, [accountId, dataMonthFilter, dataYearFilter, startup.state]);
+  }, [dataMonthFilter, dataYearFilter, startup.state]);
 
   React.useEffect(() => {
     if (section !== "data") {
@@ -709,11 +619,9 @@ export function App() {
         amount?: number;
         [key: string]: unknown;
       };
-      confidence: number;
       parse_error?: string | null;
       direction?: string;
       direction_source?: string;
-      direction_confidence?: number | null;
     };
     const rows = await apiFetchJson<ApiReviewRow[]>(`/api/v1/imports/${encodeURIComponent(importId)}/review`);
     setReviewRows(
@@ -723,12 +631,10 @@ export function App() {
           row_id: row.row_id,
           row_index: row.row_index,
           normalized_json: row.normalized_json,
-          confidence: row.confidence,
           parse_error: row.parse_error,
           direction,
           initial_direction: direction,
-          direction_source: typeof row.direction_source === "string" ? row.direction_source : "model",
-          direction_confidence: typeof row.direction_confidence === "number" ? row.direction_confidence : null
+          direction_source: typeof row.direction_source === "string" ? row.direction_source : "model"
         };
       })
     );
@@ -843,7 +749,7 @@ export function App() {
   }, [importMonth, importYear]);
 
   const handleCreateImport = React.useCallback(async () => {
-    if (!selectedFile || !accountId) {
+    if (!selectedFile) {
       return;
     }
     if (coverageExists) {
@@ -866,7 +772,6 @@ export function App() {
       };
 
       if (includeMonthContext) {
-        payload.account_id = accountId;
         payload.year = importYear;
         payload.month = importMonth;
       }
@@ -892,7 +797,7 @@ export function App() {
     } finally {
       setIsSubmittingImport(false);
     }
-  }, [accountId, coverageExists, importMonth, importYear, openViewDataWithMonthContext, selectedFile]);
+  }, [coverageExists, importMonth, importYear, openViewDataWithMonthContext, selectedFile]);
 
   const saveReviewDecisions = React.useCallback(async () => {
     if (!activeImportId) {
@@ -914,8 +819,7 @@ export function App() {
               row_id: row.row_id,
               approved: true,
               rejection_reason: null,
-              direction: row.direction,
-              direction_confidence: null
+              direction: row.direction
             }))
         })
       });
@@ -1051,21 +955,6 @@ export function App() {
           ) : (
             <div className="spinner" aria-label="starting" />
           )}
-        </section>
-      </main>
-    );
-  }
-
-  if (!accountsLoading && !accountId) {
-    return (
-      <main className="screen">
-        <section className="panel gate" data-testid="no-account-state">
-          <p className="eyebrow">Spendora Desktop</p>
-          <h1>No account available</h1>
-          <p className="muted">{accountLoadError || "Account bootstrap is still in progress."}</p>
-          <button className="button" onClick={() => setAccountRetryKey((v) => v + 1)}>
-            Retry
-          </button>
         </section>
       </main>
     );
@@ -1221,7 +1110,7 @@ export function App() {
                     {selectedFile ? (
                       <button
                         className="button"
-                        disabled={coverageExists || isSubmittingImport || coverageLoading || !accountId}
+                        disabled={coverageExists || isSubmittingImport || coverageLoading}
                         onClick={() => void handleCreateImport()}
                       >
                         {isSubmittingImport ? "Starting..." : "Start Extraction"}
@@ -1254,40 +1143,17 @@ export function App() {
             {importStage === "results" ? (
               <section className="results-stack" data-testid="import-results-stage">
                 <article className="panel results-summary" data-testid="results-summary">
-                  <p className="eyebrow">Import Summary</p>
-                  <h3>{importStatusTitle(activeImportStatus?.status ?? null)}</h3>
-                  <div className="summary-grid">
-                    <div>
-                      <span>Parsed Rows</span>
-                      <strong>{Number(activeImportStatus?.summary?.parsed_rows ?? 0)}</strong>
-                    </div>
-                    <div>
-                      <span>Unresolved Direction</span>
-                      <strong>{unresolvedDirectionCount}</strong>
-                    </div>
-                    <div>
-                      <span>Warnings</span>
-                      <strong>{activeImportStatus?.warnings?.length ?? 0}</strong>
-                    </div>
-                    <div>
-                      <span>Errors</span>
-                      <strong>{activeImportStatus?.errors?.length ?? 0}</strong>
-                    </div>
-                    <div>
-                      <span>Provider</span>
-                      <strong>{activeImportStatus?.effective_provider || "n/a"}</strong>
-                    </div>
-                    <div>
-                      <span>Mode</span>
-                      <strong>{activeImportStatus?.extraction_mode || "managed"}</strong>
-                    </div>
+                  <div className="section-head">
+                    <p className="eyebrow">Import Status</p>
+                    <small className="muted">{importStatusMessage(activeImportStatus)}</small>
                   </div>
-                  <div className="quality-card">
+                  <h3>{importStatusTitle(activeImportStatus?.status ?? null)}</h3>
+                  <div className="status-card">
                     <strong>Card Resolution</strong>
                     <small>
                       Status: {activeImportStatus?.card_resolution_status || "pending"}
-                      {activeImportStatus?.resolved_account_id
-                        ? ` · Account ${activeImportStatus.resolved_account_id}`
+                      {(activeImportStatus?.resolved_account_label || activeImportStatus?.resolved_account_id)
+                        ? ` · ${activeImportStatus?.resolved_account_label || activeImportStatus?.resolved_account_id}`
                         : ""}
                     </small>
                     {activeImportStatus?.card_resolution_metadata?.account_type ? (
@@ -1304,20 +1170,11 @@ export function App() {
                       <small>No strong card metadata extracted from this statement.</small>
                     )}
                   </div>
-                  {activeQualityMetrics ? (
-                    <div className="quality-card">
-                      <strong>Quality metrics</strong>
-                      <small>
-                        Unknown: {qualityUnknownCount} ({(qualityUnknownRate * 100).toFixed(1)}%) ·
-                        Conflict: {qualityConflictCount} ({(qualityConflictRate * 100).toFixed(1)}%)
-                      </small>
-                      <small>
-                        Manual override: {qualityManualOverrideCount} ({(qualityManualOverrideRate * 100).toFixed(1)}%) ·
-                        Reconciliation fails: {qualityReconciliationFailCount} ({(qualityReconciliationFailRate * 100).toFixed(1)}%)
-                      </small>
-                    </div>
+                  {activeImportStatus?.card_resolution_reason === "auto_created_card" ? (
+                    <p className="success-text">
+                      No matching card found; created new card and linked this import.
+                    </p>
                   ) : null}
-
                   {commitResult ? (
                     <p className="success-text" data-testid="commit-summary">
                       Committed. Inserted {commitResult.inserted_count} · Duplicates {commitResult.duplicate_count}
@@ -1352,7 +1209,7 @@ export function App() {
                     <section className="panel card-resolution-panel">
                       <h4>Select Card For This Import</h4>
                       <p className="muted">
-                        Choose an existing card or add a new one. Commit is locked until this is resolved.
+                        Choose an existing card or add a new one. Commit stays locked until this is resolved.
                       </p>
                       <div className="card-resolution-grid">
                         <div className="card-resolution-col">
@@ -1366,9 +1223,9 @@ export function App() {
                               <option value="">Select card</option>
                               {cardResolution.candidate_accounts.map((account) => (
                                 <option key={account.id} value={account.id}>
-                                  {account.name}
-                                  {account.account_number_ending
-                                    ? ` • ****${account.account_number_ending}`
+                                  {candidateAccountLabel(account)}
+                                  {typeof account.match_score === "number"
+                                    ? ` · ${(account.match_score * 100).toFixed(0)}%`
                                     : ""}
                                 </option>
                               ))}
@@ -1436,7 +1293,11 @@ export function App() {
                     <button className="button ghost" onClick={resetImportSession}>
                       Create New Import
                     </button>
-                    <button className="button ghost" onClick={() => void saveReviewDecisions()} disabled={isSavingReview}>
+                    <button
+                      className="button ghost"
+                      onClick={() => void saveReviewDecisions()}
+                      disabled={isSavingReview}
+                    >
                       {isSavingReview ? "Saving..." : "Save Review Decisions"}
                     </button>
                     <button
@@ -1465,31 +1326,40 @@ export function App() {
                 </article>
 
                 <article className="panel results-rows" data-testid="results-rows">
-                  <h3>Transactions</h3>
+                  <div className="section-head">
+                    <h3>Transactions</h3>
+                    <small className="muted">{reviewRows.length} rows</small>
+                  </div>
                   {reviewRows.length === 0 ? (
                     <p className="muted">No review rows available.</p>
                   ) : (
                     <ul className="list">
-                      {reviewRows.map((row) => (
+                      {reviewRows.map((row) => {
+                        const rowFlow = directionBadge(row.direction);
+                        return (
                         <li key={row.row_id} className="review-row">
                           <div className="review-row-main">
                             <strong>
                               #{row.row_index} · {row.normalized_json.details || "(no details)"}
                             </strong>
                             <small>
-                              {row.normalized_json.transaction_date || "(no date)"} · {formatMoney(Number((row.normalized_json.amount || 0) * 100))} · confidence {row.confidence.toFixed(2)}
+                              {row.normalized_json.transaction_date || "(no date)"} · {formatMoney(Number((row.normalized_json.amount || 0) * 100))}
                             </small>
                             <small>
                               Direction source: {row.direction_source}
-                              {typeof row.direction_confidence === "number"
-                                ? ` · dir confidence ${row.direction_confidence.toFixed(2)}`
-                                : ""}
                             </small>
                             {row.parse_error ? <small className="error-text">Parse error: {row.parse_error}</small> : null}
                           </div>
 
                           <div className="review-actions">
-                            <label htmlFor={`direction-${row.row_id}`}>Direction</label>
+                            <label
+                              htmlFor={`direction-${row.row_id}`}
+                              className={`review-flow-label ${rowFlow.className}`}
+                              title={`Flow: ${rowFlow.label}`}
+                              aria-label={`Flow: ${rowFlow.label}`}
+                            >
+                              <rowFlow.icon size={14} strokeWidth={2.2} aria-hidden="true" />
+                            </label>
                             <select
                               id={`direction-${row.row_id}`}
                               className="input"
@@ -1512,15 +1382,22 @@ export function App() {
                                 );
                               }}
                             >
-                              {DIRECTION_OPTIONS.map((option) => (
+                              {DIRECTION_OPTIONS.filter(
+                                (option) => option !== "unknown" || row.direction === "unknown"
+                              ).map((option) => (
                                 <option key={option} value={option}>
-                                  {option}
+                                  {option === "debit"
+                                    ? "Debit"
+                                    : option === "credit"
+                                      ? "Credit"
+                                      : "Unknown"}
                                 </option>
                               ))}
                             </select>
                           </div>
                         </li>
-                      ))}
+                      );
+                    })}
                     </ul>
                   )}
                 </article>
@@ -1568,78 +1445,38 @@ export function App() {
               <div className="panel inset">
                 <h3>Transactions</h3>
                 {selectedStatement ? (
-                  <div className="quality-card">
-                    <strong>Statement details</strong>
-                    <small>
-                      Period: {selectedStatement.statement_period_start || selectedStatement.period_start} to{" "}
-                      {selectedStatement.statement_period_end || selectedStatement.period_end}
-                    </small>
-                    {selectedStatement.statement_date ? (
-                      <small>Statement date: {selectedStatement.statement_date}</small>
-                    ) : null}
-                    {selectedStatement.account_type || selectedStatement.account_number_ending ? (
-                      <small>
-                        Account: {selectedStatement.account_type || "Card"}
-                        {selectedStatement.account_number_ending
-                          ? ` • ****${selectedStatement.account_number_ending}`
-                          : ""}
-                      </small>
-                    ) : null}
-                    {selectedStatement.payment_due_date ||
-                    selectedStatement.total_minimum_payment !== null ? (
-                      <small>
-                        Due: {selectedStatement.payment_due_date || "n/a"} • Minimum:{" "}
-                        {typeof selectedStatement.total_minimum_payment === "number"
-                          ? `$${selectedStatement.total_minimum_payment.toFixed(2)}`
-                          : "n/a"}
-                      </small>
-                    ) : null}
-                    {typeof selectedStatement.account_balance === "number" ||
-                    typeof selectedStatement.available_credit === "number" ? (
-                      <small>
-                        Balance:{" "}
-                        {typeof selectedStatement.account_balance === "number"
-                          ? `$${selectedStatement.account_balance.toFixed(2)}`
-                          : "n/a"}{" "}
-                        • Available:{" "}
-                        {typeof selectedStatement.available_credit === "number"
-                          ? `$${selectedStatement.available_credit.toFixed(2)}`
-                          : "n/a"}
-                      </small>
-                    ) : null}
-                  </div>
+                  <p className="muted">
+                    Period: {selectedStatement.statement_period_start || selectedStatement.period_start} to{" "}
+                    {selectedStatement.statement_period_end || selectedStatement.period_end}
+                  </p>
                 ) : null}
-                <div className="quality-card">
-                  <strong>Quality</strong>
-                  <small>
-                    Reconciliation: {reconciliation.status}
-                    {reconciliation.totalChecks > 0 ? ` (${reconciliation.totalChecks - reconciliation.failCount}/${reconciliation.totalChecks} checks pass)` : ""}
-                  </small>
-                  <small>
-                    Unknown: {dataUnknownCount} ({(dataUnknownRate * 100).toFixed(1)}%) ·
-                    Conflict: {dataConflictCount} ({(dataConflictRate * 100).toFixed(1)}%)
-                  </small>
-                  <small>
-                    Manual override: {dataManualOverrideCount} ({(dataManualOverrideRate * 100).toFixed(1)}%)
-                  </small>
-                </div>
                 {statementTransactions.length === 0 ? (
                   <p className="muted">No transactions for selected statement.</p>
                 ) : (
                   <ul className="list">
-                    {statementTransactions.map((transaction) => (
-                      <li key={transaction.id} className="txn-row">
-                        <div>
-                          <strong>{transaction.details || "(no details)"}</strong>
-                          <small>
-                            {transaction.transaction_date || "(no date)"} ·{" "}
-                            {transaction.tx_type || "unknown"} ·{" "}
-                            {transaction.classification_source || "manual"}
-                          </small>
-                        </div>
-                        <div className="amount">{formatAmountFromText(transaction.amount)}</div>
-                      </li>
-                    ))}
+                    {statementTransactions.map((transaction) => {
+                      const flow = directionBadge(transaction.tx_type);
+                      return (
+                        <li key={transaction.id} className="txn-row">
+                          <div>
+                            <strong>{transaction.details || "(no details)"}</strong>
+                            <small>
+                              {transaction.transaction_date || "(no date)"} ·{" "}
+                              <span
+                                className={`txn-direction-badge ${flow.className}`}
+                                title={transaction.tx_type || "unknown"}
+                              >
+                                <flow.icon size={12} strokeWidth={2.2} aria-hidden="true" />
+                                {flow.label}
+                              </span>{" "}
+                              ·{" "}
+                              {transaction.classification_source || "manual"}
+                            </small>
+                          </div>
+                          <div className="amount">{formatAmountFromText(transaction.amount)}</div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>

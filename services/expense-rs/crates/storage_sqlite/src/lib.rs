@@ -51,7 +51,6 @@ pub struct ImportStatusView {
 pub struct ParsedRowInput {
     pub row_index: i64,
     pub normalized_json: serde_json::Value,
-    pub confidence: f64,
     pub parse_error: Option<String>,
     pub normalized_txn_hash: String,
     pub account_id: Option<String>,
@@ -66,7 +65,6 @@ pub struct ReviewRow {
     pub direction: String,
     pub direction_confidence: Option<f64>,
     pub direction_source: String,
-    pub confidence: f64,
     pub parse_error: Option<String>,
     pub approved: bool,
     pub rejection_reason: Option<String>,
@@ -90,7 +88,6 @@ pub struct TransactionListItem {
     pub transaction_date: Option<String>,
     pub source: String,
     pub classification_source: String,
-    pub confidence: f64,
     pub explanation: String,
     pub last_sync_at: String,
     pub import_id: Option<String>,
@@ -120,6 +117,20 @@ pub struct AccountItem {
     pub metadata_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardMatchCandidate {
+    pub account: AccountItem,
+    pub match_score: f64,
+    pub match_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardMatchResult {
+    pub resolved_account_id: Option<String>,
+    pub candidates: Vec<CardMatchCandidate>,
+    pub top_score: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateAccountCardInput {
     pub name: String,
@@ -128,6 +139,14 @@ pub struct CreateAccountCardInput {
     pub account_number_ending: Option<String>,
     pub customer_name: Option<String>,
     pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct AccountMatchRow {
+    account: AccountItem,
+    account_number_last4_canonical: Option<String>,
+    customer_name_canonical: Option<String>,
+    account_descriptor_canonical: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +422,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
     }
+    backfill_account_identity_canonicals(pool).await?;
     Ok(())
 }
 
@@ -430,6 +450,169 @@ fn is_idempotent_sqlite_error(error: &sqlx::Error) -> bool {
     message.contains("duplicate column name")
         || message.contains("already exists")
         || message.contains("duplicate key name")
+}
+
+pub fn canonicalize_account_number_last4(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    if let Some(token) = tokens.iter().find(|token| token.len() == 4) {
+        return Some(token.clone());
+    }
+
+    let compact: String = tokens.concat();
+    if compact.len() < 4 {
+        return None;
+    }
+    Some(compact[compact.len() - 4..].to_string())
+}
+
+pub fn canonicalize_customer_name(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    let mut out = String::new();
+    let mut prev_space = true;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    let normalized = out.trim().to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn canonicalize_account_descriptor(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    let mut without_parens = String::new();
+    let mut depth = 0_i32;
+    for ch in raw.chars() {
+        if ch == '(' {
+            depth += 1;
+            continue;
+        }
+        if ch == ')' {
+            depth = (depth - 1).max(0);
+            continue;
+        }
+        if depth == 0 {
+            without_parens.push(ch);
+        }
+    }
+
+    let stopwords = [
+        "account", "accounts", "banking", "bank", "day", "to", "the", "a", "an", "of",
+    ];
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in without_parens.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            if !stopwords.contains(&current.as_str()) {
+                tokens.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty() && !stopwords.contains(&current.as_str()) {
+        tokens.push(current);
+    }
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
+fn canonicalize_account_identity(
+    account_type: Option<&str>,
+    account_number_ending: Option<&str>,
+    customer_name: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        canonicalize_account_number_last4(account_number_ending),
+        canonicalize_customer_name(customer_name),
+        canonicalize_account_descriptor(account_type),
+    )
+}
+
+async fn backfill_account_identity_canonicals(pool: &SqlitePool) -> anyhow::Result<()> {
+    let table_info = sqlx::query("PRAGMA table_info(accounts)")
+        .fetch_all(pool)
+        .await?;
+    let has_last4 = table_info
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "account_number_last4_canonical");
+    let has_name = table_info
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "customer_name_canonical");
+    let has_descriptor = table_info
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "account_descriptor_canonical");
+    if !(has_last4 && has_name && has_descriptor) {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        "SELECT id, account_type, account_number_ending, customer_name, account_number_last4_canonical, customer_name_canonical, account_descriptor_canonical FROM accounts",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let id: String = row.get("id");
+        let account_type: Option<String> = row.get("account_type");
+        let account_number_ending: Option<String> = row.get("account_number_ending");
+        let customer_name: Option<String> = row.get("customer_name");
+        let current_last4: Option<String> = row.get("account_number_last4_canonical");
+        let current_name: Option<String> = row.get("customer_name_canonical");
+        let current_descriptor: Option<String> = row.get("account_descriptor_canonical");
+
+        let (next_last4, next_name, next_descriptor) = canonicalize_account_identity(
+            account_type.as_deref(),
+            account_number_ending.as_deref(),
+            customer_name.as_deref(),
+        );
+
+        if current_last4 == next_last4
+            && current_name == next_name
+            && current_descriptor == next_descriptor
+        {
+            continue;
+        }
+
+        sqlx::query(
+            "UPDATE accounts SET account_number_last4_canonical = ?2, customer_name_canonical = ?3, account_descriptor_canonical = ?4, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(next_last4)
+        .bind(next_name)
+        .bind(next_descriptor)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
 }
 
 pub async fn ensure_default_manual_account(pool: &SqlitePool) -> anyhow::Result<String> {
@@ -564,38 +747,161 @@ pub async fn update_import_extraction_result(
     Ok(())
 }
 
-pub async fn find_high_confidence_account_match(
+fn token_overlap_ratio(left: &str, right: &str) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let left_tokens: std::collections::BTreeSet<&str> = left.split_whitespace().collect();
+    let right_tokens: std::collections::BTreeSet<&str> = right.split_whitespace().collect();
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_tokens.intersection(&right_tokens).count() as f64;
+    let union = left_tokens.union(&right_tokens).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn compute_candidate_score(
+    incoming_last4: Option<&str>,
+    incoming_name: Option<&str>,
+    incoming_descriptor: Option<&str>,
+    account_last4: Option<&str>,
+    account_name: Option<&str>,
+    account_descriptor: Option<&str>,
+) -> (f64, Vec<String>) {
+    let mut score = 0.0_f64;
+    let mut reasons = Vec::new();
+
+    if incoming_last4.is_some() && account_last4.is_some() && incoming_last4 == account_last4 {
+        score += 0.70;
+        reasons.push("last4_exact".to_string());
+    } else {
+        return (0.0, reasons);
+    }
+
+    if let (Some(left), Some(right)) = (incoming_name, account_name) {
+        if left == right {
+            score += 0.20;
+            reasons.push("customer_name_exact".to_string());
+        } else if left.contains(right) || right.contains(left) {
+            score += 0.10;
+            reasons.push("customer_name_partial".to_string());
+        }
+    }
+
+    if let (Some(left), Some(right)) = (incoming_descriptor, account_descriptor) {
+        if left == right {
+            score += 0.10;
+            reasons.push("account_descriptor_exact".to_string());
+        } else if token_overlap_ratio(left, right) >= 0.50 {
+            score += 0.05;
+            reasons.push("account_descriptor_overlap".to_string());
+        }
+    }
+
+    (score, reasons)
+}
+
+async fn list_accounts_for_card_matching(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<AccountMatchRow>> {
+    let rows = sqlx::query(
+        "SELECT id, name, currency_code, account_type, account_number_ending, customer_name, COALESCE(metadata_json, '{}') AS metadata_json, account_number_last4_canonical, customer_name_canonical, account_descriptor_canonical FROM accounts WHERE trim(COALESCE(account_type, '')) <> '' AND trim(COALESCE(account_number_ending, '')) <> '' AND trim(COALESCE(customer_name, '')) <> '' ORDER BY name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AccountMatchRow {
+            account: AccountItem {
+                id: row.get("id"),
+                name: row.get("name"),
+                currency_code: row.get("currency_code"),
+                account_type: row.get("account_type"),
+                account_number_ending: row.get("account_number_ending"),
+                customer_name: row.get("customer_name"),
+                metadata_json: serde_json::from_str(row.get::<String, _>("metadata_json").as_str())
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            },
+            account_number_last4_canonical: row.get("account_number_last4_canonical"),
+            customer_name_canonical: row.get("customer_name_canonical"),
+            account_descriptor_canonical: row.get("account_descriptor_canonical"),
+        })
+        .collect())
+}
+
+pub async fn resolve_card_account_match(
     pool: &SqlitePool,
     account_type: Option<&str>,
     account_number_ending: Option<&str>,
     customer_name: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let Some(account_type) = account_type.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let Some(account_number_ending) = account_number_ending
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(customer_name) = customer_name.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
+) -> anyhow::Result<CardMatchResult> {
+    let (incoming_last4, incoming_name, incoming_descriptor) =
+        canonicalize_account_identity(account_type, account_number_ending, customer_name);
+    let accounts = list_accounts_for_card_matching(pool).await?;
+
+    let mut candidates = accounts
+        .into_iter()
+        .map(|row| {
+            let account_last4 = row.account_number_last4_canonical.or_else(|| {
+                canonicalize_account_number_last4(row.account.account_number_ending.as_deref())
+            });
+            let account_name = row
+                .customer_name_canonical
+                .or_else(|| canonicalize_customer_name(row.account.customer_name.as_deref()));
+            let account_descriptor = row
+                .account_descriptor_canonical
+                .or_else(|| canonicalize_account_descriptor(row.account.account_type.as_deref()));
+            let (score, reasons) = compute_candidate_score(
+                incoming_last4.as_deref(),
+                incoming_name.as_deref(),
+                incoming_descriptor.as_deref(),
+                account_last4.as_deref(),
+                account_name.as_deref(),
+                account_descriptor.as_deref(),
+            );
+            CardMatchCandidate {
+                account: row.account,
+                match_score: score,
+                match_reasons: reasons,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .match_score
+            .partial_cmp(&left.match_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.account.name.cmp(&right.account.name))
+    });
+
+    let top_score = candidates.first().map(|candidate| candidate.match_score);
+    let resolved_account_id = if let Some(top) = candidates.first() {
+        let runner_up = candidates
+            .get(1)
+            .map(|candidate| candidate.match_score)
+            .unwrap_or(0.0);
+        let clear_margin = top.match_score - runner_up >= 0.05;
+        if top.match_score >= 0.90 && clear_margin {
+            Some(top.account.id.clone())
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    let rows = sqlx::query(
-        "SELECT id FROM accounts WHERE lower(trim(COALESCE(account_type, ''))) = lower(trim(?1)) AND lower(trim(COALESCE(account_number_ending, ''))) = lower(trim(?2)) AND lower(trim(COALESCE(customer_name, ''))) = lower(trim(?3)) ORDER BY created_at ASC LIMIT 2",
-    )
-    .bind(account_type)
-    .bind(account_number_ending)
-    .bind(customer_name)
-    .fetch_all(pool)
-    .await?;
-
-    if rows.len() == 1 {
-        return Ok(Some(rows[0].get("id")));
-    }
-    Ok(None)
+    Ok(CardMatchResult {
+        resolved_account_id,
+        candidates,
+        top_score,
+    })
 }
 
 pub async fn set_import_card_resolution(
@@ -647,9 +953,19 @@ pub async fn create_account_card(
     .execute(pool)
     .await?;
 
+    let normalized_name = input.account_type.clone().and_then(trim_optional);
+    let normalized_ending = input.account_number_ending.clone().and_then(trim_optional);
+    let normalized_customer = input.customer_name.clone().and_then(trim_optional);
+    let (account_number_last4_canonical, customer_name_canonical, account_descriptor_canonical) =
+        canonicalize_account_identity(
+            normalized_name.as_deref(),
+            normalized_ending.as_deref(),
+            normalized_customer.as_deref(),
+        );
+
     let account_id = new_idempotency_key();
     sqlx::query(
-        "INSERT INTO accounts (id, connection_id, name, currency_code, account_type, account_number_ending, customer_name, metadata_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)",
+        "INSERT INTO accounts (id, connection_id, name, currency_code, account_type, account_number_ending, customer_name, metadata_json, account_number_last4_canonical, customer_name_canonical, account_descriptor_canonical, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP)",
     )
     .bind(&account_id)
     .bind(connection_id)
@@ -659,15 +975,18 @@ pub async fn create_account_card(
     } else {
         input.currency_code.trim().to_string()
     })
-    .bind(input.account_type.and_then(trim_optional))
-    .bind(input.account_number_ending.and_then(trim_optional))
-    .bind(input.customer_name.and_then(trim_optional))
+    .bind(normalized_name)
+    .bind(normalized_ending)
+    .bind(normalized_customer)
     .bind(
         input
             .metadata_json
             .unwrap_or_else(|| serde_json::json!({}))
             .to_string(),
     )
+    .bind(account_number_last4_canonical)
+    .bind(customer_name_canonical)
+    .bind(account_descriptor_canonical)
     .execute(pool)
     .await?;
 
@@ -944,16 +1263,21 @@ pub async fn upsert_or_get_statement(
 
 pub async fn list_statements_for_account(
     pool: &SqlitePool,
-    account_id: &str,
+    account_id: Option<&str>,
     year: Option<i32>,
     month: Option<i32>,
     date_from: Option<&str>,
     date_to: Option<&str>,
 ) -> anyhow::Result<Vec<StatementListItem>> {
     let mut sql = String::from(
-        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.statement_period_start, s.statement_period_end, s.statement_date, s.account_number_ending, s.customer_name, s.payment_due_date, s.total_minimum_payment, s.interest_charged, s.account_balance, s.credit_limit, s.available_credit, s.estimated_payoff_years, s.estimated_payoff_months, s.credits_total, s.debits_total, s.statement_payload_json, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE s.account_id = ?",
+        "SELECT s.id, s.account_id, s.period_start, s.period_end, s.statement_month, s.provider_name, s.provider_job_id, s.provider_run_id, s.schema_version, s.statement_period_start, s.statement_period_end, s.statement_date, s.account_number_ending, s.customer_name, s.payment_due_date, s.total_minimum_payment, s.interest_charged, s.account_balance, s.credit_limit, s.available_credit, s.estimated_payoff_years, s.estimated_payoff_months, s.credits_total, s.debits_total, s.statement_payload_json, s.opening_balance_cents, s.opening_balance_date, s.closing_balance_cents, s.closing_balance_date, s.total_debits_cents, s.total_credits_cents, s.account_type, s.account_number_masked, s.currency_code, COALESCE(COUNT(t.id), 0) AS linked_txn_count FROM statements s LEFT JOIN transactions t ON t.statement_id = s.id WHERE 1=1",
     );
-    let mut binds: Vec<String> = vec![account_id.to_string()];
+    let mut binds: Vec<String> = Vec::new();
+
+    if let Some(account_id) = account_id.map(str::trim).filter(|v| !v.is_empty()) {
+        sql.push_str(" AND s.account_id = ?");
+        binds.push(account_id.to_string());
+    }
 
     if let Some(y) = year {
         sql.push_str(" AND substr(COALESCE(s.statement_month, s.period_start), 1, 4) = ?");
@@ -1029,10 +1353,11 @@ pub async fn list_statements_for_account(
 
 pub async fn get_statement_coverage(
     pool: &SqlitePool,
-    account_id: &str,
+    account_id: Option<&str>,
     year: Option<i32>,
     month: Option<i32>,
 ) -> anyhow::Result<Vec<StatementCoverageMonth>> {
+    let account_id = account_id.map(str::trim).filter(|v| !v.is_empty());
     let statements = list_statements_for_account(pool, account_id, None, None, None, None).await?;
     let mut by_month: std::collections::BTreeMap<(i32, i32), StatementCoverageMonth> =
         std::collections::BTreeMap::new();
@@ -1179,12 +1504,20 @@ pub async fn get_statement_coverage(
 
     // TODO(step4): Bucket manual rows by booked_at so backfilled entries land in
     // the statement month they belong to instead of the month they were created.
-    let manual_rows = sqlx::query(
-        "SELECT CAST(strftime('%Y', created_at) AS INTEGER) AS y, CAST(strftime('%m', created_at) AS INTEGER) AS m, COUNT(*) AS cnt FROM transactions WHERE account_id = ?1 AND statement_id IS NULL GROUP BY y, m",
-    )
-    .bind(account_id)
-    .fetch_all(pool)
-    .await?;
+    let manual_rows = if let Some(account_id) = account_id {
+        sqlx::query(
+            "SELECT CAST(strftime('%Y', created_at) AS INTEGER) AS y, CAST(strftime('%m', created_at) AS INTEGER) AS m, COUNT(*) AS cnt FROM transactions WHERE account_id = ?1 AND statement_id IS NULL GROUP BY y, m",
+        )
+        .bind(account_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT CAST(strftime('%Y', created_at) AS INTEGER) AS y, CAST(strftime('%m', created_at) AS INTEGER) AS m, COUNT(*) AS cnt FROM transactions WHERE statement_id IS NULL GROUP BY y, m",
+        )
+        .fetch_all(pool)
+        .await?
+    };
 
     for row in manual_rows {
         let y: i32 = row.get("y");
@@ -1243,7 +1576,7 @@ pub async fn list_transactions_for_statement(
     statement_id: &str,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let rows = sqlx::query(
-        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE t.statement_id = ?1 ORDER BY COALESCE(t.transaction_date, t.booked_at) DESC, t.created_at DESC",
+        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE t.statement_id = ?1 ORDER BY COALESCE(t.transaction_date, t.booked_at) DESC, t.created_at DESC",
     )
     .bind(statement_id)
     .fetch_all(pool)
@@ -1259,7 +1592,6 @@ pub async fn list_transactions_for_statement(
             transaction_date: row.get("transaction_date"),
             source: row.get("source"),
             classification_source: row.get("classification_source"),
-            confidence: row.get("confidence"),
             explanation: row.get("explanation"),
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
@@ -1321,13 +1653,12 @@ pub async fn insert_import_rows(
 ) -> anyhow::Result<()> {
     for row in rows {
         sqlx::query(
-            "INSERT INTO import_rows (id, import_id, row_index, normalized_json, confidence, parse_error, normalized_txn_hash, approved, rejection_reason, account_id, statement_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO import_rows (id, import_id, row_index, normalized_json, parse_error, normalized_txn_hash, approved, rejection_reason, account_id, statement_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(new_idempotency_key())
         .bind(import_id)
         .bind(row.row_index)
         .bind(row.normalized_json.to_string())
-        .bind(row.confidence)
         .bind(row.parse_error)
         .bind(row.normalized_txn_hash)
         .bind(1_i64)
@@ -1394,7 +1725,7 @@ pub async fn list_import_rows_for_review(
     import_id: &str,
 ) -> anyhow::Result<Vec<ReviewRow>> {
     let rows = sqlx::query(
-        "SELECT id, row_index, normalized_json, confidence, parse_error, approved, rejection_reason FROM import_rows WHERE import_id = ?1 ORDER BY row_index ASC",
+        "SELECT id, row_index, normalized_json, parse_error, approved, rejection_reason FROM import_rows WHERE import_id = ?1 ORDER BY row_index ASC",
     )
     .bind(import_id)
     .fetch_all(pool)
@@ -1429,7 +1760,6 @@ pub async fn list_import_rows_for_review(
                     .unwrap_or("model")
                     .to_string(),
                 normalized_json,
-                confidence: row.get("confidence"),
                 parse_error: row.get("parse_error"),
                 approved: row.get::<i64, _>("approved") == 1,
                 rejection_reason: row.get("rejection_reason"),
@@ -1518,7 +1848,7 @@ pub async fn commit_import_rows(
     .unwrap_or_else(|_| serde_json::json!({}));
 
     let rows = sqlx::query(
-        "SELECT id, normalized_json, normalized_txn_hash, confidence, account_id, statement_id FROM import_rows WHERE import_id = ?1",
+        "SELECT id, normalized_json, normalized_txn_hash, account_id, statement_id FROM import_rows WHERE import_id = ?1",
     )
     .bind(import_id)
     .fetch_all(&mut *tx)
@@ -1616,7 +1946,7 @@ pub async fn commit_import_rows(
             .or_else(|| import_statement_id.clone());
 
         let result = sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, confidence, explanation, statement_id, direction, type, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, amount, details, transaction_date, source, classification_source, explanation, statement_id, direction, type, updated_at) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, CURRENT_TIMESTAMP) ON CONFLICT(account_id, external_txn_id) DO NOTHING",
         )
         .bind(new_idempotency_key())
         .bind(&account_id)
@@ -1629,7 +1959,6 @@ pub async fn commit_import_rows(
         .bind(transaction_date)
         .bind(TransactionSource::Manual.as_str())
         .bind(ClassificationSource::Manual.as_str())
-        .bind(row.get::<f64, _>("confidence"))
         .bind("Imported from statement")
         .bind(statement_id)
         .bind(direction_legacy)
@@ -1820,7 +2149,7 @@ pub async fn query_transactions(
     query: TransactionQuery,
 ) -> anyhow::Result<Vec<TransactionListItem>> {
     let mut base = String::from(
-        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.confidence, 1.0) AS confidence, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE 1=1",
+        "SELECT t.id, t.account_id, COALESCE(t.details, t.description) AS details, COALESCE(t.amount, printf('%.2f', t.amount_cents / 100.0)) AS amount, COALESCE(t.transaction_date, t.booked_at) AS transaction_date, t.source, COALESCE(t.classification_source, 'manual') AS classification_source, COALESCE(t.explanation, 'Imported transaction') AS explanation, t.updated_at AS last_sync_at, (SELECT ir.import_id FROM import_rows ir WHERE ir.normalized_txn_hash = t.external_txn_id LIMIT 1) AS import_id, t.statement_id, COALESCE(t.type, t.direction) AS type FROM transactions t WHERE 1=1",
     );
 
     let mut binds: Vec<String> = Vec::new();
@@ -1867,7 +2196,6 @@ pub async fn query_transactions(
             transaction_date: row.get("transaction_date"),
             source: row.get("source"),
             classification_source: row.get("classification_source"),
-            confidence: row.get("confidence"),
             explanation: row.get("explanation"),
             last_sync_at: row.get("last_sync_at"),
             import_id: row.get("import_id"),
@@ -1883,6 +2211,55 @@ pub async fn list_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AccountItem>
     )
         .fetch_all(pool)
         .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AccountItem {
+            id: row.get("id"),
+            name: row.get("name"),
+            currency_code: row.get("currency_code"),
+            account_type: row.get("account_type"),
+            account_number_ending: row.get("account_number_ending"),
+            customer_name: row.get("customer_name"),
+            metadata_json: serde_json::from_str(row.get::<String, _>("metadata_json").as_str())
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+        .collect())
+}
+
+pub async fn get_account_by_id(
+    pool: &SqlitePool,
+    account_id: &str,
+) -> anyhow::Result<Option<AccountItem>> {
+    let row = sqlx::query(
+        "SELECT id, name, currency_code, account_type, account_number_ending, customer_name, COALESCE(metadata_json, '{}') AS metadata_json FROM accounts WHERE id = ?1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(AccountItem {
+        id: row.get("id"),
+        name: row.get("name"),
+        currency_code: row.get("currency_code"),
+        account_type: row.get("account_type"),
+        account_number_ending: row.get("account_number_ending"),
+        customer_name: row.get("customer_name"),
+        metadata_json: serde_json::from_str(row.get::<String, _>("metadata_json").as_str())
+            .unwrap_or_else(|_| serde_json::json!({})),
+    }))
+}
+
+pub async fn list_card_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AccountItem>> {
+    let rows = sqlx::query(
+        "SELECT id, name, currency_code, account_type, account_number_ending, customer_name, COALESCE(metadata_json, '{}') AS metadata_json FROM accounts WHERE trim(COALESCE(account_type, '')) <> '' AND trim(COALESCE(account_number_ending, '')) <> '' AND trim(COALESCE(customer_name, '')) <> '' ORDER BY name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .into_iter()
@@ -2025,6 +2402,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0008_import_card_resolution",
         include_str!("../../../migrations/0008_import_card_resolution.sql"),
     ),
+    (
+        "0009_card_only_global_data_cleanup",
+        include_str!("../../../migrations/0009_card_only_global_data_cleanup.sql"),
+    ),
+    (
+        "0010_remove_analytics_confidence_columns",
+        include_str!("../../../migrations/0010_remove_analytics_confidence_columns.sql"),
+    ),
+    (
+        "0011_card_identity_canonical_fields",
+        include_str!("../../../migrations/0011_card_identity_canonical_fields.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -2133,7 +2522,6 @@ mod tests {
                 ParsedRowInput {
                     row_index: 1,
                     normalized_json: normalized.clone(),
-                    confidence: 0.9,
                     parse_error: None,
                     normalized_txn_hash: "same-hash".to_string(),
                     account_id: Some(account_id.clone()),
@@ -2142,7 +2530,6 @@ mod tests {
                 ParsedRowInput {
                     row_index: 2,
                     normalized_json: normalized,
-                    confidence: 0.9,
                     parse_error: None,
                     normalized_txn_hash: "same-hash".to_string(),
                     account_id: Some(account_id),
@@ -2201,7 +2588,6 @@ mod tests {
                         "description": "salary",
                         "direction": "credit"
                     }),
-                    confidence: 0.99,
                     parse_error: None,
                     normalized_txn_hash: "hash-ok".to_string(),
                     account_id: Some(account_id.clone()),
@@ -2215,7 +2601,6 @@ mod tests {
                         "description": "unknown",
                         "direction": "debit"
                     }),
-                    confidence: 0.4,
                     parse_error: Some("failed parse".to_string()),
                     normalized_txn_hash: "hash-err".to_string(),
                     account_id: Some(account_id.clone()),
@@ -2286,7 +2671,7 @@ mod tests {
             .expect("default account");
 
         sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES (?1, ?2, ?3, 1200, 'CAD', 'Coffee Shop', '2026-03-01', 'manual', 'manual', 0.9, 'manual entry')",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation) VALUES (?1, ?2, ?3, 1200, 'CAD', 'Coffee Shop', '2026-03-01', 'manual', 'manual', 'manual entry')",
         )
         .bind("tx-filter-1")
         .bind(&account_id)
@@ -2296,7 +2681,7 @@ mod tests {
         .expect("insert tx1");
 
         sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES (?1, ?2, ?3, 9900, 'CAD', 'Salary', '2026-03-02', 'manual', 'manual', 1.0, 'manual entry')",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation) VALUES (?1, ?2, ?3, 9900, 'CAD', 'Salary', '2026-03-02', 'manual', 'manual', 'manual entry')",
         )
         .bind("tx-filter-2")
         .bind(&account_id)
@@ -2322,6 +2707,135 @@ mod tests {
 
         assert_eq!(only_coffee.len(), 1);
         assert_eq!(only_coffee[0].details.as_deref(), Some("Coffee Shop"));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[test]
+    fn canonicalize_account_number_last4_parses_inconsistent_formats() {
+        assert_eq!(
+            canonicalize_account_number_last4(Some("9984 86")).as_deref(),
+            Some("9984")
+        );
+        assert_eq!(
+            canonicalize_account_number_last4(Some("****9984")).as_deref(),
+            Some("9984")
+        );
+        assert_eq!(
+            canonicalize_account_number_last4(Some("9984")).as_deref(),
+            Some("9984")
+        );
+        assert!(canonicalize_account_number_last4(Some("86")).is_none());
+        assert!(canonicalize_account_number_last4(Some("abc")).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_card_account_match_handles_noisy_statement_identity() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let primary = create_account_card(
+            &pool,
+            CreateAccountCardInput {
+                name: "Primary".to_string(),
+                currency_code: "CAD".to_string(),
+                account_type: Some("Preferred Package".to_string()),
+                account_number_ending: Some("9984".to_string()),
+                customer_name: Some("MR SARATH-KUMAR K-S".to_string()),
+                metadata_json: None,
+            },
+        )
+        .await
+        .expect("create primary");
+
+        let _other = create_account_card(
+            &pool,
+            CreateAccountCardInput {
+                name: "Other".to_string(),
+                currency_code: "CAD".to_string(),
+                account_type: Some("Random Account".to_string()),
+                account_number_ending: Some("1234".to_string()),
+                customer_name: Some("OTHER PERSON".to_string()),
+                metadata_json: None,
+            },
+        )
+        .await
+        .expect("create other");
+
+        let resolved = resolve_card_account_match(
+            &pool,
+            Some("Preferred Package account (Scotiabank Day-to-Day Banking)"),
+            Some("9984 86"),
+            Some("MR SARATH-KUMAR K-S"),
+        )
+        .await
+        .expect("resolve match");
+
+        assert_eq!(
+            resolved.resolved_account_id.as_deref(),
+            Some(primary.id.as_str())
+        );
+        assert!(resolved.top_score.unwrap_or_default() >= 0.90);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_card_account_match_requires_clear_winner() {
+        let db_path = temp_db_path();
+        let pool = connect(&db_path).await.expect("connect should succeed");
+        run_migrations(&pool)
+            .await
+            .expect("migration should succeed");
+
+        let _first = create_account_card(
+            &pool,
+            CreateAccountCardInput {
+                name: "Card A".to_string(),
+                currency_code: "CAD".to_string(),
+                account_type: Some("Preferred Package".to_string()),
+                account_number_ending: Some("9984".to_string()),
+                customer_name: Some("MR SARATH-KUMAR K-S".to_string()),
+                metadata_json: None,
+            },
+        )
+        .await
+        .expect("create first");
+
+        let _second = create_account_card(
+            &pool,
+            CreateAccountCardInput {
+                name: "Card B".to_string(),
+                currency_code: "CAD".to_string(),
+                account_type: Some("Preferred Package".to_string()),
+                account_number_ending: Some("9984".to_string()),
+                customer_name: Some("MR SARATH-KUMAR K-S".to_string()),
+                metadata_json: None,
+            },
+        )
+        .await
+        .expect("create second");
+
+        let resolved = resolve_card_account_match(
+            &pool,
+            Some("Preferred Package"),
+            Some("9984"),
+            Some("MR SARATH-KUMAR K-S"),
+        )
+        .await
+        .expect("resolve match");
+
+        assert!(resolved.resolved_account_id.is_none());
+        assert_eq!(resolved.candidates.len(), 2);
+        assert_eq!(
+            resolved.candidates[0].match_score,
+            resolved.candidates[1].match_score
+        );
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -2469,7 +2983,7 @@ mod tests {
         );
 
         let inserted = sqlx::query(
-            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, 'manual', 'manual', 1.0, 'manual entry', ?7)",
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, statement_id) VALUES (?1, ?2, ?3, ?4, 'CAD', ?5, ?6, 'manual', 'manual', 'manual entry', ?7)",
         )
         .bind("tx-statement-1")
         .bind(&account_id)
@@ -2656,7 +3170,6 @@ mod tests {
                     "description": "linked row",
                     "direction": "credit"
                 }),
-                confidence: 0.9,
                 parse_error: None,
                 normalized_txn_hash: "link-hash".to_string(),
                 account_id: Some(account_id.clone()),
@@ -2723,7 +3236,6 @@ mod tests {
                         "direction_confidence": 0.91,
                         "direction_source": "model"
                     }),
-                    confidence: 0.9,
                     parse_error: None,
                     normalized_txn_hash: "dir-hash-1".to_string(),
                     account_id: Some(account_id.clone()),
@@ -2736,7 +3248,6 @@ mod tests {
                         "amount_cents": 2500,
                         "description": "legacy row"
                     }),
-                    confidence: 0.9,
                     parse_error: None,
                     normalized_txn_hash: "dir-hash-2".to_string(),
                     account_id: Some(account_id.clone()),
@@ -2790,7 +3301,6 @@ mod tests {
                     "direction": "debit",
                     "direction_source": "manual"
                 }),
-                confidence: 0.3,
                 parse_error: Some("missing core fields".to_string()),
                 normalized_txn_hash: "dir-hash-default".to_string(),
                 account_id: Some(account_id.clone()),
@@ -2857,7 +3367,6 @@ mod tests {
                     "description": "row",
                     "direction": "unknown"
                 }),
-                confidence: 0.9,
                 parse_error: None,
                 normalized_txn_hash: "review-dir-hash".to_string(),
                 account_id: None,
@@ -2970,20 +3479,20 @@ mod tests {
         .await
         .expect("statement upsert");
 
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-cov-1', ?1, 'hash-cov-1', 1100, 'CAD', 'Linked Tx', '2026-05-10', 'manual', 'manual', 1.0, 'manual', ?2)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, statement_id) VALUES ('tx-cov-1', ?1, 'hash-cov-1', 1100, 'CAD', 'Linked Tx', '2026-05-10', 'manual', 'manual', 'manual', ?2)")
             .bind(&account_id)
             .bind(&statement.id)
             .execute(&pool)
             .await
             .expect("insert linked tx");
 
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, created_at, statement_id) VALUES ('tx-cov-2', ?1, 'hash-cov-2', 1300, 'CAD', 'Manual Tx', '2026-06-03', 'manual', 'manual', 1.0, 'manual', '2026-06-04 12:00:00', NULL)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, created_at, statement_id) VALUES ('tx-cov-2', ?1, 'hash-cov-2', 1300, 'CAD', 'Manual Tx', '2026-06-03', 'manual', 'manual', 'manual', '2026-06-04 12:00:00', NULL)")
             .bind(&account_id)
             .execute(&pool)
             .await
             .expect("insert manual tx");
 
-        let coverage = get_statement_coverage(&pool, &account_id, None, None)
+        let coverage = get_statement_coverage(&pool, Some(&account_id), None, None)
             .await
             .expect("coverage");
 
@@ -3024,7 +3533,7 @@ mod tests {
         .await
         .expect("insert malformed statement");
 
-        let coverage = get_statement_coverage(&pool, &account_id, None, None)
+        let coverage = get_statement_coverage(&pool, Some(&account_id), None, None)
             .await
             .expect("coverage should not fail");
         assert!(coverage.is_empty());
@@ -3059,13 +3568,13 @@ mod tests {
         .await
         .expect("statement upsert");
 
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-list-1', ?1, 'hash-list-1', 1500, 'CAD', 'Linked 1', '2026-07-03', 'manual', 'manual', 1.0, 'manual', ?2)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, statement_id) VALUES ('tx-list-1', ?1, 'hash-list-1', 1500, 'CAD', 'Linked 1', '2026-07-03', 'manual', 'manual', 'manual', ?2)")
             .bind(&account_id)
             .bind(&statement.id)
             .execute(&pool)
             .await
             .expect("insert linked tx");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation) VALUES ('tx-list-2', ?1, 'hash-list-2', 1600, 'CAD', 'Unlinked', '2026-07-04', 'manual', 'manual', 1.0, 'manual')")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation) VALUES ('tx-list-2', ?1, 'hash-list-2', 1600, 'CAD', 'Unlinked', '2026-07-04', 'manual', 'manual', 'manual')")
             .bind(&account_id)
             .execute(&pool)
             .await

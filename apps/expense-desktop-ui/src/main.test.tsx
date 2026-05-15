@@ -28,22 +28,16 @@ function withDefaultRoutes(extra?: FetchRoute): FetchRoute {
   return async (url, init) => {
     const method = (init?.method || "GET").toUpperCase();
 
-    if (url.includes("/api/v1/accounts") && method === "GET") {
-      return jsonResponse([
-        { id: "manual-default-account", name: "Manual Imported Account", currency_code: "CAD" }
-      ]);
-    }
-
     if (url.includes("/api/v1/statements/") && url.includes("/transactions") && method === "GET") {
       return jsonResponse([]);
     }
 
-    if (url.includes("/api/v1/statements?") && method === "GET") {
+    if (url.includes("/api/v1/statements") && !url.includes("/coverage") && method === "GET") {
       return jsonResponse([]);
     }
 
     if (url.includes("/api/v1/statements/coverage") && method === "GET") {
-      return jsonResponse({ account_id: "manual-default-account", years: [], selected: null });
+      return jsonResponse({ account_id: "", years: [], selected: null });
     }
 
     if (extra) {
@@ -98,7 +92,7 @@ describe("Import page revamp", () => {
 
       if (url.includes("/api/v1/statements/coverage") && method === "GET") {
         return jsonResponse({
-          account_id: "manual-default-account",
+          account_id: "",
           years: [],
           selected: {
             year: 2026,
@@ -152,7 +146,7 @@ describe("Import page revamp", () => {
 
       if (url.includes("/api/v1/statements/coverage") && method === "GET") {
         return jsonResponse({
-          account_id: "manual-default-account",
+          account_id: "",
           years: [],
           selected: {
             year: 2026,
@@ -172,7 +166,7 @@ describe("Import page revamp", () => {
         });
       }
 
-      if (url.includes("/api/v1/statements?") && method === "GET") {
+      if (url.includes("/api/v1/statements") && !url.includes("/coverage") && method === "GET") {
         return jsonResponse([
           {
             id: "stmt-2",
@@ -293,20 +287,9 @@ describe("Import page revamp", () => {
     expect(summary.compareDocumentPosition(rows) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("shows blocking no-account state when account list is empty", async () => {
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
-    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = toUrl(input);
-      const method = (init?.method || "GET").toUpperCase();
-      if (url.includes("/api/v1/accounts") && method === "GET") {
-        return jsonResponse([]);
-      }
-      return withDefaultRoutes()(url, init);
-    });
-
+  it("renders app without requiring account bootstrap", async () => {
     render(<App />);
-    expect(await screen.findByTestId("no-account-state")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Import" })).toBeInTheDocument();
   });
 
   it("submits review decisions and commits import", async () => {
@@ -552,7 +535,14 @@ describe("Import page revamp", () => {
             customer_name: "Jane Doe"
           },
           candidate_accounts: [
-            { id: "manual-default-account", name: "Manual Imported Account", currency_code: "CAD" }
+            {
+              id: "card-1",
+              name: "Scotia Visa",
+              currency_code: "CAD",
+              account_type: "Scotiabank Scene+ Visa Card",
+              account_number_ending: "1234",
+              customer_name: "Jane Doe"
+            }
           ]
         });
       }

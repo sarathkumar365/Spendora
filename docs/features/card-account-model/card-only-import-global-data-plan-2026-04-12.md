@@ -1,74 +1,84 @@
-# Revised Plan: Card-Only Import Model + Global Data View
+# Card-Only Import + Global Data (Two-Pass Implementation)
 
 ## Summary
-Replace legacy managed-account behavior with a strict card-only model in `accounts`, auto-resolve imports to cards when metadata is complete, and make Data page read across all cards (no filter for now). This fixes:
-1. Empty statements/transactions after commit
-2. Wrong managed-account option in import card resolution
+Implement in 2 passes:
+1. Pass 1 (stability-first): migration + backend/API behavior + core UI wiring + tests.
+2. Pass 2 (cleanup): import-page UX cleanup and regression hardening.
 
-## Implementation Changes
+Locked defaults:
+- Migration policy: hard-delete legacy `manual-default-account` data.
+- Scope: full import-page cleanup now (after core behavior is stable).
 
-1. **Remove legacy managed account row and clean old data**
-- Add DB migration (next version) to:
-  - Delete `manual-default-account` from `accounts`
-  - Delete linked `transactions`, `statements`, `import_rows` for that account
-  - Reset any `imports.resolved_account_id = manual-default-account` to unresolved/pending card resolution state
-- Keep app-level root identity in `app_user` + `connections` only (no root row in `accounts`).
+## Key Changes
 
-2. **Stop creating legacy default account at startup**
-- Remove API startup call that ensures `manual-default-account`.
-- Keep `connections.manual-connection` creation inside card/account creation path as needed.
+1. **Database + storage**
+- Add migration `0009` to:
+  - delete `manual-default-account` from `accounts`
+  - delete linked `transactions`, `statements`, `import_rows`
+  - reset `imports.resolved_account_id = manual-default-account` to unresolved (`resolved_account_id = NULL`, pending card resolution)
+- Remove startup dependency on `ensure_default_manual_account`.
+- Keep `manual-connection` creation only in card-account creation paths.
 
-3. **Card resolution policy (auto-first, manual fallback)**
-- Use exact match key: `account_type + account_number_ending + customer_name`.
+2. **Import resolution pipeline**
+- Enforce card-only match key: `account_type + account_number_ending + customer_name`.
 - On import processing:
-  - If exact single match exists: resolve to that card (`auto_high_confidence_match`).
-  - If no match and all 3 fields exist: auto-create card via `create_account_card`, resolve import, and continue.
-  - If any of the 3 fields missing: keep `pending_card_resolution`, require user card input.
-- Keep ambiguous multi-match as manual resolution (no auto-pick).
+  - single exact match -> auto-resolve (`auto_high_confidence_match`)
+  - no match + complete metadata -> auto-create via `create_account_card`, then resolve
+  - missing required metadata -> `pending_card_resolution`
+  - ambiguous multi-match -> manual resolution
+- Ensure `/api/v1/imports/:id/card-resolution` returns card candidates only.
 
-4. **Import UI behavior**
-- Card-resolution existing-card dropdown must show **cards only** (no legacy managed account).
-- For auto-created card, show non-blocking info message in import results:
-  - “No matching card found; created new card and linked this import.”
-- Manual resolution form remains for insufficient metadata cases.
+3. **Statements/Coverage API global mode**
+- Make `account_id` optional for:
+  - `GET /api/v1/statements`
+  - `GET /api/v1/statements/coverage`
+- If `account_id` is absent, return aggregated all-card data.
+- Keep account-filtered behavior unchanged when `account_id` is present.
 
-5. **Global data read mode (for now)**
-- Make statements and coverage APIs support global mode when `account_id` is absent:
-  - `GET /api/v1/statements` returns all-card statements
-  - `GET /api/v1/statements/coverage` returns all-card coverage
-- UI Data page:
-  - Remove dependency on selecting first account from `/api/v1/accounts`
-  - Load statements/coverage in global mode
-  - Continue statement drill-down by `statement_id`
+4. **Desktop UI**
+- Remove first-account bootstrap dependency on `/api/v1/accounts` for Data view.
+- Load statements/coverage in global mode.
+- Keep statement drill-down by `statement_id`.
+- Card-resolution panel:
+  - existing-card selector shows cards only
+  - non-blocking info message when auto-created card is used
+- Full cleanup:
+  - remove duplicate/legacy account creation and resolution blocks
+  - simplify import action flow and status messaging
+  - preserve review/commit functional behavior
 
-## API / Interface Updates
-- `GET /api/v1/statements`: `account_id` optional (global if missing).
-- `GET /api/v1/statements/coverage`: `account_id` optional (global if missing).
-- `GET /api/v1/imports/:id/card-resolution`: same shape; candidate semantics are cards-only.
-- No change to commit endpoint shape; commit gating remains card-resolution aware.
+## Pass Breakdown
+
+1. **Pass 1**
+- Migration, storage, API contract updates, minimal UI wiring, and backend/UI tests green.
+
+2. **Pass 2**
+- Full import-page cleanup/refactor, UX message cleanup, focused regression suite, final end-to-end smoke flow:
+  import -> review -> card resolution -> commit -> data visibility.
 
 ## Test Plan
-1. **Migration tests**
-- Legacy `manual-default-account` and linked rows are removed/reset correctly.
-- Fresh DB has no default account row created on startup.
+1. Migration/storage tests:
+- legacy row and linked records removed/reset as intended
+- fresh startup does not create `manual-default-account`
 
-2. **Card resolution tests**
-- Exact match resolves automatically.
-- No match + complete metadata auto-creates and resolves.
-- Missing any of type/last4/name stays `pending_card_resolution`.
-- Ambiguous matches remain manual.
+2. Import resolution tests:
+- exact-match auto-resolve
+- complete metadata + no match -> auto-create + resolve
+- missing metadata -> `pending_card_resolution`
+- ambiguous matches -> manual required
 
-3. **Data API tests**
-- Statements endpoint returns rows globally with no `account_id`.
-- Coverage endpoint returns global coverage with no `account_id`.
-- Existing account-filtered behavior still works when `account_id` is provided.
+3. API tests:
+- statements works with and without `account_id`
+- coverage works with and without `account_id`
+- existing account-filtered behavior unchanged
 
-4. **UI tests**
-- Data view after commit shows imported statement(s)/transactions without account preselection.
-- Card-resolution list excludes managed account.
-- Auto-create banner appears when a new card is created automatically.
+4. UI tests:
+- Data page shows committed statements/transactions without account preselection
+- card-resolution candidates exclude legacy managed account
+- auto-create info banner appears when applicable
+- cleanup flow remains commit-safe end-to-end
 
 ## Assumptions
-- Clearing existing legacy managed-account data is acceptable.
-- Card filtering UI is deferred; global Data view is temporary desired behavior.
+- Hard-delete of legacy managed-account data is acceptable.
+- Global Data mode is temporary and intentionally unfiltered for now.
 - Card identity remains strict on `type + last4 + customer_name` for this phase.

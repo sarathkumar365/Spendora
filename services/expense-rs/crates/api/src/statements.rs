@@ -15,7 +15,7 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct StatementsQueryParams {
-    pub account_id: String,
+    pub account_id: Option<String>,
     pub year: Option<i32>,
     pub month: Option<i32>,
     pub date_from: Option<String>,
@@ -24,7 +24,7 @@ pub struct StatementsQueryParams {
 
 #[derive(Debug, Deserialize)]
 pub struct CoverageQueryParams {
-    pub account_id: String,
+    pub account_id: Option<String>,
     pub year: Option<i32>,
     pub month: Option<i32>,
 }
@@ -125,12 +125,6 @@ pub async fn list_statements_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StatementsQueryParams>,
 ) -> Result<Json<Vec<StatementListItem>>, (StatusCode, String)> {
-    if params.account_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "account_id is required".to_string(),
-        ));
-    }
     if let Some(month) = params.month {
         if !(1..=12).contains(&month) {
             return Err((StatusCode::BAD_REQUEST, "month must be 1..12".to_string()));
@@ -139,7 +133,7 @@ pub async fn list_statements_handler(
 
     let rows = list_statements_for_account(
         &state.db,
-        params.account_id.trim(),
+        params.account_id.as_deref(),
         params.year,
         params.month,
         params.date_from.as_deref(),
@@ -155,12 +149,6 @@ pub async fn get_statement_coverage_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CoverageQueryParams>,
 ) -> Result<Json<CoverageResponse>, (StatusCode, String)> {
-    if params.account_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "account_id is required".to_string(),
-        ));
-    }
     if (params.year.is_some() && params.month.is_none())
         || (params.year.is_none() && params.month.is_some())
     {
@@ -177,7 +165,7 @@ pub async fn get_statement_coverage_handler(
 
     let coverage = get_statement_coverage(
         &state.db,
-        params.account_id.trim(),
+        params.account_id.as_deref(),
         params.year,
         params.month,
     )
@@ -329,7 +317,7 @@ pub async fn get_statement_coverage_handler(
     };
 
     Ok(Json(CoverageResponse {
-        account_id: params.account_id,
+        account_id: params.account_id.unwrap_or_default(),
         years,
         selected,
     }))
@@ -375,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coverage_requires_account_id() {
+    async fn coverage_supports_global_mode_without_account_id() {
         let db_path = temp_db_path();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).expect("create parent");
@@ -387,13 +375,15 @@ mod tests {
         let result = get_statement_coverage_handler(
             State(state),
             Query(CoverageQueryParams {
-                account_id: "".to_string(),
+                account_id: None,
                 year: None,
                 month: None,
             }),
         )
-        .await;
-        assert!(result.is_err());
+        .await
+        .expect("global coverage should be allowed")
+        .0;
+        assert!(result.years.is_empty());
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
@@ -425,7 +415,7 @@ mod tests {
         )
         .await
         .expect("statement upsert");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-api-st-1', ?1, 'hash-api-st-1', 2100, 'CAD', 'Statement Row', '2026-08-08', 'manual', 'manual', 1.0, 'manual', ?2)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, statement_id) VALUES ('tx-api-st-1', ?1, 'hash-api-st-1', 2100, 'CAD', 'Statement Row', '2026-08-08', 'manual', 'manual', 'manual', ?2)")
             .bind(&account_id)
             .bind(&statement.id)
             .execute(&pool)
@@ -455,7 +445,7 @@ mod tests {
         let account_id = ensure_default_manual_account(&pool)
             .await
             .expect("default account");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, created_at, statement_id) VALUES ('tx-api-manual-1', ?1, 'hash-api-manual-1', 2200, 'CAD', 'Manual Only', '2026-09-05', 'manual', 'manual', 1.0, 'manual', '2026-09-06 09:00:00', NULL)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, created_at, statement_id) VALUES ('tx-api-manual-1', ?1, 'hash-api-manual-1', 2200, 'CAD', 'Manual Only', '2026-09-05', 'manual', 'manual', 'manual', '2026-09-06 09:00:00', NULL)")
             .bind(&account_id)
             .execute(&pool)
             .await
@@ -465,7 +455,7 @@ mod tests {
         let payload = get_statement_coverage_handler(
             State(state),
             Query(CoverageQueryParams {
-                account_id,
+                account_id: Some(account_id),
                 year: Some(2026),
                 month: Some(9),
             }),
@@ -510,7 +500,7 @@ mod tests {
         )
         .await
         .expect("statement upsert");
-        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, confidence, explanation, statement_id) VALUES ('tx-api-flow-1', ?1, 'hash-api-flow-1', 2500, 'CAD', 'Flow Linked Tx', '2026-10-08', 'manual', 'manual', 1.0, 'manual', ?2)")
+        sqlx::query("INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, classification_source, explanation, statement_id) VALUES ('tx-api-flow-1', ?1, 'hash-api-flow-1', 2500, 'CAD', 'Flow Linked Tx', '2026-10-08', 'manual', 'manual', 'manual', ?2)")
             .bind(&account_id)
             .bind(&statement.id)
             .execute(&pool)
@@ -521,7 +511,7 @@ mod tests {
         let coverage = get_statement_coverage_handler(
             State(state.clone()),
             Query(CoverageQueryParams {
-                account_id: account_id.clone(),
+                account_id: Some(account_id.clone()),
                 year: Some(2026),
                 month: Some(10),
             }),
@@ -557,7 +547,7 @@ mod tests {
         let statement_rows = list_statements_handler(
             State(state.clone()),
             Query(StatementsQueryParams {
-                account_id: account_id.clone(),
+                account_id: Some(account_id.clone()),
                 year: Some(2026),
                 month: Some(10),
                 date_from: None,

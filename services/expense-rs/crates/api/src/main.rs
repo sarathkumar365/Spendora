@@ -21,8 +21,7 @@ use expense_core::{
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use storage_sqlite::{
-    connect, ensure_default_manual_account, get_llama_agent_readiness, run_migrations,
-    LlamaAgentReadiness, SqlitePool,
+    connect, get_llama_agent_readiness, run_migrations, LlamaAgentReadiness, SqlitePool,
 };
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing::info;
@@ -67,9 +66,6 @@ async fn main() -> anyhow::Result<()> {
         info!("api migrations applied");
     }
 
-    ensure_default_manual_account(&pool).await?;
-    info!("default manual account ensured");
-
     let state = Arc::new(AppState { db: pool });
     let app = Router::new()
         .route("/health", get(health))
@@ -96,10 +92,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/transactions",
             get(transactions::get_transactions_handler),
-        )
-        .route(
-            "/api/v1/transactions/safe-summary",
-            get(transactions::get_transactions_safe_summary_handler),
         )
         .route("/api/v1/accounts", get(accounts::get_accounts_handler))
         .route(
@@ -299,9 +291,6 @@ mod tests {
         }
         let pool = connect(&db_path).await.expect("connect");
         run_migrations(&pool).await.expect("migrate");
-        ensure_default_manual_account(&pool)
-            .await
-            .expect("default account");
 
         upsert_llama_agent_readiness(
             &pool,
@@ -347,6 +336,7 @@ mod tests {
 
     #[test]
     fn cors_origin_parser_rejects_invalid_values() {
+        let _guard = env_lock().lock().expect("env lock");
         unsafe { std::env::set_var("CORS_ALLOWED_ORIGINS", "http://ok,not-an-origin") };
         let err = parse_allowed_origins().expect_err("invalid origin should fail");
         assert!(err
@@ -357,6 +347,7 @@ mod tests {
 
     #[test]
     fn cors_method_parser_rejects_invalid_values() {
+        let _guard = env_lock().lock().expect("env lock");
         unsafe { std::env::set_var("CORS_ALLOWED_METHODS", "GET,B@D") };
         let err = parse_allowed_methods().expect_err("invalid method should fail");
         assert!(err
@@ -367,6 +358,7 @@ mod tests {
 
     #[test]
     fn cors_header_parser_rejects_invalid_values() {
+        let _guard = env_lock().lock().expect("env lock");
         unsafe { std::env::set_var("CORS_ALLOWED_HEADERS", "Content-Type, bad header") };
         let err = parse_allowed_headers().expect_err("invalid header should fail");
         assert!(err
@@ -377,6 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_allows_configured_origin_and_blocks_unknown_origin() {
+        let _guard = env_lock().lock().expect("env lock");
         unsafe {
             std::env::set_var("CORS_ALLOWED_ORIGINS", "http://127.0.0.1:1420");
             std::env::set_var("CORS_ALLOWED_METHODS", "GET,OPTIONS");
@@ -433,6 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_preflight_allows_expected_header_and_rejects_unknown_header() {
+        let _guard = env_lock().lock().expect("env lock");
         unsafe {
             std::env::set_var("CORS_ALLOWED_ORIGINS", "http://127.0.0.1:1420");
             std::env::set_var("CORS_ALLOWED_METHODS", "GET,OPTIONS");

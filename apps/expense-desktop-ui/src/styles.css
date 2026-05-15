@@ -302,14 +302,17 @@ select.input::-ms-expand {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  padding-right: 6px;
 }
 
 .import-page {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 100%;
-  overflow: hidden;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
 }
 
 .import-idle-center {
@@ -331,14 +334,14 @@ select.input::-ms-expand {
   width: min(860px, 100%);
   margin: 26px auto 12px;
   text-align: center;
-  border-radius: 999px;
+  border-radius: 24px;
   border: 1px solid var(--border);
   background:
     radial-gradient(circle at 20% 20%, #f8fcfb, transparent 55%),
     radial-gradient(circle at 80% 35%, #e9f2ff, transparent 50%),
     var(--surface-solid);
-  min-height: 300px;
-  padding: 64px 56px;
+  min-height: 240px;
+  padding: 44px 34px;
   display: grid;
   align-content: center;
   gap: 14px;
@@ -389,11 +392,11 @@ select.input::-ms-expand {
 .results-stack {
   margin-top: 16px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  flex: 1;
-  min-height: 0;
+  grid-template-columns: 1fr;
+  flex: 0 0 auto;
+  min-height: auto;
   gap: 16px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .results-summary,
@@ -404,33 +407,21 @@ select.input::-ms-expand {
 }
 
 .results-rows {
-  min-height: 0;
-  overflow-y: auto;
+  min-height: auto;
+  overflow: visible;
   align-content: start;
 }
 
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 10px;
 }
 
-.summary-grid div {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 10px;
-  background: var(--surface-solid);
-  display: grid;
-  gap: 4px;
-}
-
-.summary-grid span {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-}
-
-.summary-grid strong {
-  font-size: 1rem;
+.section-head h3,
+.section-head p {
+  margin: 0;
 }
 
 .review-row {
@@ -459,6 +450,35 @@ select.input::-ms-expand {
   justify-items: end;
   align-content: start;
   min-width: 220px;
+}
+
+.review-flow-label {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  background: var(--surface-solid);
+}
+
+.review-flow-label.is-debit {
+  color: #8a2f3e;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border) 55%);
+  background: color-mix(in srgb, #fff 82%, #f5d9df 18%);
+}
+
+.review-flow-label.is-credit {
+  color: #1e6b55;
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border) 55%);
+  background: color-mix(in srgb, #fff 82%, #d9efe8 18%);
+}
+
+.review-flow-label.is-unknown {
+  color: #8a6b2f;
+  border-color: color-mix(in srgb, #d2a63f 40%, var(--border) 60%);
+  background: color-mix(in srgb, #fff 82%, #f7ecd1 18%);
 }
 
 .review-approve-label {
@@ -550,7 +570,7 @@ select.input::-ms-expand {
   margin: 0 0 12px;
 }
 
-.quality-card {
+.status-card {
   display: grid;
   gap: 4px;
   border: 1px solid var(--border);
@@ -560,7 +580,7 @@ select.input::-ms-expand {
   background: color-mix(in srgb, var(--surface-solid) 85%, #f5f7fb 15%);
 }
 
-.quality-card small {
+.status-card small {
   color: var(--text-secondary);
 }
 
@@ -616,6 +636,35 @@ select.input::-ms-expand {
   color: var(--text-secondary);
 }
 
+.txn-direction-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  line-height: 1.2;
+  vertical-align: middle;
+  background: var(--surface-solid);
+}
+
+.txn-direction-badge.is-debit {
+  color: #8a2f3e;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border) 55%);
+  background: color-mix(in srgb, #fff 82%, #f5d9df 18%);
+}
+
+.txn-direction-badge.is-credit {
+  color: #1e6b55;
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border) 55%);
+  background: color-mix(in srgb, #fff 82%, #d9efe8 18%);
+}
+
+.txn-direction-badge.is-unknown {
+  color: var(--text-secondary);
+}
+
 .amount {
   font-weight: 700;
 }
@@ -660,12 +709,8 @@ select.input::-ms-expand {
     grid-template-columns: 1fr;
   }
 
-  .summary-grid {
-    grid-template-columns: 1fr 1fr;
-  }
-
   .upload-blob {
-    border-radius: 26px;
+    border-radius: 20px;
     padding: 26px 18px;
   }
 
