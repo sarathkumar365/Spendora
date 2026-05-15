@@ -33,6 +33,7 @@ pub mod detail_tool;
 pub mod echo_tool;
 pub mod query_tool;
 pub mod recurring_tool;
+pub mod resolve_category_tool;
 
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,7 @@ pub use detail_tool::TransactionDetailTool;
 pub use echo_tool::EchoTool;
 pub use query_tool::QueryTransactionsTool;
 pub use recurring_tool::FindRecurringTool;
+pub use resolve_category_tool::ResolveCategoryIntentTool;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolOutput {
@@ -124,5 +126,6 @@ pub fn build_default_registry() -> ToolRegistry {
     reg.register(ComparePeriodsTool);
     reg.register(FindRecurringTool);
     reg.register(TransactionDetailTool);
+    reg.register(ResolveCategoryIntentTool);
     reg
 }

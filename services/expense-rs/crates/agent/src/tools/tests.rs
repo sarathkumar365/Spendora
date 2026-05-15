@@ -1,12 +1,13 @@
 use super::*;
 use crate::llm::{
-    ChatCompletionRequest, ChatCompletionResponse, LlmProvider, LlmProviderKind,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LlmProvider, LlmProviderKind,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use storage_sqlite::{connect, run_migrations, SqlitePool};
 
 /// Stub LLM provider used by tool tests that don't exercise the LLM path.
@@ -33,6 +34,72 @@ impl LlmProvider for PanicLlm {
 
 fn test_deps(db: &SqlitePool) -> AgentDeps<'_> {
     AgentDeps::new(db, Arc::new(PanicLlm))
+}
+
+/// LLM stub for category classification tests. Returns a JSON object mapping each merchant
+/// `key:` in the prompt to a pre-seeded confidence. Tracks call count for assertions.
+struct StubClassifier {
+    scores: HashMap<String, f64>,
+    call_count: Mutex<usize>,
+}
+
+impl StubClassifier {
+    fn new(scores: &[(&str, f64)]) -> Self {
+        Self {
+            scores: scores.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            call_count: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for StubClassifier {
+    async fn complete(&self, req: ChatCompletionRequest) -> anyhow::Result<ChatCompletionResponse> {
+        *self.call_count.lock().unwrap() += 1;
+        // Pull merchant keys out of the user message; if absent, score nothing.
+        let user_text = req
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .last()
+            .unwrap_or("")
+            .to_string();
+        let mut out = serde_json::Map::new();
+        for line in user_text.lines() {
+            if let Some(idx) = line.find("(key: ") {
+                let rest = &line[idx + 6..];
+                if let Some(end) = rest.find(')') {
+                    let key = rest[..end].to_string();
+                    let score = self.scores.get(&key).copied().unwrap_or(0.0);
+                    out.insert(key, json!(score));
+                }
+            }
+        }
+        let content = serde_json::to_string(&out).unwrap();
+        Ok(ChatCompletionResponse {
+            message: ChatMessage::Assistant {
+                content: Some(content),
+                tool_calls: Vec::new(),
+            },
+            finish_reason: "stop".to_string(),
+        })
+    }
+    fn model_label(&self) -> String {
+        "stub:classifier".to_string()
+    }
+    fn kind(&self) -> LlmProviderKind {
+        LlmProviderKind::OpenAi
+    }
+}
+
+fn classifier_deps<'a>(
+    db: &'a SqlitePool,
+    classifier: Arc<StubClassifier>,
+) -> AgentDeps<'a> {
+    AgentDeps::new(db, classifier)
 }
 
 async fn setup_db_with_fixture() -> SqlitePool {
@@ -384,4 +451,157 @@ async fn aggregate_count_by_direction() {
         .find(|g| g.get("direction").unwrap().as_str() == Some("credit"))
         .unwrap();
     assert_eq!(credits.get("value").unwrap().as_f64().unwrap(), 2.0);
+}
+
+// --------- resolve_category_intent tests (Phase 5c) ---------
+
+async fn seed_grocery_fixture() -> SqlitePool {
+    let pool = setup_db_with_fixture().await;
+    // Seed merchants spanning various categories for April 2026.
+    let txns = [
+        ("g1", "acct-a", "2026-04-05", 5000, "debit", "LOBLAWS GREAT FOOD #1234"),
+        ("g2", "acct-a", "2026-04-12", 3200, "debit", "LOBLAWS GREAT FOOD #1234"),
+        ("g3", "acct-a", "2026-04-15", 2400, "debit", "METRO #455"),
+        ("g4", "acct-a", "2026-04-18", 14200, "debit", "COSTCO WHOLESALE"),
+        ("g5", "acct-a", "2026-04-22", 1599, "debit", "NETFLIX.COM"),
+    ];
+    for (id, account, date, cents, direction, descr) in txns {
+        sqlx::query(
+            "INSERT INTO transactions (id, account_id, external_txn_id, amount_cents, currency_code, description, booked_at, source, direction, direction_source) \
+             VALUES (?1, ?2, ?1, ?3, 'CAD', ?4, ?5, 'manual', ?6, 'seed')",
+        )
+        .bind(id)
+        .bind(account)
+        .bind(cents as i64)
+        .bind(descr)
+        .bind(date)
+        .bind(direction)
+        .execute(&pool)
+        .await
+        .expect("seed grocery txn");
+    }
+    pool
+}
+
+#[tokio::test]
+async fn resolve_category_intent_first_run_returns_suggestions_and_persists() {
+    let pool = seed_grocery_fixture().await;
+    let classifier = Arc::new(StubClassifier::new(&[
+        ("loblaws great food", 0.95),
+        ("metro", 0.93),
+        ("costco wholesale", 0.55),
+        ("netflix", 0.02),
+    ]));
+
+    let out = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier.clone()),
+            json!({
+                "category": "groceries",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30"
+            }),
+        )
+        .await
+        .expect("ok");
+
+    assert_eq!(*classifier.call_count.lock().unwrap(), 1);
+    let confirmed = out.data.get("confirmed").unwrap().as_array().unwrap();
+    let suggested = out.data.get("suggested").unwrap().as_array().unwrap();
+    assert!(confirmed.is_empty(), "nothing confirmed yet on first run");
+    assert_eq!(
+        suggested.len(),
+        3,
+        "three above 0.4 threshold (loblaws, metro, costco)"
+    );
+    assert!(out
+        .data
+        .get("requires_user_confirmation")
+        .unwrap()
+        .as_bool()
+        .unwrap());
+}
+
+#[tokio::test]
+async fn resolve_category_intent_does_not_re_ask_llm_for_known_merchants() {
+    let pool = seed_grocery_fixture().await;
+    let classifier = Arc::new(StubClassifier::new(&[
+        ("loblaws great food", 0.95),
+        ("metro", 0.93),
+        ("costco wholesale", 0.55),
+        ("netflix", 0.02),
+    ]));
+
+    // First run: classifier fires.
+    let _ = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier.clone()),
+            json!({
+                "category": "groceries",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30"
+            }),
+        )
+        .await
+        .expect("ok");
+    assert_eq!(*classifier.call_count.lock().unwrap(), 1);
+
+    // Second run on same window: every merchant already has an llm_suggested row, so the LLM
+    // should NOT be called again.
+    let _ = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier.clone()),
+            json!({
+                "category": "groceries",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30"
+            }),
+        )
+        .await
+        .expect("ok");
+    assert_eq!(
+        *classifier.call_count.lock().unwrap(),
+        1,
+        "no new LLM call when all merchants already classified"
+    );
+}
+
+#[tokio::test]
+async fn resolve_category_intent_rejects_unknown_category() {
+    let pool = seed_grocery_fixture().await;
+    let classifier = Arc::new(StubClassifier::new(&[]));
+    let err = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier),
+            json!({ "category": "moonshine" }),
+        )
+        .await
+        .expect_err("should fail");
+    assert!(err.to_string().contains("unknown category"));
+}
+
+#[tokio::test]
+async fn resolve_category_intent_skips_llm_when_window_empty() {
+    let pool = setup_db_with_fixture().await;
+    let classifier = Arc::new(StubClassifier::new(&[]));
+    let out = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier.clone()),
+            json!({
+                "category": "groceries",
+                "date_from": "2099-01-01",
+                "date_to": "2099-01-31"
+            }),
+        )
+        .await
+        .expect("ok");
+    assert_eq!(*classifier.call_count.lock().unwrap(), 0);
+    let suggested = out.data.get("suggested").unwrap().as_array().unwrap();
+    assert!(suggested.is_empty());
+    assert!(!out
+        .data
+        .get("requires_user_confirmation")
+        .unwrap()
+        .as_bool()
+        .unwrap());
 }

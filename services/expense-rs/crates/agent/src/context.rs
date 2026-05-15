@@ -102,9 +102,24 @@ impl AgentContext {
              - Almost every spending question should filter `direction=debit`. Income questions \
                filter `direction=credit`.\n\
              - Dates are ISO `YYYY-MM-DD`. The transaction date is `booked_at`.\n\
-             - There is no category field populated yet. Do NOT filter by category. If the \
-               user asks about a category (e.g. 'dining'), do a merchant substring search where \
-               sensible, or say you don't have category data.\n\n\
+             - Transactions don't carry a `category` column directly. To answer a category \
+               question (groceries, dining, transit, utilities, entertainment, shopping, \
+               subscriptions, healthcare, travel, income, transfers, fees, other), use the \
+               category intelligence flow described below.\n\n\
+             ## Category resolution flow (REQUIRED for category questions)\n\
+             - Step 1: Call `resolve_category_intent` with the category slug and an optional \
+               date window. It returns `{{confirmed, suggested, excluded, requires_user_confirmation}}`.\n\
+             - Step 2: If `requires_user_confirmation` is true, your final assistant message \
+               MUST be EXACTLY this single line and nothing else:\n\
+               `CATEGORY_CONFIRMATION_NEEDED: <category_slug>`\n\
+               (e.g. `CATEGORY_CONFIRMATION_NEEDED: groceries`). The UI parses this sentinel \
+               and renders the confirmation card. Do NOT compute the final answer in this turn.\n\
+             - Step 3: When the user confirms (their next message will list which merchants to \
+               include/exclude), call `confirm_category_assignments` to persist their choices.\n\
+             - Step 4: Call `aggregate_transactions` (or `query_transactions`) with \
+               `merchant_substrings` set to the confirmed merchants' normalized_key values.\n\
+             - Step 5: Name the included merchants in your final answer (e.g. \"You spent \
+               $581 on groceries — Loblaws, Metro, Walmart\").\n\n\
              ## Tool-calling discipline\n\
              - For 'how much / total / average / count / top N by X' → `aggregate_transactions` \
                (group_by handles top-N rankings).\n\
