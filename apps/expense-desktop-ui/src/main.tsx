@@ -4,10 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowDownLeft, ArrowUpRight, Circle, Settings2 } from "lucide-react";
 import appIcon from "./assets/app-icon.png";
 import { ChatPanel } from "./chat/ChatPanel";
+import { ActivityPanel } from "./chat/ActivityPanel";
 import "./styles.css";
 
 type ServiceStartupState = "starting" | "healthy" | "failed";
-type AppSection = "ai" | "import" | "data";
+type AppSection = "ai" | "import" | "data" | "activity";
 
 type StartupStatus = {
   state: ServiceStartupState;
@@ -988,10 +989,18 @@ export function App() {
             >
               View Your Data
             </button>
+            <button
+              className={section === "activity" ? "button active" : "button ghost"}
+              onClick={() => setSection("activity")}
+            >
+              Activity
+            </button>
           </nav>
         </header>
 
         {section === "ai" ? <ChatPanel apiBaseUrl={API_BASE_URL || ""} /> : null}
+
+        {section === "activity" ? <ActivityPanel apiBaseUrl={API_BASE_URL || ""} /> : null}
 
         {section === "import" ? (
           <section className="panel page import-page" data-testid="import-page">

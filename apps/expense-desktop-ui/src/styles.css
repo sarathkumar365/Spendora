@@ -1191,3 +1191,186 @@ select.input::-ms-expand {
 .chat-details-tools li code {
   font-weight: 500;
 }
+
+/* ===== Activity tab (Phase 6f) ===== */
+.activity-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.activity-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.activity-summary-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.activity-summary-card {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.activity-summary-cost {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+
+.activity-view-toggle {
+  display: flex;
+  gap: 8px;
+}
+
+.activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.activity-table thead th {
+  text-align: left;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.55);
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.activity-table th.num,
+.activity-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-table tbody tr {
+  cursor: pointer;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.activity-table tbody tr:hover {
+  background: rgba(37, 99, 235, 0.04);
+}
+
+.activity-table td {
+  padding: 8px 10px;
+  vertical-align: top;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: lowercase;
+}
+
+.status-pill.status-done {
+  background: rgba(16, 185, 129, 0.12);
+  color: #047857;
+}
+
+.status-pill.status-error {
+  background: rgba(239, 68, 68, 0.12);
+  color: #b91c1c;
+}
+
+.status-pill.status-truncated,
+.status-pill.status-cancelled {
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+}
+
+.status-pill.status-running {
+  background: rgba(99, 102, 241, 0.12);
+  color: #4338ca;
+}
+
+/* Run drawer reuse */
+.activity-drawer {
+  width: min(640px, 100vw);
+}
+
+.activity-event-list {
+  list-style: none;
+  padding: 0 18px 18px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.activity-event {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.03);
+  font-size: 12px;
+}
+
+.activity-event-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.activity-event-kind {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.activity-event.kind-tool_call {
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.activity-event.kind-llm_call {
+  background: rgba(37, 99, 235, 0.05);
+}
+
+.activity-event.kind-run_started,
+.activity-event.kind-run_ended {
+  background: rgba(16, 185, 129, 0.06);
+}
+
+.activity-event.kind-error {
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.activity-event-meta {
+  margin: 2px 0;
+}
+
+.activity-event-summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: rgba(0, 0, 0, 0.55);
+  margin-top: 6px;
+}
+
+.activity-event-payload {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 8px;
+  border-radius: 6px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 6px;
+}
