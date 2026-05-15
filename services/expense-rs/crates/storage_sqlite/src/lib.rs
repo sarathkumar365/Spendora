@@ -2648,6 +2648,258 @@ pub async fn append_category_history(
     Ok(())
 }
 
+// =============================================================================
+// Agent audit trail (migration 0013)
+// =============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentEventRow {
+    pub id: Option<String>,
+    pub conversation_id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub event_kind: String,
+    pub occurred_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub payload_json: String,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    pub user_message_excerpt: Option<String>,
+    pub tool_name: Option<String>,
+    pub ok: Option<bool>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEventRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub event_kind: String,
+    pub occurred_at: String,
+    pub duration_ms: Option<i64>,
+    pub payload_json: String,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    pub user_message_excerpt: Option<String>,
+    pub tool_name: Option<String>,
+    pub ok: Option<bool>,
+    pub error_message: Option<String>,
+}
+
+pub async fn insert_agent_event(pool: &SqlitePool, row: AgentEventRow) -> anyhow::Result<String> {
+    let id = row.id.unwrap_or_else(new_idempotency_key);
+    let mut q = sqlx::query(
+        "INSERT INTO agent_events ( \
+            id, conversation_id, run_id, sequence, event_kind, \
+            duration_ms, payload_json, status, model, prompt_tokens, \
+            completion_tokens, cost_micros, user_message_excerpt, \
+            tool_name, ok, error_message \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )
+    .bind(&id)
+    .bind(&row.conversation_id)
+    .bind(&row.run_id)
+    .bind(row.sequence)
+    .bind(&row.event_kind)
+    .bind(row.duration_ms)
+    .bind(&row.payload_json)
+    .bind(row.status.as_deref())
+    .bind(row.model.as_deref())
+    .bind(row.prompt_tokens)
+    .bind(row.completion_tokens)
+    .bind(row.cost_micros)
+    .bind(row.user_message_excerpt.as_deref())
+    .bind(row.tool_name.as_deref())
+    .bind(row.ok.map(|b| if b { 1_i64 } else { 0_i64 }))
+    .bind(row.error_message.as_deref());
+    // occurred_at: leave NULL → SQLite default (CURRENT_TIMESTAMP). If caller supplied a value,
+    // override via a follow-up update — keeps the bind list above stable.
+    q.execute(pool).await?;
+    if let Some(at) = row.occurred_at.as_deref() {
+        sqlx::query("UPDATE agent_events SET occurred_at = ?1 WHERE id = ?2")
+            .bind(at)
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(id)
+}
+
+pub async fn list_agent_events_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> anyhow::Result<Vec<AgentEventRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, conversation_id, run_id, sequence, event_kind, occurred_at, \
+                duration_ms, payload_json, status, model, prompt_tokens, completion_tokens, \
+                cost_micros, user_message_excerpt, tool_name, ok, error_message \
+         FROM agent_events WHERE run_id = ?1 ORDER BY sequence ASC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(record_from_row).collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub started_at: String,
+    pub last_active_at: String,
+    pub run_count: i64,
+    pub total_cost_micros: i64,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub first_question: Option<String>,
+}
+
+pub async fn list_conversation_summaries(
+    pool: &SqlitePool,
+    limit: i64,
+) -> anyhow::Result<Vec<ConversationSummary>> {
+    let rows = sqlx::query(
+        "SELECT \
+            conversation_id, \
+            MIN(occurred_at) AS started_at, \
+            MAX(occurred_at) AS last_active_at, \
+            COUNT(DISTINCT run_id) AS run_count, \
+            COALESCE(SUM(CASE WHEN event_kind='llm_call' THEN cost_micros ELSE 0 END), 0) AS total_cost_micros, \
+            COALESCE(SUM(CASE WHEN event_kind='llm_call' THEN prompt_tokens ELSE 0 END), 0) AS total_prompt_tokens, \
+            COALESCE(SUM(CASE WHEN event_kind='llm_call' THEN completion_tokens ELSE 0 END), 0) AS total_completion_tokens, \
+            MAX(CASE WHEN event_kind='run_started' THEN user_message_excerpt END) AS first_question \
+         FROM agent_events \
+         GROUP BY conversation_id \
+         ORDER BY last_active_at DESC \
+         LIMIT ?1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ConversationSummary {
+            conversation_id: r.get("conversation_id"),
+            started_at: r.get("started_at"),
+            last_active_at: r.get("last_active_at"),
+            run_count: r.get("run_count"),
+            total_cost_micros: r.get("total_cost_micros"),
+            total_prompt_tokens: r.get("total_prompt_tokens"),
+            total_completion_tokens: r.get("total_completion_tokens"),
+            first_question: r.try_get::<Option<String>, _>("first_question").unwrap_or(None),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub conversation_id: String,
+    pub occurred_at: String,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+pub async fn list_recent_runs(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<RunSummary>> {
+    let rows = sqlx::query(
+        "SELECT run_id, conversation_id, occurred_at, status, model, \
+                prompt_tokens, completion_tokens, cost_micros, error_message \
+         FROM agent_events \
+         WHERE event_kind = 'run_ended' \
+         ORDER BY occurred_at DESC \
+         LIMIT ?1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RunSummary {
+            run_id: r.get("run_id"),
+            conversation_id: r.get("conversation_id"),
+            occurred_at: r.get("occurred_at"),
+            status: r.try_get::<Option<String>, _>("status").unwrap_or(None),
+            model: r.try_get::<Option<String>, _>("model").unwrap_or(None),
+            prompt_tokens: r.try_get::<Option<i64>, _>("prompt_tokens").unwrap_or(None),
+            completion_tokens: r
+                .try_get::<Option<i64>, _>("completion_tokens")
+                .unwrap_or(None),
+            cost_micros: r.try_get::<Option<i64>, _>("cost_micros").unwrap_or(None),
+            error_message: r.try_get::<Option<String>, _>("error_message").unwrap_or(None),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentCostSummary {
+    pub total_cost_micros: i64,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub llm_call_count: i64,
+}
+
+pub async fn agent_cost_since(
+    pool: &SqlitePool,
+    since_iso: &str,
+) -> anyhow::Result<AgentCostSummary> {
+    let row = sqlx::query(
+        "SELECT \
+            COALESCE(SUM(cost_micros), 0) AS total_cost_micros, \
+            COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens, \
+            COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens, \
+            COUNT(*) AS llm_call_count \
+         FROM agent_events \
+         WHERE event_kind = 'llm_call' AND occurred_at >= ?1",
+    )
+    .bind(since_iso)
+    .fetch_one(pool)
+    .await?;
+    Ok(AgentCostSummary {
+        total_cost_micros: row.get("total_cost_micros"),
+        total_prompt_tokens: row.get("total_prompt_tokens"),
+        total_completion_tokens: row.get("total_completion_tokens"),
+        llm_call_count: row.get("llm_call_count"),
+    })
+}
+
+fn record_from_row(r: sqlx::sqlite::SqliteRow) -> AgentEventRecord {
+    AgentEventRecord {
+        id: r.get("id"),
+        conversation_id: r.get("conversation_id"),
+        run_id: r.get("run_id"),
+        sequence: r.get("sequence"),
+        event_kind: r.get("event_kind"),
+        occurred_at: r.get("occurred_at"),
+        duration_ms: r.try_get::<Option<i64>, _>("duration_ms").unwrap_or(None),
+        payload_json: r.get("payload_json"),
+        status: r.try_get::<Option<String>, _>("status").unwrap_or(None),
+        model: r.try_get::<Option<String>, _>("model").unwrap_or(None),
+        prompt_tokens: r.try_get::<Option<i64>, _>("prompt_tokens").unwrap_or(None),
+        completion_tokens: r.try_get::<Option<i64>, _>("completion_tokens").unwrap_or(None),
+        cost_micros: r.try_get::<Option<i64>, _>("cost_micros").unwrap_or(None),
+        user_message_excerpt: r
+            .try_get::<Option<String>, _>("user_message_excerpt")
+            .unwrap_or(None),
+        tool_name: r.try_get::<Option<String>, _>("tool_name").unwrap_or(None),
+        ok: r
+            .try_get::<Option<i64>, _>("ok")
+            .unwrap_or(None)
+            .map(|n| n != 0),
+        error_message: r.try_get::<Option<String>, _>("error_message").unwrap_or(None),
+    }
+}
+
 pub async fn enqueue_job(
     pool: &SqlitePool,
     job_type: &str,
@@ -2789,6 +3041,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0012_category_intelligence",
         include_str!("../../../migrations/0012_category_intelligence.sql"),
+    ),
+    (
+        "0013_agent_audit",
+        include_str!("../../../migrations/0013_agent_audit.sql"),
     ),
 ];
 
@@ -4157,6 +4413,169 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(h_count, 2);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    // ---------- Agent audit (migration 0013) ----------
+
+    fn agent_event(
+        conv: &str,
+        run: &str,
+        seq: i64,
+        kind: &str,
+    ) -> AgentEventRow {
+        AgentEventRow {
+            id: None,
+            conversation_id: conv.to_string(),
+            run_id: run.to_string(),
+            sequence: seq,
+            event_kind: kind.to_string(),
+            occurred_at: None,
+            duration_ms: None,
+            payload_json: "{}".to_string(),
+            status: None,
+            model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cost_micros: None,
+            user_message_excerpt: None,
+            tool_name: None,
+            ok: None,
+            error_message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_list_agent_events_round_trip() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+
+        insert_agent_event(&pool, {
+            let mut e = agent_event("c1", "r1", 0, "run_started");
+            e.status = Some("running".into());
+            e.user_message_excerpt = Some("Hi".into());
+            e.model = Some("openai:gpt-4o-mini".into());
+            e
+        })
+        .await
+        .expect("insert 0");
+        insert_agent_event(&pool, {
+            let mut e = agent_event("c1", "r1", 1, "llm_call");
+            e.model = Some("openai:gpt-4o-mini".into());
+            e.prompt_tokens = Some(100);
+            e.completion_tokens = Some(40);
+            e.cost_micros = Some(39);
+            e.duration_ms = Some(800);
+            e
+        })
+        .await
+        .expect("insert 1");
+        insert_agent_event(&pool, {
+            let mut e = agent_event("c1", "r1", 2, "run_ended");
+            e.status = Some("done".into());
+            e.prompt_tokens = Some(100);
+            e.completion_tokens = Some(40);
+            e.cost_micros = Some(39);
+            e
+        })
+        .await
+        .expect("insert 2");
+
+        let events = list_agent_events_for_run(&pool, "r1").await.expect("list");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_kind, "run_started");
+        assert_eq!(events[1].event_kind, "llm_call");
+        assert_eq!(events[2].event_kind, "run_ended");
+        assert_eq!(events[1].cost_micros, Some(39));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_summary_rolls_up_cost_and_tokens() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        // 2 LLM calls in conv A, 1 in conv B.
+        for (conv, run, seq, cost, prompt, comp) in [
+            ("A", "r1", 0, 100_i64, 50_i64, 20_i64),
+            ("A", "r1", 1, 200, 80, 30),
+            ("A", "r2", 0, 50, 40, 10),
+            ("B", "r3", 0, 999, 100, 50),
+        ] {
+            let mut e = agent_event(conv, run, seq, "llm_call");
+            e.cost_micros = Some(cost);
+            e.prompt_tokens = Some(prompt);
+            e.completion_tokens = Some(comp);
+            insert_agent_event(&pool, e).await.expect("insert");
+        }
+        // Add the run_started markers so first_question rollup picks them up.
+        let mut started_a = agent_event("A", "r1", 2, "run_started");
+        started_a.user_message_excerpt = Some("Question A".into());
+        insert_agent_event(&pool, started_a).await.expect("insert");
+
+        let summaries = list_conversation_summaries(&pool, 10).await.expect("list");
+        let a = summaries.iter().find(|s| s.conversation_id == "A").unwrap();
+        assert_eq!(a.run_count, 2);
+        assert_eq!(a.total_cost_micros, 100 + 200 + 50);
+        assert_eq!(a.total_prompt_tokens, 50 + 80 + 40);
+        assert_eq!(a.total_completion_tokens, 20 + 30 + 10);
+        let b = summaries.iter().find(|s| s.conversation_id == "B").unwrap();
+        assert_eq!(b.total_cost_micros, 999);
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn list_recent_runs_returns_one_row_per_run_ended() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        // 2 completed runs + 1 in-flight (no run_ended yet).
+        for (run, ts, status, cost) in [
+            ("r1", "2026-05-01 10:00:00", "done", 100_i64),
+            ("r2", "2026-05-02 10:00:00", "error", 0),
+        ] {
+            let mut e = agent_event("c1", run, 9, "run_ended");
+            e.occurred_at = Some(ts.to_string());
+            e.status = Some(status.to_string());
+            e.cost_micros = Some(cost);
+            insert_agent_event(&pool, e).await.expect("insert");
+        }
+        insert_agent_event(&pool, agent_event("c1", "r3", 0, "run_started"))
+            .await
+            .expect("insert in-flight");
+
+        let runs = list_recent_runs(&pool, 10).await.expect("list");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, "r2"); // most recent first
+        assert_eq!(runs[1].run_id, "r1");
+        assert_eq!(runs[1].cost_micros, Some(100));
+
+        drop(pool);
+        let _ = tokio::fs::remove_file(db_path).await;
+    }
+
+    #[tokio::test]
+    async fn agent_cost_since_sums_llm_calls_only() {
+        let (pool, db_path) = fresh_migrated_pool().await;
+        let mut e = agent_event("c1", "r1", 0, "llm_call");
+        e.cost_micros = Some(500);
+        e.prompt_tokens = Some(100);
+        e.completion_tokens = Some(50);
+        e.occurred_at = Some("2026-05-15 12:00:00".into());
+        insert_agent_event(&pool, e).await.expect("insert");
+
+        // A tool_call also has a stray cost_micros — should NOT be counted.
+        let mut e2 = agent_event("c1", "r1", 1, "tool_call");
+        e2.cost_micros = Some(9999);
+        e2.occurred_at = Some("2026-05-15 12:00:01".into());
+        insert_agent_event(&pool, e2).await.expect("insert");
+
+        let summary = agent_cost_since(&pool, "2026-05-01").await.expect("ok");
+        assert_eq!(summary.total_cost_micros, 500);
+        assert_eq!(summary.total_prompt_tokens, 100);
+        assert_eq!(summary.total_completion_tokens, 50);
+        assert_eq!(summary.llm_call_count, 1);
 
         drop(pool);
         let _ = tokio::fs::remove_file(db_path).await;
