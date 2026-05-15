@@ -2,9 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
-use storage_sqlite::SqlitePool;
 
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 pub struct ListAccountsAndCardsTool;
 
@@ -29,7 +28,8 @@ impl Tool for ListAccountsAndCardsTool {
         })
     }
 
-    async fn invoke(&self, db: &SqlitePool, _args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, deps: AgentDeps<'_>, _args: Value) -> Result<ToolOutput> {
+        let db = deps.db;
         let rows = sqlx::query(
             "SELECT id, name, currency_code, account_type, account_number_ending, customer_name \
              FROM accounts \

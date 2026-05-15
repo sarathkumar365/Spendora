@@ -6,7 +6,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use storage_sqlite::SqlitePool;
 
-use crate::llm::{ToolDefinition, ToolFunctionSchema};
+use crate::llm::{LlmProvider, ToolDefinition, ToolFunctionSchema};
+
+/// Dependencies handed to every tool's `invoke` call.
+///
+/// Held by value but the inner fields are cheap to clone (a pool ref + an Arc), so passing
+/// `AgentDeps` to a tool is essentially free. Tools that need direct LLM access (e.g. for
+/// merchant classification) call `deps.llm.complete(...)`; tools that only read SQL ignore it.
+#[derive(Clone)]
+pub struct AgentDeps<'a> {
+    pub db: &'a SqlitePool,
+    pub llm: Arc<dyn LlmProvider>,
+}
+
+impl<'a> AgentDeps<'a> {
+    pub fn new(db: &'a SqlitePool, llm: Arc<dyn LlmProvider>) -> Self {
+        Self { db, llm }
+    }
+}
 
 pub mod accounts_tool;
 pub mod aggregate_tool;
@@ -55,7 +72,7 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters_schema(&self) -> Value;
-    async fn invoke(&self, db: &SqlitePool, args: Value) -> Result<ToolOutput>;
+    async fn invoke(&self, deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput>;
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {

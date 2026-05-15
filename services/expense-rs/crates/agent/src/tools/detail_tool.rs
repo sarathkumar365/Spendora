@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
-use storage_sqlite::{normalize_merchant_key, SqlitePool};
+use storage_sqlite::normalize_merchant_key;
 
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 pub struct TransactionDetailTool;
 
@@ -44,7 +44,8 @@ impl Tool for TransactionDetailTool {
         })
     }
 
-    async fn invoke(&self, db: &SqlitePool, args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput> {
+        let db = deps.db;
         let args: DetailArgs = serde_json::from_value(args.clone())
             .map_err(|e| anyhow!("invalid arguments: {e}"))?;
 

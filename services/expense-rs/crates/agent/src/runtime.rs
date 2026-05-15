@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmProvider, ToolCall};
-use crate::tools::ToolRegistry;
+use crate::tools::{AgentDeps, ToolRegistry};
 
 pub const DEFAULT_MAX_ITERATIONS: usize = 6;
 
@@ -235,7 +235,8 @@ impl AgentRunner {
             }
         };
 
-        match tool.invoke(db, args).await {
+        let deps = AgentDeps::new(db, self.provider.clone());
+        match tool.invoke(deps, args).await {
             Ok(out) => {
                 info!(
                     tool = %call.function.name,

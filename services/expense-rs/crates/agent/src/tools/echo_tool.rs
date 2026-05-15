@@ -1,9 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use storage_sqlite::SqlitePool;
 
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 pub struct EchoTool;
 
@@ -30,7 +29,7 @@ impl Tool for EchoTool {
         })
     }
 
-    async fn invoke(&self, _db: &SqlitePool, args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, _deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput> {
         let text = args
             .get("text")
             .and_then(|v| v.as_str())

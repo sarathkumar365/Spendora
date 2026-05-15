@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use storage_sqlite::SqlitePool;
 
 use super::common::{validate_date, validate_direction};
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 const MAX_LIMIT: i64 = 200;
 
@@ -104,7 +104,8 @@ impl Tool for ComparePeriodsTool {
         })
     }
 
-    async fn invoke(&self, db: &SqlitePool, args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput> {
+        let db = deps.db;
         let args: CompareArgs = serde_json::from_value(args.clone())
             .map_err(|e| anyhow!("invalid arguments: {e}"))?;
 

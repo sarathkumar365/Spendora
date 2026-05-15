@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
-use storage_sqlite::SqlitePool;
+// SqlitePool now reached via AgentDeps::db
 
 use super::common::{validate_date_opt, validate_direction};
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -85,7 +85,8 @@ impl Tool for AggregateTransactionsTool {
         })
     }
 
-    async fn invoke(&self, db: &SqlitePool, args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput> {
+        let db = deps.db;
         let args: AggArgs = serde_json::from_value(args.clone())
             .map_err(|e| anyhow!("invalid arguments: {e}"))?;
 

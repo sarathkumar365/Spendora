@@ -1,7 +1,39 @@
 use super::*;
+use crate::llm::{
+    ChatCompletionRequest, ChatCompletionResponse, LlmProvider, LlmProviderKind,
+};
+use anyhow::anyhow;
+use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use storage_sqlite::{connect, run_migrations, SqlitePool};
+
+/// Stub LLM provider used by tool tests that don't exercise the LLM path.
+/// Calling `complete` from a test that uses this stub is a bug — it panics.
+struct PanicLlm;
+
+#[async_trait]
+impl LlmProvider for PanicLlm {
+    async fn complete(
+        &self,
+        _req: ChatCompletionRequest,
+    ) -> anyhow::Result<ChatCompletionResponse> {
+        Err(anyhow!(
+            "PanicLlm.complete called — this tool test should not invoke the LLM"
+        ))
+    }
+    fn model_label(&self) -> String {
+        "panic:test".to_string()
+    }
+    fn kind(&self) -> LlmProviderKind {
+        LlmProviderKind::OpenAi
+    }
+}
+
+fn test_deps(db: &SqlitePool) -> AgentDeps<'_> {
+    AgentDeps::new(db, Arc::new(PanicLlm))
+}
 
 async fn setup_db_with_fixture() -> SqlitePool {
     let dir = std::env::current_dir().expect("cwd").join(".tmp");
@@ -66,7 +98,7 @@ async fn setup_db_with_fixture() -> SqlitePool {
 async fn list_accounts_returns_seeded_accounts() {
     let pool = setup_db_with_fixture().await;
     let out = ListAccountsAndCardsTool
-        .invoke(&pool, json!({}))
+        .invoke(test_deps(&pool), json!({}))
         .await
         .expect("ok");
     let accounts = out.data.get("accounts").unwrap().as_array().unwrap();
@@ -84,7 +116,7 @@ async fn query_filters_by_merchant_substring() {
     let pool = setup_db_with_fixture().await;
     let out = QueryTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "merchant_substring": "amazon",
                 "direction": "debit"
@@ -103,7 +135,7 @@ async fn query_respects_date_range_and_direction() {
     let pool = setup_db_with_fixture().await;
     let out = QueryTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "date_from": "2026-04-01",
                 "date_to": "2026-04-30",
@@ -127,7 +159,7 @@ async fn aggregate_sum_by_merchant_debit() {
     let pool = setup_db_with_fixture().await;
     let out = AggregateTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "group_by": "merchant",
                 "metric": "sum",
@@ -155,7 +187,7 @@ async fn aggregate_sum_by_account_debit() {
     let pool = setup_db_with_fixture().await;
     let out = AggregateTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "group_by": "account",
                 "metric": "sum",
@@ -173,7 +205,7 @@ async fn aggregate_rejects_unknown_group_by() {
     let pool = setup_db_with_fixture().await;
     let err = AggregateTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({ "group_by": "shoe_size", "metric": "sum" }),
         )
         .await
@@ -185,7 +217,7 @@ async fn aggregate_rejects_unknown_group_by() {
 async fn query_rejects_bad_date() {
     let pool = setup_db_with_fixture().await;
     let err = QueryTransactionsTool
-        .invoke(&pool, json!({ "date_from": "yesterday" }))
+        .invoke(test_deps(&pool), json!({ "date_from": "yesterday" }))
         .await
         .expect_err("should fail");
     assert!(err.to_string().contains("YYYY-MM-DD"));
@@ -197,7 +229,7 @@ async fn compare_periods_sum_debit() {
     // March vs April debits: March = $45 refund credit (not debit), April debits = $50+$120+$8+$250 = $428
     let out = ComparePeriodsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "window_a": { "date_from": "2026-03-01", "date_to": "2026-03-31" },
                 "window_b": { "date_from": "2026-04-01", "date_to": "2026-04-30" },
@@ -223,7 +255,7 @@ async fn compare_periods_groups_by_merchant() {
     // Force same window so groups should have non-zero on both sides where merchants repeat
     let out = ComparePeriodsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({
                 "window_a": { "date_from": "2026-04-01", "date_to": "2026-04-15" },
                 "window_b": { "date_from": "2026-04-16", "date_to": "2026-04-30" },
@@ -246,7 +278,7 @@ async fn compare_periods_groups_by_merchant() {
 async fn transaction_detail_finds_similar_amazon() {
     let pool = setup_db_with_fixture().await;
     let out = TransactionDetailTool
-        .invoke(&pool, json!({ "transaction_id": "t1" }))
+        .invoke(test_deps(&pool), json!({ "transaction_id": "t1" }))
         .await
         .expect("ok");
     let primary = out.data.get("transaction").unwrap();
@@ -266,7 +298,7 @@ async fn transaction_detail_finds_similar_amazon() {
 async fn transaction_detail_returns_error_for_missing_id() {
     let pool = setup_db_with_fixture().await;
     let err = TransactionDetailTool
-        .invoke(&pool, json!({ "transaction_id": "nope" }))
+        .invoke(test_deps(&pool), json!({ "transaction_id": "nope" }))
         .await
         .expect_err("should fail");
     assert!(err.to_string().contains("not found"));
@@ -290,7 +322,7 @@ async fn find_recurring_detects_monthly_subscription() {
     }
 
     let out = FindRecurringTool
-        .invoke(&pool, json!({ "lookback_months": 6, "date_to": "2026-03-31" }))
+        .invoke(test_deps(&pool), json!({ "lookback_months": 6, "date_to": "2026-03-31" }))
         .await
         .expect("ok");
     let recurring = out.data.get("recurring").unwrap().as_array().unwrap();
@@ -324,7 +356,7 @@ async fn find_recurring_skips_irregular_charges() {
         .expect("seed irregular");
     }
     let out = FindRecurringTool
-        .invoke(&pool, json!({ "lookback_months": 6, "date_to": "2026-03-31", "merchant_substring": "rando" }))
+        .invoke(test_deps(&pool), json!({ "lookback_months": 6, "date_to": "2026-03-31", "merchant_substring": "rando" }))
         .await
         .expect("ok");
     let recurring = out.data.get("recurring").unwrap().as_array().unwrap();
@@ -336,7 +368,7 @@ async fn aggregate_count_by_direction() {
     let pool = setup_db_with_fixture().await;
     let out = AggregateTransactionsTool
         .invoke(
-            &pool,
+            test_deps(&pool),
             json!({ "group_by": "direction", "metric": "count" }),
         )
         .await

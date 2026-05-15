@@ -5,9 +5,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::HashMap;
-use storage_sqlite::{normalize_merchant_key, SqlitePool};
+use storage_sqlite::normalize_merchant_key;
 
-use super::{Tool, ToolOutput};
+use super::{AgentDeps, Tool, ToolOutput};
 
 pub struct FindRecurringTool;
 
@@ -66,7 +66,8 @@ impl Tool for FindRecurringTool {
         })
     }
 
-    async fn invoke(&self, db: &SqlitePool, args: Value) -> Result<ToolOutput> {
+    async fn invoke(&self, deps: AgentDeps<'_>, args: Value) -> Result<ToolOutput> {
+        let db = deps.db;
         let args: RecurringArgs = serde_json::from_value(args.clone())
             .map_err(|e| anyhow!("invalid arguments: {e}"))?;
 
