@@ -95,6 +95,15 @@ pub struct ChatCompletionRequest {
 pub struct ChatCompletionResponse {
     pub message: ChatMessage,
     pub finish_reason: String,
+    /// Token counts from the provider, when available. OpenAI returns these natively;
+    /// local OpenAI-compatible servers often don't, in which case this is None.
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
 }
 
 #[async_trait]
@@ -282,12 +291,28 @@ async fn chat_completion(
         })
         .unwrap_or_default();
 
+    let usage = parse_usage(&json);
+
     Ok(ChatCompletionResponse {
         message: ChatMessage::Assistant {
             content,
             tool_calls,
         },
         finish_reason,
+        usage,
+    })
+}
+
+/// Extract the `usage.prompt_tokens` / `usage.completion_tokens` fields from an OpenAI-shaped
+/// chat completion response. Returns `None` if the field is missing (some local providers
+/// omit it).
+fn parse_usage(json: &Value) -> Option<TokenUsage> {
+    let u = json.get("usage")?;
+    let prompt = u.get("prompt_tokens").and_then(|v| v.as_i64())?;
+    let completion = u.get("completion_tokens").and_then(|v| v.as_i64())?;
+    Some(TokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
     })
 }
 
@@ -300,6 +325,33 @@ fn truncate_for_log(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod parse_usage_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_when_present() {
+        let json = serde_json::json!({
+            "usage": { "prompt_tokens": 123, "completion_tokens": 45 }
+        });
+        let u = parse_usage(&json).expect("present");
+        assert_eq!(u.prompt_tokens, 123);
+        assert_eq!(u.completion_tokens, 45);
+    }
+
+    #[test]
+    fn none_when_usage_missing() {
+        let json = serde_json::json!({ "choices": [] });
+        assert!(parse_usage(&json).is_none());
+    }
+
+    #[test]
+    fn none_when_fields_partial() {
+        let json = serde_json::json!({ "usage": { "prompt_tokens": 10 } });
+        assert!(parse_usage(&json).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -85,6 +85,7 @@ impl LlmProvider for StubClassifier {
                 tool_calls: Vec::new(),
             },
             finish_reason: "stop".to_string(),
+            usage: None,
         })
     }
     fn model_label(&self) -> String {

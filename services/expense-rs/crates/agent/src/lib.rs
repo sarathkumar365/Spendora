@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod context;
 pub mod llm;
+pub mod pricing;
 pub mod runtime;
 pub mod tools;
 
