@@ -605,3 +605,152 @@ async fn resolve_category_intent_skips_llm_when_window_empty() {
         .as_bool()
         .unwrap());
 }
+
+// --------- confirm_category_assignments + merchant_substrings tests (Phase 5d) ---------
+
+#[tokio::test]
+async fn confirm_category_assignments_persists_user_choices() {
+    let pool = seed_grocery_fixture().await;
+    let classifier = Arc::new(StubClassifier::new(&[
+        ("loblaws great food", 0.95),
+        ("metro", 0.93),
+        ("costco wholesale", 0.55),
+        ("netflix", 0.02),
+    ]));
+
+    // Run the classifier first so merchant_signatures exist + suggestions are persisted.
+    let resolve_out = ResolveCategoryIntentTool
+        .invoke(
+            classifier_deps(&pool, classifier.clone()),
+            json!({ "category": "groceries", "date_from": "2026-04-01", "date_to": "2026-04-30" }),
+        )
+        .await
+        .expect("resolve ok");
+
+    // Pull two suggested merchant IDs from the resolver output for the confirm payload.
+    let suggested = resolve_out.data.get("suggested").unwrap().as_array().unwrap();
+    let loblaws_id = suggested
+        .iter()
+        .find(|m| m.get("normalized_key").unwrap().as_str().unwrap().contains("loblaws"))
+        .unwrap()
+        .get("merchant_signature_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let costco_id = suggested
+        .iter()
+        .find(|m| m.get("normalized_key").unwrap().as_str().unwrap().contains("costco"))
+        .unwrap()
+        .get("merchant_signature_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let confirm_out = ConfirmCategoryAssignmentsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "category": "groceries",
+                "assignments": [
+                    { "merchant_signature_id": loblaws_id, "included": true },
+                    { "merchant_signature_id": costco_id,  "included": false },
+                ]
+            }),
+        )
+        .await
+        .expect("confirm ok");
+
+    let confirmed = confirm_out.data.get("confirmed").unwrap().as_array().unwrap();
+    let excluded = confirm_out.data.get("excluded").unwrap().as_array().unwrap();
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(excluded.len(), 1);
+
+    // History row count should be 2 (one per assignment).
+    let history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM category_resolution_history")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(history_count, 2);
+}
+
+#[tokio::test]
+async fn confirm_rejects_unknown_merchant_signature() {
+    let pool = seed_grocery_fixture().await;
+    let err = ConfirmCategoryAssignmentsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "category": "groceries",
+                "assignments": [
+                    { "merchant_signature_id": "bogus-id", "included": true }
+                ]
+            }),
+        )
+        .await
+        .expect_err("should fail");
+    assert!(err.to_string().contains("unknown merchant_signature_id"));
+}
+
+#[tokio::test]
+async fn aggregate_supports_merchant_substrings_array() {
+    let pool = seed_grocery_fixture().await;
+    // Sum debits matching either 'loblaws' OR 'metro' in April.
+    let out = AggregateTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "group_by": "merchant",
+                "metric": "sum",
+                "direction": "debit",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30",
+                "merchant_substrings": ["loblaws", "metro"]
+            }),
+        )
+        .await
+        .expect("ok");
+
+    let groups = out.data.get("groups").unwrap().as_array().unwrap();
+    // loblaws (5000+3200) + metro (2400) — but grouped by merchant they remain separate.
+    let total: f64 = groups.iter().map(|g| g.get("value").unwrap().as_f64().unwrap()).sum();
+    assert_eq!(total, (5000 + 3200 + 2400) as f64);
+}
+
+#[tokio::test]
+async fn query_supports_merchant_substrings_array() {
+    let pool = seed_grocery_fixture().await;
+    let out = QueryTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "merchant_substrings": ["loblaws", "costco"],
+                "direction": "debit",
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-30"
+            }),
+        )
+        .await
+        .expect("ok");
+    let count = out.data.get("count").unwrap().as_i64().unwrap();
+    // 2 loblaws + 1 costco
+    assert_eq!(count, 3);
+}
+
+#[tokio::test]
+async fn query_rejects_both_merchant_filter_forms_together() {
+    let pool = seed_grocery_fixture().await;
+    let err = QueryTransactionsTool
+        .invoke(
+            test_deps(&pool),
+            json!({
+                "merchant_substring": "loblaws",
+                "merchant_substrings": ["metro"]
+            }),
+        )
+        .await
+        .expect_err("should fail");
+    assert!(err.to_string().contains("not both"));
+}

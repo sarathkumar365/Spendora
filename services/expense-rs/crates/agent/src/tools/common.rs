@@ -1,8 +1,36 @@
 //! Helpers shared across the data tools.
 
 use anyhow::{anyhow, Result};
+use sqlx::{QueryBuilder, Sqlite};
 
 pub use storage_sqlite::normalize_merchant_key as normalize_merchant;
+
+/// Append an OR'd `LIKE` filter for each substring. Caller must wrap in an `AND (...)` block.
+/// Returns true if any clauses were appended.
+pub fn push_merchant_substrings_or<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    descr_col: &str,
+    substrings: &'a [String],
+) -> bool {
+    let non_empty: Vec<&'a str> = substrings
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return false;
+    }
+    qb.push(" AND (");
+    for (i, s) in non_empty.iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        qb.push(format!("LOWER({descr_col}) LIKE "));
+        qb.push_bind(format!("%{}%", s.to_lowercase()));
+    }
+    qb.push(")");
+    true
+}
 
 /// Validate an optional ISO date string in the form `YYYY-MM-DD`.
 /// Returns `Ok(())` if the value is `None`.

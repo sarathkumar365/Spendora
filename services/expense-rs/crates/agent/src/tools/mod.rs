@@ -29,6 +29,7 @@ pub mod accounts_tool;
 pub mod aggregate_tool;
 pub mod common;
 pub mod compare_tool;
+pub mod confirm_category_tool;
 pub mod detail_tool;
 pub mod echo_tool;
 pub mod query_tool;
@@ -41,6 +42,7 @@ mod tests;
 pub use accounts_tool::ListAccountsAndCardsTool;
 pub use aggregate_tool::AggregateTransactionsTool;
 pub use compare_tool::ComparePeriodsTool;
+pub use confirm_category_tool::ConfirmCategoryAssignmentsTool;
 pub use detail_tool::TransactionDetailTool;
 pub use echo_tool::EchoTool;
 pub use query_tool::QueryTransactionsTool;
@@ -127,5 +129,6 @@ pub fn build_default_registry() -> ToolRegistry {
     reg.register(FindRecurringTool);
     reg.register(TransactionDetailTool);
     reg.register(ResolveCategoryIntentTool);
+    reg.register(ConfirmCategoryAssignmentsTool);
     reg
 }

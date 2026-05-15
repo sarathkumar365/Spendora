@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
 // SqlitePool now reached via AgentDeps::db
 
-use super::common::{validate_date_opt, validate_direction};
+use super::common::{push_merchant_substrings_or, validate_date_opt, validate_direction};
 use super::{AgentDeps, Tool, ToolOutput};
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -23,6 +23,10 @@ struct AggArgs {
     account_id: Option<String>,
     #[serde(default)]
     merchant_substring: Option<String>,
+    /// OR-combined list of merchant substrings (e.g. confirmed grocery merchants).
+    /// Mutually exclusive with `merchant_substring`.
+    #[serde(default)]
+    merchant_substrings: Vec<String>,
     #[serde(default)]
     amount_min_cents: Option<i64>,
     #[serde(default)]
@@ -58,6 +62,11 @@ impl Tool for AggregateTransactionsTool {
                 "date_to": { "type": "string", "description": "Inclusive YYYY-MM-DD." },
                 "account_id": { "type": "string" },
                 "merchant_substring": { "type": "string" },
+                "merchant_substrings": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "OR'd list of substrings. Use this with the confirmed merchants from a category resolution. Mutually exclusive with `merchant_substring`."
+                },
                 "amount_min_cents": { "type": "integer" },
                 "amount_max_cents": { "type": "integer" },
                 "direction": {
@@ -93,6 +102,11 @@ impl Tool for AggregateTransactionsTool {
         validate_date_opt(args.date_from.as_deref(), "date_from")?;
         validate_date_opt(args.date_to.as_deref(), "date_to")?;
         validate_direction(args.direction.as_deref())?;
+        if args.merchant_substring.is_some() && !args.merchant_substrings.is_empty() {
+            return Err(anyhow!(
+                "pass either merchant_substring (single) or merchant_substrings (array), not both"
+            ));
+        }
 
         let (group_sql, group_alias) = match args.group_by.as_str() {
             "merchant" => ("LOWER(TRIM(t.description))", "merchant"),
@@ -136,6 +150,7 @@ impl Tool for AggregateTransactionsTool {
             let pat = format!("%{}%", v.to_lowercase());
             qb.push(" AND LOWER(t.description) LIKE ").push_bind(pat);
         }
+        push_merchant_substrings_or(&mut qb, "t.description", &args.merchant_substrings);
         if let Some(v) = args.amount_min_cents {
             qb.push(" AND ABS(t.amount_cents) >= ").push_bind(v);
         }

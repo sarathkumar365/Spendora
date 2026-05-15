@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
 // SqlitePool now reached via AgentDeps::db
 
-use super::common::{validate_date_opt, validate_direction};
+use super::common::{push_merchant_substrings_or, validate_date_opt, validate_direction};
 use super::{AgentDeps, Tool, ToolOutput};
 
 const DEFAULT_LIMIT: i64 = 100;
@@ -23,6 +23,10 @@ struct QueryArgs {
     account_id: Option<String>,
     #[serde(default)]
     merchant_substring: Option<String>,
+    /// OR-combined list of merchant substrings. Mutually exclusive with `merchant_substring`.
+    /// Used to scope a query to a category's confirmed merchants in the intelligence flow.
+    #[serde(default)]
+    merchant_substrings: Vec<String>,
     #[serde(default)]
     amount_min_cents: Option<i64>,
     #[serde(default)]
@@ -69,6 +73,11 @@ impl Tool for QueryTransactionsTool {
                     "type": "string",
                     "description": "Case-insensitive substring match against the transaction description / merchant. E.g. 'amazon' or 'uber'."
                 },
+                "merchant_substrings": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "OR'd list of substrings (e.g. ['loblaws', 'metro', 'walmart']). Use this when filtering by a set of merchants confirmed for a category. Mutually exclusive with `merchant_substring`."
+                },
                 "amount_min_cents": {
                     "type": "integer",
                     "description": "Inclusive minimum absolute amount in cents. E.g. 10000 = $100."
@@ -104,6 +113,11 @@ impl Tool for QueryTransactionsTool {
         validate_date_opt(args.date_from.as_deref(), "date_from")?;
         validate_date_opt(args.date_to.as_deref(), "date_to")?;
         validate_direction(args.direction.as_deref())?;
+        if args.merchant_substring.is_some() && !args.merchant_substrings.is_empty() {
+            return Err(anyhow!(
+                "pass either merchant_substring (single) or merchant_substrings (array), not both"
+            ));
+        }
 
         let limit = args
             .limit
@@ -138,6 +152,7 @@ impl Tool for QueryTransactionsTool {
             let pat = format!("%{}%", v.to_lowercase());
             qb.push(" AND LOWER(t.description) LIKE ").push_bind(pat);
         }
+        push_merchant_substrings_or(&mut qb, "t.description", &args.merchant_substrings);
         if let Some(v) = args.amount_min_cents {
             qb.push(" AND ABS(t.amount_cents) >= ").push_bind(v);
         }
