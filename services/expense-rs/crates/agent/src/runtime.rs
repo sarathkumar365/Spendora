@@ -76,10 +76,19 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
-    /// Always emitted last.
+    /// Always emitted last. Carries per-run stats for the UI's "Details" expander —
+    /// total tokens, cost, and the run/conversation ids so the UI can link to the
+    /// full audit replay at GET /api/v1/audit/runs/:run_id/events.
     Done {
         iterations: usize,
         cited_transaction_ids: Vec<String>,
+        run_id: String,
+        conversation_id: String,
+        model: String,
+        total_prompt_tokens: i64,
+        total_completion_tokens: i64,
+        total_cost_micros: i64,
+        total_llm_duration_ms: i64,
     },
 }
 
@@ -134,6 +143,7 @@ impl AgentRunner {
         let mut total_prompt_tokens: i64 = 0;
         let mut total_completion_tokens: i64 = 0;
         let mut total_cost_micros: i64 = 0;
+        let mut total_llm_duration_ms: i64 = 0;
         self.audit
             .record({
                 let mut e = AuditEvent::new(
@@ -242,6 +252,7 @@ impl AgentRunner {
             };
 
             let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
+            total_llm_duration_ms += llm_duration_ms;
             let usage = response.usage;
             let cost_micros = usage.as_ref().and_then(|u| cost_micros_for(&model_label, u));
             if let Some(u) = usage.as_ref() {
@@ -453,6 +464,13 @@ impl AgentRunner {
             .send(AgentEvent::Done {
                 iterations,
                 cited_transaction_ids: cited.clone(),
+                run_id: ctx.run_id.clone(),
+                conversation_id: ctx.conversation_id.clone(),
+                model: model_label.clone(),
+                total_prompt_tokens,
+                total_completion_tokens,
+                total_cost_micros,
+                total_llm_duration_ms,
             })
             .await;
 

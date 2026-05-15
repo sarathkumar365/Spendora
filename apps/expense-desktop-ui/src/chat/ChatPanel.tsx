@@ -48,6 +48,17 @@ type CategoryConfirmation = {
   applied: boolean;
 };
 
+type RunStats = {
+  runId: string;
+  conversationId: string;
+  iterations: number;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  costMicros: number;
+  llmDurationMs: number;
+};
+
 type ChatTurn = {
   id: string;
   role: ChatRole;
@@ -58,6 +69,7 @@ type ChatTurn = {
   truncated?: string | null;
   error?: string | null;
   categoryConfirmation?: CategoryConfirmation;
+  runStats?: RunStats;
 };
 
 type AgentEventBase = { kind: string };
@@ -96,6 +108,13 @@ type DoneEvent = AgentEventBase & {
   kind: "done";
   iterations: number;
   cited_transaction_ids: string[];
+  run_id: string;
+  conversation_id: string;
+  model: string;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_cost_micros: number;
+  total_llm_duration_ms: number;
 };
 type CategoryConfirmationNeededEvent = AgentEventBase & {
   kind: "category_confirmation_needed";
@@ -241,6 +260,9 @@ export function ChatPanel({ apiBaseUrl }: Props) {
   const [running, setRunning] = React.useState(false);
   const [ctx, setCtx] = React.useState<AgentContextResponse | null>(null);
   const [ctxError, setCtxError] = React.useState<string | null>(null);
+  // One conversation_id per UI session, sent on every chat request so the audit log groups
+  // every turn from this session under one conversation row.
+  const conversationIdRef = React.useRef<string>(newId());
   const [drawerCitedIds, setDrawerCitedIds] = React.useState<string[] | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
   const transcriptRef = React.useRef<HTMLDivElement | null>(null);
@@ -284,6 +306,7 @@ export function ChatPanel({ apiBaseUrl }: Props) {
     abortRef.current?.abort();
     setTurns([]);
     txnCache.current.clear();
+    conversationIdRef.current = newId();
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {
@@ -324,7 +347,11 @@ export function ChatPanel({ apiBaseUrl }: Props) {
       const res = await fetch(`${apiBaseUrl}/api/v1/agent/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ message: trimmed, history }),
+        body: JSON.stringify({
+          message: trimmed,
+          history,
+          conversation_id: conversationIdRef.current
+        }),
         signal: controller.signal
       });
 
@@ -445,7 +472,17 @@ export function ChatPanel({ apiBaseUrl }: Props) {
           case "done":
             return {
               ...t,
-              citedIds: event.cited_transaction_ids ?? []
+              citedIds: event.cited_transaction_ids ?? [],
+              runStats: {
+                runId: event.run_id,
+                conversationId: event.conversation_id,
+                iterations: event.iterations,
+                model: event.model,
+                promptTokens: event.total_prompt_tokens,
+                completionTokens: event.total_completion_tokens,
+                costMicros: event.total_cost_micros,
+                llmDurationMs: event.total_llm_duration_ms
+              }
             };
           case "truncated":
             return { ...t, truncated: event.reason };
@@ -749,8 +786,77 @@ function TurnView({
           <div className="chat-warning">Stopped early: {turn.truncated}</div>
         ) : null}
         {turn.error ? <div className="chat-error">Error: {turn.error}</div> : null}
+
+        {turn.runStats ? <TurnDetailsExpander stats={turn.runStats} toolEvents={turn.toolEvents} /> : null}
       </div>
     </div>
+  );
+}
+
+function TurnDetailsExpander({
+  stats,
+  toolEvents
+}: {
+  stats: RunStats;
+  toolEvents?: ToolEvent[];
+}) {
+  const [open, setOpen] = React.useState(false);
+
+  const costDollars = stats.costMicros / 1_000_000;
+  const costLabel =
+    stats.costMicros > 0
+      ? `$${costDollars.toFixed(costDollars >= 0.01 ? 4 : 6)}`
+      : "(no cost — provider didn't report usage)";
+
+  return (
+    <details
+      className="chat-details"
+      open={open}
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+    >
+      <summary className="chat-details-summary">
+        Details · {stats.iterations} iteration{stats.iterations === 1 ? "" : "s"} ·{" "}
+        {stats.llmDurationMs} ms LLM · {costLabel}
+      </summary>
+      <div className="chat-details-body">
+        <dl className="chat-details-grid">
+          <dt>Model</dt>
+          <dd><code>{stats.model}</code></dd>
+          <dt>Prompt tokens</dt>
+          <dd>{stats.promptTokens.toLocaleString()}</dd>
+          <dt>Completion tokens</dt>
+          <dd>{stats.completionTokens.toLocaleString()}</dd>
+          <dt>Estimated cost</dt>
+          <dd>{costLabel}</dd>
+          <dt>LLM time</dt>
+          <dd>{stats.llmDurationMs} ms across {stats.iterations} call{stats.iterations === 1 ? "" : "s"}</dd>
+          <dt>Run id</dt>
+          <dd><code className="chat-details-id">{stats.runId}</code></dd>
+          <dt>Conversation id</dt>
+          <dd><code className="chat-details-id">{stats.conversationId}</code></dd>
+        </dl>
+
+        {toolEvents && toolEvents.length > 0 ? (
+          <div className="chat-details-tools">
+            <p className="muted small">Tool calls ({toolEvents.length}):</p>
+            <ul>
+              {toolEvents.map((te) => (
+                <li key={te.id}>
+                  <code>{te.name}</code>{" "}
+                  {te.result ? (
+                    <span className={te.result.ok ? "muted small" : "chat-error"}>
+                      — {te.result.summary}
+                    </span>
+                  ) : (
+                    <span className="muted small">— …</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
