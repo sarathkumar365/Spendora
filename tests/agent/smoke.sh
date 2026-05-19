@@ -75,4 +75,17 @@ runs=$(curl -sf --max-time 5 "${BASE}/api/v1/audit/runs?limit=5") || fail "/audi
 echo "$runs" | grep -q '"run_id"' || fail "no completed runs — run_ended audit event may be missing"
 green "✓ audit runs endpoint shows recent run_ended rows"
 
+# --- Paused-run continuation endpoint (Phase 7) ---
+
+info "POST /api/v1/agent/runs/:run_id/continue (expect 404 for unknown run)"
+status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  -X POST \
+  -H "Content-Type: application/json" \
+  --data '{"category_slug":"groceries","assignments":[]}' \
+  "${BASE}/api/v1/agent/runs/bogus-run-id/continue")
+if [ "$status" != "404" ]; then
+  fail "expected 404 for unknown run_id, got HTTP $status"
+fi
+green "✓ /continue returns 404 for unknown run"
+
 green "All agent smoke checks passed."

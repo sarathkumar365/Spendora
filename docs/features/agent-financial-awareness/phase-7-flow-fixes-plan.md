@@ -1,7 +1,7 @@
 # Phase 7 — Flow Fixes Plan
 
-Date: 2026-05-15
-Status: Approved, ready to build
+Date: 2026-05-15 (shipped 2026-05-15)
+Status: ✅ Shipped (7a–7e)
 Estimate: ~6 hours across 5 sub-phases
 
 Address all four issues surfaced by the post-launch audit of the category confirmation flow, and restructure the flow itself so a category question is one continuous run instead of two with a JSON wart in between.
@@ -24,13 +24,13 @@ Address all four issues surfaced by the post-launch audit of the category confir
 
 ## Sub-phases
 
-| | Sub-phase | Files touched (primary) | Time |
+| | Sub-phase | Status | Commit |
 |---|---|---|---|
-| 7a | `merchant_signature_ids` filter on data tools | `crates/agent/src/tools/{query,aggregate,compare,resolve_category}_tool.rs`, `crates/storage_sqlite/src/lib.rs`, `crates/agent/src/context.rs` | 90 min |
-| 7b | Paused-run continuation | `crates/agent/src/runtime.rs`, new `crates/api/src/run_coordinator.rs`, `crates/api/src/state.rs`, `crates/api/src/agent_chat.rs`, `crates/api/src/main.rs` | 2 hr |
-| 7c | Tighter classifier prompt + empty-window metadata | `crates/agent/src/tools/{resolve_category,aggregate}_tool.rs`, `crates/agent/src/context.rs` | 45 min |
-| 7d | UI rework: Apply → POST /continue, no chat message | `apps/expense-desktop-ui/src/chat/ChatPanel.tsx`, styles | 60 min |
-| 7e | Tests + smoke extension | `crates/agent/src/tools/tests.rs`, new runtime tests, `tests/agent/smoke.sh` | 60 min |
+| 7a | `merchant_signature_ids` filter on data tools | ✅ | `8e413cc` |
+| 7b | Paused-run continuation (RunCoordinator + /continue endpoint) | ✅ | `0fe4189` |
+| 7c | Tighter classifier prompt + UI threshold | ✅ | `f1f21f1` |
+| 7d | UI Apply hits /continue, no JSON message | ✅ | `63fc90e` |
+| 7e | Smoke extension + abandoned-run test | ✅ | (this commit) |
 
 ## Build order
 

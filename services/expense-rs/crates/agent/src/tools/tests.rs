@@ -1051,3 +1051,56 @@ async fn paused_run_resumes_on_continuation_and_finishes_as_one_run() {
     assert_eq!(coordinator.parked_count().await, 0, "coordinator must be empty");
     assert_eq!(*llm.calls.lock().unwrap(), 2, "LLM was called twice (before+after pause)");
 }
+
+#[tokio::test]
+async fn paused_run_marked_abandoned_when_coordinator_cancels_externally() {
+    let pool = setup_db_with_fixture().await;
+    let llm = Arc::new(ScriptedConfirmLlm {
+        calls: Mutex::new(0),
+    });
+    let registry = Arc::new(build_default_registry());
+    let coordinator = RunCoordinator::new();
+    let runner = AgentRunner::with_audit(llm, registry, Arc::new(crate::audit::NoopSink))
+        .with_coordinator(coordinator.clone());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(32);
+    let ctx = RunContext {
+        conversation_id: "conv-abandon".into(),
+        run_id: "run-abandon".into(),
+        user_message_excerpt: "groceries last month".into(),
+    };
+    let db = pool.clone();
+    let runner_handle = tokio::spawn(async move {
+        runner
+            .run(
+                &db,
+                ctx,
+                vec![ChatMessage::User {
+                    content: "groceries last month".into(),
+                }],
+                tx,
+            )
+            .await;
+    });
+
+    // Wait until the runner emits the confirmation event (i.e. has parked).
+    let mut got_confirmation = false;
+    let mut got_done = false;
+    while let Some(event) = rx.recv().await {
+        match &event {
+            AgentEvent::CategoryConfirmationNeeded { .. } => {
+                got_confirmation = true;
+                // Simulate "tab closed" / "5-min timeout" by cancelling the parked entry.
+                coordinator.cancel("run-abandon").await;
+            }
+            AgentEvent::Done { .. } => {
+                got_done = true;
+            }
+            _ => {}
+        }
+    }
+    runner_handle.await.expect("runner exited cleanly");
+    assert!(got_confirmation, "confirmation event never fired");
+    assert!(got_done, "run never reached done — should still emit Done with abandoned status");
+    assert_eq!(coordinator.parked_count().await, 0);
+}
