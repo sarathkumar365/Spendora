@@ -66,10 +66,14 @@ pub enum AgentEvent {
     Followups {
         suggestions: Vec<String>,
     },
-    /// Emitted instead of `AssistantMessage` when the agent ends a run with the sentinel
+    /// Emitted instead of `AssistantMessage` when the agent emits the sentinel
     /// `CATEGORY_CONFIRMATION_NEEDED: <slug>`. Carries the latest `resolve_category_intent`
     /// payload so the UI can render an inline confirmation card.
+    ///
+    /// `run_id` is included so the UI knows which run to resume via
+    /// POST /api/v1/agent/runs/:run_id/continue.
     CategoryConfirmationNeeded {
+        run_id: String,
         category_slug: String,
         payload: Value,
     },
@@ -349,6 +353,7 @@ impl AgentRunner {
                     });
                     let _ = events
                         .send(AgentEvent::CategoryConfirmationNeeded {
+                            run_id: ctx.run_id.clone(),
                             category_slug: slug.clone(),
                             payload: payload.clone(),
                         })

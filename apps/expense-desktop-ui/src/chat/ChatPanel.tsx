@@ -37,6 +37,7 @@ type CategoryMerchant = {
 };
 
 type CategoryConfirmation = {
+  runId: string;
   categorySlug: string;
   categoryName: string;
   confirmed: CategoryMerchant[];
@@ -46,6 +47,8 @@ type CategoryConfirmation = {
   selectedIds: Set<string>;
   /// Once Apply is clicked, the card disables itself.
   applied: boolean;
+  /// Surfaced error from the /continue POST (network failure, 404, etc.).
+  error?: string | null;
 };
 
 type RunStats = {
@@ -118,6 +121,7 @@ type DoneEvent = AgentEventBase & {
 };
 type CategoryConfirmationNeededEvent = AgentEventBase & {
   kind: "category_confirmation_needed";
+  run_id: string;
   category_slug: string;
   payload: {
     category: { id?: string; name?: string; slug?: string };
@@ -452,6 +456,7 @@ export function ChatPanel({ apiBaseUrl }: Props) {
             return {
               ...t,
               categoryConfirmation: {
+                runId: event.run_id,
                 categorySlug: event.category_slug,
                 categoryName,
                 confirmed: p.confirmed ?? [],
@@ -465,7 +470,8 @@ export function ChatPanel({ apiBaseUrl }: Props) {
                     .filter((m) => (m.confidence ?? 0) >= 0.85)
                     .map((m) => m.merchant_signature_id)
                 ),
-                applied: false
+                applied: false,
+                error: null
               }
             };
           }
@@ -529,46 +535,67 @@ export function ChatPanel({ apiBaseUrl }: Props) {
     const card = turn?.categoryConfirmation;
     if (!card || card.applied) return;
 
-    // Always include user-confirmed merchants. For suggested ones, the selectedIds set decides.
-    const include: string[] = [];
-    const exclude: string[] = [];
-    for (const m of card.confirmed) include.push(m.merchant_signature_id);
+    // Build the assignments list: confirmed merchants are always included; suggested ones
+    // are included if the user ticked them and explicitly excluded otherwise.
+    const assignments: { merchant_signature_id: string; included: boolean }[] = [];
+    for (const m of card.confirmed) {
+      assignments.push({ merchant_signature_id: m.merchant_signature_id, included: true });
+    }
     for (const m of card.suggested) {
-      if (card.selectedIds.has(m.merchant_signature_id)) {
-        include.push(m.merchant_signature_id);
-      } else {
-        exclude.push(m.merchant_signature_id);
-      }
+      assignments.push({
+        merchant_signature_id: m.merchant_signature_id,
+        included: card.selectedIds.has(m.merchant_signature_id)
+      });
     }
 
-    const followup =
-      `[User confirmed category "${card.categorySlug}"]\n` +
-      `Call confirm_category_assignments now with this exact payload:\n` +
-      JSON.stringify(
-        {
-          category: card.categorySlug,
-          assignments: [
-            ...include.map((id) => ({ merchant_signature_id: id, included: true })),
-            ...exclude.map((id) => ({ merchant_signature_id: id, included: false }))
-          ]
-        },
-        null,
-        2
-      ) +
-      `\nThen compute the original spending question for the confirmed merchants ` +
-      `(use aggregate_transactions with merchant_substrings set to their normalized_key values) ` +
-      `and answer in the same format you would have used originally.`;
-
-    // Mark the card applied so it disables.
+    // Optimistically mark applied; revert on error.
     setTurns((prev) =>
       prev.map((t) =>
         t.id === turnId && t.categoryConfirmation
-          ? { ...t, categoryConfirmation: { ...t.categoryConfirmation, applied: true } }
+          ? {
+              ...t,
+              categoryConfirmation: { ...t.categoryConfirmation, applied: true, error: null }
+            }
           : t
       )
     );
 
-    await sendMessage(followup);
+    try {
+      const res = await fetch(
+        `${apiBaseUrl}/api/v1/agent/runs/${encodeURIComponent(card.runId)}/continue`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            category_slug: card.categorySlug,
+            assignments
+          })
+        }
+      );
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(friendlyHttpError(res.status, text));
+      }
+      // Success — the original SSE stream will keep emitting events from the resumed run.
+      // Nothing else to do here; the agent's next assistant_message + done events arrive
+      // through the same channel that's still open from sendMessage().
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === turnId && t.categoryConfirmation
+            ? {
+                ...t,
+                categoryConfirmation: {
+                  ...t.categoryConfirmation,
+                  applied: false,
+                  error: msg
+                }
+              }
+            : t
+        )
+      );
+    }
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -658,7 +685,9 @@ export function ChatPanel({ apiBaseUrl }: Props) {
             />
           ))
         )}
-        {running ? <div className="chat-thinking">Thinking…</div> : null}
+        {running && !lastTurnAwaitingConfirmation(turns) ? (
+          <div className="chat-thinking">Thinking…</div>
+        ) : null}
       </div>
 
       <form className="chat-input-row" onSubmit={handleSubmit}>
@@ -933,13 +962,15 @@ function CategoryConfirmationCard({
         <p className="muted small">No matching merchants found in this window.</p>
       ) : null}
 
+      {card.error ? <div className="chat-error">Couldn't apply: {card.error}</div> : null}
+
       <div className="chat-category-card-actions">
         <button
           className="button"
           onClick={() => onApply(turnId)}
           disabled={card.applied || (card.confirmed.length === 0 && card.selectedIds.size === 0)}
         >
-          {card.applied ? "Applied" : "Apply"}
+          {card.applied ? "Applied — agent continuing…" : "Apply"}
         </button>
       </div>
     </div>
@@ -996,6 +1027,13 @@ function CitationDrawer({
       </aside>
     </div>
   );
+}
+
+function lastTurnAwaitingConfirmation(turns: ChatTurn[]): boolean {
+  const last = turns[turns.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const c = last.categoryConfirmation;
+  return !!c && !c.applied;
 }
 
 function friendlyHttpError(status: number, body: string): string {
