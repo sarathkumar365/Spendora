@@ -15,7 +15,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use agent::{audit::DbAuditSink, llm::build_provider_from_env, tools::build_default_registry};
+use agent::{
+    audit::DbAuditSink, coordinator::RunCoordinator, llm::build_provider_from_env,
+    tools::build_default_registry,
+};
 use clap::Parser;
 use expense_core::{
     default_app_data_dir, load_extraction_runtime_config_from_env, load_statement_blueprint_schema,
@@ -87,12 +90,14 @@ async fn main() -> anyhow::Result<()> {
     let agent_audit: Option<Arc<dyn agent::audit::AuditSink>> =
         Some(DbAuditSink::spawn(pool.clone()));
     info!("agent audit sink ready (DbAuditSink, background writer)");
+    let agent_run_coordinator = RunCoordinator::new();
 
     let state = Arc::new(AppState {
         db: pool,
         agent_provider,
         agent_registry,
         agent_audit,
+        agent_run_coordinator,
     });
     let app = Router::new()
         .route("/health", get(health))
@@ -145,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/agent/chat",
             post(agent_chat::post_agent_chat_handler),
+        )
+        .route(
+            "/api/v1/agent/runs/:run_id/continue",
+            post(agent_chat::post_agent_run_continue_handler),
         )
         .route(
             "/api/v1/audit/conversations",

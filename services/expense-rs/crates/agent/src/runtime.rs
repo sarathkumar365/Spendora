@@ -8,9 +8,14 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::audit::{AuditEvent, AuditSink, NoopSink};
+use crate::coordinator::RunCoordinator;
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmProvider, ToolCall};
 use crate::pricing::cost_micros_for;
 use crate::tools::{AgentDeps, ToolRegistry};
+
+/// Max time a run stays parked waiting for the user to apply a confirmation card. After
+/// this, the run is recorded with status=abandoned in the audit and the loop exits.
+const CONFIRMATION_TIMEOUT_SECS: u64 = 300;
 
 /// Caller-provided identifiers + metadata for a single run. Threaded into every audit event.
 #[derive(Debug, Clone)]
@@ -96,12 +101,16 @@ pub struct AgentRunner {
     pub provider: Arc<dyn LlmProvider>,
     pub registry: Arc<ToolRegistry>,
     pub audit: Arc<dyn AuditSink>,
+    /// When present, runs that emit `CATEGORY_CONFIRMATION_NEEDED` park here waiting for the
+    /// UI to post `/agent/runs/:run_id/continue`. When absent (tests + legacy callers), the
+    /// run ends at the sentinel — backward-compatible.
+    pub coordinator: Option<Arc<RunCoordinator>>,
     pub max_iterations: usize,
     pub temperature: f32,
 }
 
 impl AgentRunner {
-    /// Build a runner with the default `NoopSink` (tests + callers that don't want auditing).
+    /// Build a runner with the default `NoopSink` and no coordinator (tests + legacy).
     pub fn new(provider: Arc<dyn LlmProvider>, registry: Arc<ToolRegistry>) -> Self {
         Self::with_audit(provider, registry, Arc::new(NoopSink))
     }
@@ -115,9 +124,16 @@ impl AgentRunner {
             provider,
             registry,
             audit,
+            coordinator: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             temperature: 0.2,
         }
+    }
+
+    /// Attach a `RunCoordinator` so this runner supports paused-run continuation.
+    pub fn with_coordinator(mut self, coordinator: Arc<RunCoordinator>) -> Self {
+        self.coordinator = Some(coordinator);
+        self
     }
 
     /// Run the multi-turn loop. Each AgentEvent is pushed into `events`. `ctx` carries
@@ -346,14 +362,113 @@ impl AgentRunner {
                                 "category_confirmation_needed",
                             );
                             e.payload = serde_json::json!({
-                                "category_slug": slug,
+                                "category_slug": slug.clone(),
                                 "payload": payload,
                             });
                             e
                         })
                         .await;
                     seq += 1;
-                    break;
+
+                    // If a coordinator is configured, park here waiting for the UI's POST to
+                    // /agent/runs/:run_id/continue. Otherwise (tests/legacy), end the run.
+                    let Some(coord) = self.coordinator.clone() else {
+                        break;
+                    };
+                    let rx = coord.park(&ctx.run_id).await;
+                    info!(run_id = %ctx.run_id, slug = %slug, "agent run parked for category confirmation");
+                    let continuation = tokio::select! {
+                        biased;
+                        _ = events.closed() => {
+                            info!(run_id = %ctx.run_id, "client disconnected while parked; cleaning up");
+                            coord.cancel(&ctx.run_id).await;
+                            final_status = "cancelled".to_string();
+                            return self.finalize(&ctx, seq, final_status, None,
+                                iterations, total_prompt_tokens, total_completion_tokens,
+                                total_cost_micros, &model_label).await;
+                        }
+                        result = tokio::time::timeout(
+                            std::time::Duration::from_secs(CONFIRMATION_TIMEOUT_SECS), rx,
+                        ) => {
+                            match result {
+                                Ok(Ok(cont)) => cont,
+                                Ok(Err(_recv_err)) => {
+                                    // Sender dropped (cancelled / re-parked).
+                                    info!(run_id = %ctx.run_id, "park receiver closed without continuation");
+                                    coord.cancel(&ctx.run_id).await;
+                                    final_status = "abandoned".to_string();
+                                    final_error = Some(
+                                        "park channel closed without user reply".to_string(),
+                                    );
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    info!(run_id = %ctx.run_id, "park timed out");
+                                    coord.cancel(&ctx.run_id).await;
+                                    let msg = format!(
+                                        "no confirmation within {}s — run abandoned",
+                                        CONFIRMATION_TIMEOUT_SECS
+                                    );
+                                    let _ = events
+                                        .send(AgentEvent::Truncated {
+                                            reason: msg.clone(),
+                                        })
+                                        .await;
+                                    final_status = "abandoned".to_string();
+                                    final_error = Some(msg);
+                                    break;
+                                }
+                            }
+                        }
+                    };
+
+                    // Audit: record what came back from the user.
+                    self.audit
+                        .record({
+                            let mut e = AuditEvent::new(
+                                &ctx.conversation_id,
+                                &ctx.run_id,
+                                seq,
+                                "category_confirmation_received",
+                            );
+                            e.payload = serde_json::json!({
+                                "category_slug": continuation.category_slug,
+                                "assignments": continuation.assignments,
+                            });
+                            e
+                        })
+                        .await;
+                    seq += 1;
+
+                    // Push a structured user message into the conversation so the agent has
+                    // it on the next iteration. Strict format the system prompt is taught to
+                    // read.
+                    let assignments_json = serde_json::to_string(&continuation.assignments)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    let included_ids: Vec<&str> = continuation
+                        .assignments
+                        .iter()
+                        .filter(|a| a.included)
+                        .map(|a| a.merchant_signature_id.as_str())
+                        .collect();
+                    let excluded_ids: Vec<&str> = continuation
+                        .assignments
+                        .iter()
+                        .filter(|a| !a.included)
+                        .map(|a| a.merchant_signature_id.as_str())
+                        .collect();
+                    let user_msg = format!(
+                        "[user_confirmation for category={slug}]\n\
+                         Apply these decisions by calling confirm_category_assignments with \
+                         category={slug:?} and assignments={assignments_json}, then answer the \
+                         original spending question using aggregate_transactions with \
+                         merchant_signature_ids={included_ids:?}. Excluded: {excluded_ids:?}.",
+                        slug = continuation.category_slug,
+                    );
+                    messages.push(ChatMessage::User { content: user_msg });
+
+                    // Resume the loop on the next iteration — DO NOT break.
+                    continue;
                 }
 
                 let _ = events

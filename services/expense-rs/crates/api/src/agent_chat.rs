@@ -3,9 +3,11 @@ use std::{sync::Arc, time::Duration};
 use agent::{
     audit::{AuditSink, NoopSink},
     context::{AccountSummary, AgentContext, DataRange},
+    coordinator::{CategoryAssignment, ContinueError, RunContinuation},
     llm::ChatMessage as AgentChatMessage,
     runtime::{build_initial_messages, AgentEvent, AgentRunner, RunContext},
 };
+use axum::extract::Path;
 use expense_core::new_idempotency_key;
 use async_stream::stream;
 use axum::{
@@ -208,7 +210,8 @@ pub async fn post_agent_chat_handler(
         .agent_audit
         .clone()
         .unwrap_or_else(|| Arc::new(NoopSink));
-    let runner = AgentRunner::with_audit(provider, registry, audit_sink);
+    let runner = AgentRunner::with_audit(provider, registry, audit_sink)
+        .with_coordinator(state.agent_run_coordinator.clone());
     let db = state.db.clone();
 
     tokio::spawn(async move {
@@ -249,5 +252,62 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Truncated { .. } => "truncated",
         AgentEvent::Error { .. } => "error",
         AgentEvent::Done { .. } => "done",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContinueRunRequest {
+    pub category_slug: String,
+    pub assignments: Vec<CategoryAssignmentInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CategoryAssignmentInput {
+    pub merchant_signature_id: String,
+    pub included: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinueRunResponse {
+    pub run_id: String,
+    pub resumed: bool,
+}
+
+pub async fn post_agent_run_continue_handler(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Json(body): Json<ContinueRunRequest>,
+) -> Result<Json<ContinueRunResponse>, (StatusCode, String)> {
+    if body.category_slug.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "category_slug is required".into()));
+    }
+    let assignments: Vec<CategoryAssignment> = body
+        .assignments
+        .into_iter()
+        .map(|a| CategoryAssignment {
+            merchant_signature_id: a.merchant_signature_id,
+            included: a.included,
+        })
+        .collect();
+    let continuation = RunContinuation {
+        category_slug: body.category_slug,
+        assignments,
+    };
+    match state
+        .agent_run_coordinator
+        .resume(&run_id, continuation)
+        .await
+    {
+        Ok(()) => Ok(Json(ContinueRunResponse {
+            run_id,
+            resumed: true,
+        })),
+        Err(ContinueError::NotFound(_)) => {
+            Err((StatusCode::NOT_FOUND, format!("run not found or no longer awaiting confirmation: {run_id}")))
+        }
+        Err(ContinueError::AlreadyResumed(_)) => Err((
+            StatusCode::CONFLICT,
+            format!("run was already resumed: {run_id}"),
+        )),
     }
 }

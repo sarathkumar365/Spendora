@@ -939,3 +939,115 @@ async fn compare_by_signature_ids_works_across_two_windows() {
     // Walmart in April should NOT be counted.
     assert_eq!(out.data.get("absolute_diff").unwrap().as_f64().unwrap(), 2000.0);
 }
+
+// --------- Paused-run continuation integration tests (Phase 7b) ---------
+
+use crate::coordinator::{CategoryAssignment, RunContinuation, RunCoordinator};
+use crate::runtime::{AgentEvent, AgentRunner, RunContext};
+
+/// Two-step LLM stub: first call emits the confirmation sentinel; second call (after
+/// the user's confirmation message lands in history) emits a normal answer.
+struct ScriptedConfirmLlm {
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedConfirmLlm {
+    async fn complete(&self, _req: ChatCompletionRequest) -> anyhow::Result<ChatCompletionResponse> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        let content = if *n == 1 {
+            "CATEGORY_CONFIRMATION_NEEDED: groceries".to_string()
+        } else {
+            "You spent $100 on groceries.\nFOLLOWUPS: [\"Compare to last month?\"]".to_string()
+        };
+        Ok(ChatCompletionResponse {
+            message: ChatMessage::Assistant {
+                content: Some(content),
+                tool_calls: Vec::new(),
+            },
+            finish_reason: "stop".to_string(),
+            usage: None,
+        })
+    }
+    fn model_label(&self) -> String {
+        "stub:scripted".to_string()
+    }
+    fn kind(&self) -> LlmProviderKind {
+        LlmProviderKind::OpenAi
+    }
+}
+
+#[tokio::test]
+async fn paused_run_resumes_on_continuation_and_finishes_as_one_run() {
+    let pool = setup_db_with_fixture().await;
+    let llm = Arc::new(ScriptedConfirmLlm {
+        calls: Mutex::new(0),
+    });
+    let registry = Arc::new(build_default_registry());
+    let coordinator = RunCoordinator::new();
+    let runner = AgentRunner::with_audit(llm.clone(), registry, Arc::new(crate::audit::NoopSink))
+        .with_coordinator(coordinator.clone());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(32);
+    let ctx = RunContext {
+        conversation_id: "conv-park".into(),
+        run_id: "run-park".into(),
+        user_message_excerpt: "groceries last month".into(),
+    };
+    let db = pool.clone();
+    let runner_handle = tokio::spawn(async move {
+        runner
+            .run(
+                &db,
+                ctx,
+                vec![ChatMessage::User {
+                    content: "groceries last month".into(),
+                }],
+                tx,
+            )
+            .await;
+    });
+
+    // Drive the SSE events: expect Started, then CategoryConfirmationNeeded, then we resume.
+    let mut got_confirmation_event = false;
+    let mut got_assistant_message = false;
+    let mut got_done = false;
+    let mut sent_continuation = false;
+
+    while let Some(event) = rx.recv().await {
+        match &event {
+            AgentEvent::CategoryConfirmationNeeded { category_slug, .. } => {
+                got_confirmation_event = true;
+                assert_eq!(category_slug, "groceries");
+                // Resume with a fake user reply.
+                let cont = RunContinuation {
+                    category_slug: "groceries".into(),
+                    assignments: vec![CategoryAssignment {
+                        merchant_signature_id: "msig-1".into(),
+                        included: true,
+                    }],
+                };
+                coordinator.resume("run-park", cont).await.expect("resume");
+                sent_continuation = true;
+            }
+            AgentEvent::AssistantMessage { content } => {
+                got_assistant_message = true;
+                assert!(content.contains("You spent"));
+            }
+            AgentEvent::Done { iterations, .. } => {
+                got_done = true;
+                assert!(*iterations >= 2, "should have looped at least twice");
+            }
+            _ => {}
+        }
+    }
+
+    runner_handle.await.expect("runner exited cleanly");
+    assert!(got_confirmation_event, "confirmation event never fired");
+    assert!(sent_continuation, "test never resumed the run");
+    assert!(got_assistant_message, "answer never came");
+    assert!(got_done, "run never reached done");
+    assert_eq!(coordinator.parked_count().await, 0, "coordinator must be empty");
+    assert_eq!(*llm.calls.lock().unwrap(), 2, "LLM was called twice (before+after pause)");
+}
