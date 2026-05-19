@@ -457,10 +457,12 @@ export function ChatPanel({ apiBaseUrl }: Props) {
                 confirmed: p.confirmed ?? [],
                 suggested: p.suggested ?? [],
                 excluded: p.excluded ?? [],
-                // Pre-select high-confidence suggestions (>=0.7) so the user just clicks Apply.
+                // Pre-select only very high-confidence suggestions (>=0.85). Phase 7c
+                // raised this from 0.7 after the audit showed Dollarama / pharmacy slipping
+                // in unnoticed when the user clicked Apply without ticking through.
                 selectedIds: new Set(
                   (p.suggested ?? [])
-                    .filter((m) => (m.confidence ?? 0) >= 0.7)
+                    .filter((m) => (m.confidence ?? 0) >= 0.85)
                     .map((m) => m.merchant_signature_id)
                 ),
                 applied: false

@@ -14,7 +14,9 @@ use crate::llm::{ChatCompletionRequest, ChatMessage, ToolDefinition};
 use super::{AgentDeps, Tool, ToolOutput};
 
 /// Threshold under which the LLM's confidence is discarded (treated as "not in this category").
-const MIN_LLM_CONFIDENCE: f64 = 0.4;
+/// Minimum confidence to flag a merchant as `included=true` in the suggested list.
+/// Raised from 0.4 → 0.5 in Phase 7c after the audit showed Dollarama / pharmacy slipping in.
+const MIN_LLM_CONFIDENCE: f64 = 0.5;
 /// Cap on the number of merchants we feed to the LLM in one classification call.
 const MAX_MERCHANTS_PER_CALL: usize = 100;
 /// Default lookback when caller doesn't pass dates.
@@ -260,6 +262,75 @@ fn resolve_window(date_from: Option<&str>, date_to: Option<&str>) -> Result<(Str
     Ok((from.to_string(), to.to_string()))
 }
 
+/// Per-category inclusion/exclusion rules baked into the classifier prompt.
+/// Audited bugs (e.g. Dollarama tagged as groceries) come from missing exclusion lists;
+/// this is where we encode the user-meaning of each category beyond just the label.
+fn category_specific_guidance(category_name: &str) -> &'static str {
+    let key = category_name.to_lowercase();
+    if key.contains("groceries") {
+        "INCLUDE: dedicated supermarkets and grocery stores (e.g. Loblaws, Metro, Sobeys, \
+         Walmart Supercentre's grocery half, No Frills, FreshCo, Food Basics, Farm Boy, \
+         Whole Foods, ethnic grocery stores).\n\
+         EXCLUDE: general-merchandise stores (Dollarama, Dollar Tree), pharmacies (Shoppers \
+         Drug Mart, CVS), restaurants and prepared-meal services (Tim Hortons, Uber Eats, \
+         DoorDash, meal-kit boxes), gas stations even when they sell snacks, warehouse clubs \
+         when the user shops there for non-food (Costco is borderline — score 0.5 unless \
+         clearly grocery-dominant)."
+    } else if key.contains("dining") || key.contains("restaurant") {
+        "INCLUDE: restaurants, cafes, fast food, food trucks, food delivery (Uber Eats, \
+         DoorDash, SkipTheDishes), bars and pubs.\n\
+         EXCLUDE: grocery stores (even if they sell prepared food), meal kits delivered as \
+         groceries, coffee subscriptions, vending machines."
+    } else if key.contains("transit") || key.contains("fuel") {
+        "INCLUDE: rideshare (Uber, Lyft), taxis, public transit (Presto, TTC, GO Transit), \
+         airline tickets when used for transport, parking, tolls, gas stations.\n\
+         EXCLUDE: vehicle purchase or financing, car insurance, car repair (use Other)."
+    } else if key.contains("utilities") || key.contains("bills") {
+        "INCLUDE: electricity, gas, water, internet, mobile/landline phone, cable/streaming \
+         bundles billed by a utility, garbage/recycling.\n\
+         EXCLUDE: rent (use Housing/Other), tenant insurance, standalone streaming services \
+         like Netflix (those are Subscriptions/Entertainment)."
+    } else if key.contains("entertainment") {
+        "INCLUDE: movie tickets, concerts, sports tickets, museums, theme parks, video games \
+         (one-time purchase).\n\
+         EXCLUDE: streaming subscriptions (Netflix, Spotify — those are Subscriptions), bars \
+         (Dining), books unless clearly leisure."
+    } else if key.contains("subscriptions") {
+        "INCLUDE: recurring monthly/annual digital services — Netflix, Spotify, Apple Music, \
+         YouTube Premium, software SaaS, news/magazine subscriptions, gym memberships if \
+         auto-billed.\n\
+         EXCLUDE: utility bills (those are Utilities), one-time digital purchases."
+    } else if key.contains("shopping") {
+        "INCLUDE: general retail — Amazon, eBay, clothing stores, electronics retailers, \
+         home goods, Costco when general-merchandise dominant, Dollarama and dollar stores.\n\
+         EXCLUDE: groceries, dining, gas, services. When a merchant is ambiguous between \
+         groceries and shopping, lean shopping for general-purpose stores like Walmart."
+    } else if key.contains("healthcare") {
+        "INCLUDE: pharmacies (Shoppers Drug Mart, Rexall, CVS), doctor's offices, dental, \
+         optometrist, physiotherapy, prescription refills, medical supplies, lab fees.\n\
+         EXCLUDE: gym memberships (Subscriptions), beauty products from general retail."
+    } else if key.contains("travel") {
+        "INCLUDE: airlines, hotels, Airbnb, car rentals, travel insurance, travel agencies, \
+         cruise lines, foreign exchange when clearly tied to a trip.\n\
+         EXCLUDE: local transit (Transit), commuting fuel."
+    } else if key.contains("income") {
+        "INCLUDE: payroll deposits, bonuses, freelance/contract payments received, dividends, \
+         interest paid TO the user.\n\
+         EXCLUDE: transfers between own accounts (those are Transfers)."
+    } else if key.contains("transfers") {
+        "INCLUDE: transfers between the user's own accounts, e-transfers sent and received \
+         between own accounts, credit card payments from chequing.\n\
+         EXCLUDE: payments to a vendor (those are Shopping/Dining/etc), income from external \
+         parties."
+    } else if key.contains("fees") {
+        "INCLUDE: bank fees (NSF, overdraft, monthly), credit card annual fees, interest \
+         charges, ATM withdrawal fees, foreign transaction fees, late payment fees.\n\
+         EXCLUDE: actual purchases on a credit card."
+    } else {
+        "Use general world knowledge of merchant categories. When in doubt, score low (<0.5)."
+    }
+}
+
 /// Ask the LLM to classify each merchant for the given category. Returns
 /// `normalized_key -> confidence (0..1)`. Robust to JSON formatting glitches.
 async fn classify_with_llm(
@@ -272,12 +343,22 @@ async fn classify_with_llm(
         .map(|m| format!("- {} (key: {})", m.display_label, m.normalized_key))
         .collect();
 
+    let guidance = category_specific_guidance(category_name);
     let system = format!(
-        "You are a merchant classifier. Given a list of merchant strings, decide which ones \
-         belong to the category \"{category_name}\". Respond with ONLY valid JSON — no prose, \
-         no markdown — mapping each merchant's `key` to a confidence between 0.0 and 1.0. \
-         Include EVERY merchant in your response. Confidence 0.0 = definitely not, 1.0 = \
-         definitely yes."
+        "You are a strict merchant classifier. Decide which merchant strings BELONG to the \
+         category \"{category_name}\" — and which do NOT. Be CONSERVATIVE: when a merchant \
+         could belong to multiple categories, score it low (<0.5) unless it is overwhelmingly \
+         dominated by this one. False positives are worse than misses — the user will be \
+         re-prompted for anything borderline.\n\n\
+         {guidance}\n\n\
+         Output rules:\n\
+         - Respond with ONLY valid JSON — no prose, no markdown fences.\n\
+         - Map each merchant's `key` (the lowercase key, not the display label) to a \
+           confidence between 0.0 and 1.0.\n\
+         - 0.0 = definitely not in this category. 1.0 = definitely in.\n\
+         - Use <0.5 for ambiguous / multi-purpose / unrelated merchants.\n\
+         - Use >=0.85 ONLY when you are nearly certain.\n\
+         - Include EVERY merchant in your response."
     );
     let user = format!(
         "Category: {category_name}\n\nMerchants:\n{}\n\nReturn JSON like {{\"key1\": 0.95, \"key2\": 0.10, ...}}.",
